@@ -1,0 +1,32 @@
+# Rust build artifacts — rebuilt inside Docker
+target/
+
+# Environment files — injected at runtime via secrets
+.env
+.env.*
+
+# Git metadata
+.git/
+.gitignore
+
+# Claude Code session state
+.claude/
+
+# IDE / editor artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Scripts not needed in the image
+scripts/
+
+# Docs
+README.md

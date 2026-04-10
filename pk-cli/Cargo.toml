@@ -1,0 +1,24 @@
+[package]
+name = "pk-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pk"
+path = "src/main.rs"
+
+[dependencies]
+pk-core      = { workspace = true }
+pk-store     = { workspace = true }
+pk-librarian = { workspace = true }
+pk-watcher   = { workspace = true }
+tokio        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+anyhow       = { workspace = true }
+clap         = { workspace = true }
+tracing      = { workspace = true }
+tracing-subscriber = { workspace = true }
+tikv-jemallocator = { workspace = true }

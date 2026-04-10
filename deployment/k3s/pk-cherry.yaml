@@ -1,0 +1,129 @@
+---
+# K3s CronJob: runs pk lint daily at 3am UTC
+# Deployed on the L4 VM K3s cluster alongside pk-cherry
+
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pk-lint
+  namespace: prometheus
+spec:
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: pk-lint
+              image: ghcr.io/prometheusags/pk-cli:latest
+              command: ["pk", "lint", "--fix"]
+              env:
+                - name: PK_KB_DIR
+                  value: /data/knowledge
+                - name: PK_LINT_MODEL
+                  value: qwen2.5-14b-instruct-q4_k_m
+                - name: LOCAL_LLM_URL
+                  value: http://candle-vllm.prometheus.svc:8080/v1
+                - name: RUST_LOG
+                  value: info
+              volumeMounts:
+                - name: knowledge-data
+                  mountPath: /data/knowledge
+          volumes:
+            - name: knowledge-data
+              persistentVolumeClaim:
+                claimName: prometheus-knowledge-pvc
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-knowledge-pvc
+  namespace: prometheus
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: local-path
+
+---
+# pk-cherry Deployment — MCP bridge for UAR agents on the cluster
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pk-cherry
+  namespace: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pk-cherry
+  template:
+    metadata:
+      labels:
+        app: pk-cherry
+    spec:
+      containers:
+        - name: pk-cherry
+          image: ghcr.io/prometheusags/pk-cherry:latest
+          ports:
+            - containerPort: 8942
+          env:
+            - name: PK_KB_DIR
+              value: /data/knowledge
+            - name: PK_BIND
+              value: "0.0.0.0:8942"
+            - name: PK_COMPILE_MODEL
+              value: claude-sonnet-4-6
+            - name: CLOUD_LLM_URL
+              value: https://api.anthropic.com/v1
+            - name: CLOUD_LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: anthropic-credentials
+                  key: api-key
+            - name: PK_LINT_MODEL
+              value: qwen2.5-14b-instruct-q4_k_m
+            - name: LOCAL_LLM_URL
+              value: http://candle-vllm.prometheus.svc:8080/v1
+            - name: RUST_LOG
+              value: info
+          volumeMounts:
+            - name: knowledge-data
+              mountPath: /data/knowledge
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8942
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8942
+            initialDelaySeconds: 15
+            periodSeconds: 30
+      volumes:
+        - name: knowledge-data
+          persistentVolumeClaim:
+            claimName: prometheus-knowledge-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pk-cherry
+  namespace: prometheus
+spec:
+  selector:
+    app: pk-cherry
+  ports:
+    - port: 8942
+      targetPort: 8942
+  type: ClusterIP

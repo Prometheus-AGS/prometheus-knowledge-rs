@@ -1,0 +1,38 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Cargo lock file (keep for binaries, workspace manages it)
+# Cargo.lock is committed for binary crates
+
+# Environment files (never commit secrets)
+.env
+.env.local
+.env.*.local
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Claude Code session state
+.claude/
+
+# Logs
+*.log
+logs/
+
+# Test artifacts
+/tmp/
+
+# Coverage reports
+lcov.info
+tarpaulin-report.html

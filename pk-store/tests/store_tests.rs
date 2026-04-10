@@ -1,0 +1,152 @@
+use pk_core::types::{ArticleId, RawDoc, WikiEntry};
+use pk_store::MarkdownStore;
+use std::sync::Arc;
+
+async fn temp_store() -> (Arc<MarkdownStore>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(
+        MarkdownStore::open(dir.path())
+            .await
+            .expect("store open"),
+    );
+    (store, dir)
+}
+
+#[tokio::test]
+async fn upsert_and_get_roundtrip() {
+    let (store, _dir) = temp_store().await;
+
+    let entry = WikiEntry::new("Universal Agent Runtime", "Core Prometheus execution substrate.")
+        .with_tags(["rust", "uar"])
+        .with_sources(["test"]);
+
+    let saved = store.upsert(entry.clone()).await.unwrap();
+    assert_eq!(saved.id, entry.id);
+    assert_eq!(saved.revision, 0);
+
+    let retrieved = store.get(&saved.id).await.unwrap();
+    assert_eq!(retrieved.title, "Universal Agent Runtime");
+    assert_eq!(retrieved.content, "Core Prometheus execution substrate.");
+    assert_eq!(retrieved.tags, vec!["rust", "uar"]);
+}
+
+#[tokio::test]
+async fn upsert_same_id_bumps_revision() {
+    let (store, _dir) = temp_store().await;
+
+    let entry = WikiEntry::new("Kaia", "Agent certification platform.");
+    let v1 = store.upsert(entry.clone()).await.unwrap();
+    assert_eq!(v1.revision, 0);
+
+    let mut entry2 = entry.clone();
+    entry2.content = "Kaia issues W3C Verifiable Credentials.".into();
+    let v2 = store.upsert(entry2).await.unwrap();
+    assert_eq!(v2.revision, 1);
+
+    let on_disk = store.get(&v1.id).await.unwrap();
+    assert_eq!(on_disk.content, "Kaia issues W3C Verifiable Credentials.");
+    assert_eq!(on_disk.revision, 1);
+}
+
+#[tokio::test]
+async fn delete_removes_entry() {
+    let (store, _dir) = temp_store().await;
+
+    let entry = WikiEntry::new("Ephemeral Article", "Will be deleted.");
+    let saved = store.upsert(entry).await.unwrap();
+
+    store.delete(&saved.id).await.unwrap();
+    assert_eq!(store.entry_count().await, 0);
+    assert!(store.get(&saved.id).await.is_err());
+}
+
+#[tokio::test]
+async fn delete_nonexistent_returns_error() {
+    let (store, _dir) = temp_store().await;
+    let result = store.delete(&ArticleId::from("does-not-exist")).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn snapshot_returns_all_entries() {
+    let (store, _dir) = temp_store().await;
+
+    let titles = ["UAR", "Kaia", "TurboQuant", "mempalace-rs"];
+    for title in &titles {
+        store.upsert(WikiEntry::new(*title, "body")).await.unwrap();
+    }
+
+    let snapshot = store.snapshot().await.unwrap();
+    assert_eq!(snapshot.len(), titles.len());
+}
+
+#[tokio::test]
+async fn search_returns_relevant_results() {
+    let (store, _dir) = temp_store().await;
+
+    store.upsert(
+        WikiEntry::new("Universal Agent Runtime", "Rust async agent execution engine with liter-llm routing.")
+            .with_tags(["rust", "agent", "uar"])
+    ).await.unwrap();
+
+    store.upsert(
+        WikiEntry::new("TurboQuant KV Cache", "3-bit FWHT compression for KV cache in Rust.")
+            .with_tags(["rust", "compression", "kv-cache"])
+    ).await.unwrap();
+
+    store.upsert(
+        WikiEntry::new("Kaia Agent Certification", "W3C Verifiable Credentials issued for agent behavior.")
+            .with_tags(["kaia", "vc", "agent"])
+    ).await.unwrap();
+
+    let results = store.search("agent runtime execution", 3).await.unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0].id, ArticleId::from_slug("Universal Agent Runtime"));
+}
+
+#[tokio::test]
+async fn search_empty_store_returns_empty() {
+    let (store, _dir) = temp_store().await;
+    let results = store.search("anything", 5).await.unwrap();
+    assert!(results.is_empty());
+}
+
+#[tokio::test]
+async fn entries_persist_across_store_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        for title in ["UAR", "Kaia", "SurrealDB"] {
+            store.upsert(WikiEntry::new(title, "body")).await.unwrap();
+        }
+    }
+
+    let store2 = MarkdownStore::open(dir.path()).await.unwrap();
+    assert_eq!(store2.entry_count().await, 3);
+
+    let uar = store2.get(&ArticleId::from_slug("UAR")).await.unwrap();
+    assert_eq!(uar.title, "UAR");
+}
+
+#[tokio::test]
+async fn related_entries_finds_overlapping_content() {
+    let (store, _dir) = temp_store().await;
+
+    store.upsert(
+        WikiEntry::new("Axum Web Framework", "Async Rust web framework built on Tower.")
+            .with_tags(["rust", "axum", "web"])
+    ).await.unwrap();
+
+    store.upsert(
+        WikiEntry::new("Tower Middleware", "Composable middleware layers for async Rust services.")
+            .with_tags(["rust", "tower", "middleware"])
+    ).await.unwrap();
+
+    let raw = RawDoc::from_path(
+        "test.md",
+        "Notes on building Axum middleware using Tower service traits",
+    );
+    let related = store.related_entries(&raw, 5).await.unwrap();
+    assert!(!related.is_empty());
+}
