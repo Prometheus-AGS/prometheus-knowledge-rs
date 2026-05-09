@@ -353,3 +353,21 @@ Test organization:
 - **liter-llm**: Model gateway for unified API access
 - **UAR (Universal Agent Runtime)**: Execution substrate that consumes `LibrarianEvent` stream
 - **Cherry Studio**: Local LLM server with MCP support
+
+## Slash Command Prefix Convention (SP-017)
+
+prometheus-knowledge slash commands use the `pk-` prefix to avoid collisions with commands from `prometheus-skill-pack` or other installed packs.
+
+**Rule:** All `.claude/commands/*.md` files in this repo must use the `pk-` prefix.
+
+| Current name | Canonical name | Notes |
+|---|---|---|
+| `focus.md` | `pk-focus.md` | skill-pack owns `/focus` as the higher-level user-facing command |
+| `ingest.md` | `pk-ingest.md` | pk-specific librarian operation |
+
+**Why:** Claude Code load order for slash commands is non-deterministic when multiple packs define the same name. The prefix guarantees unambiguous dispatch.
+
+To detect conflicts across installed packs:
+```bash
+bash prometheus-skill-pack/scripts/detect-command-conflicts.sh
+```
