@@ -84,6 +84,12 @@ enum Cmd {
     List,
     /// Dump knowledge base stats
     Stats,
+    /// Check Prometheus setup health (hooks, sycophancy binary, KB scoping)
+    Doctor {
+        /// Output as JSON instead of human-readable report
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Migrate global KB entries to per-project directories (dry-run by default)
     MigrateToPerProject {
         /// Execute the migration (default is dry-run; review output first)
@@ -355,6 +361,10 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Doctor { json } => {
+            run_doctor(json);
+        }
+
         Cmd::MigrateStores { execute, .. } => {
             let project_root = find_project_root()
                 .unwrap_or_else(|| std::env::current_dir().expect("cwd must exist"));
@@ -576,4 +586,123 @@ fn resolve_project_kb_for_hint(hint: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+// ── pk doctor ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, serde::Serialize)]
+struct DoctorCheck {
+    name: &'static str,
+    status: &'static str,
+    detail: String,
+}
+
+fn run_doctor(json_output: bool) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let plugin_root = std::env::var("CLAUDE_PLUGIN_ROOT").ok();
+
+    let mut checks: Vec<DoctorCheck> = Vec::new();
+
+    // Check 1: hooks.log writable
+    {
+        let log_path = format!("{home}/.prometheus/hooks.log");
+        let dir = format!("{home}/.prometheus");
+        let writable = std::fs::create_dir_all(&dir).is_ok()
+            && std::fs::OpenOptions::new().create(true).append(true).open(&log_path).is_ok();
+        checks.push(DoctorCheck {
+            name: "hooks-log-writable",
+            status: if writable { "PASS" } else { "FAIL" },
+            detail: format!("{log_path}"),
+        });
+    }
+
+    // Check 2: sycophancy binary present and executable
+    {
+        let (status, detail) = if let Some(ref root) = plugin_root {
+            let bin = format!("{root}/skills/imported/sycophancy-correction/target/release/sycophancy-correction");
+            if std::path::Path::new(&bin).exists() {
+                ("PASS", format!("binary present at {bin}"))
+            } else {
+                ("WARN", format!("binary not found at {bin} — run: cargo build --release"))
+            }
+        } else {
+            ("WARN", "CLAUDE_PLUGIN_ROOT not set; cannot check sycophancy binary path".into())
+        };
+        checks.push(DoctorCheck { name: "sycophancy-binary", status, detail });
+    }
+
+    // Check 3: hooks.json symlink integrity
+    {
+        let (status, detail) = if let Some(ref root) = plugin_root {
+            let phys = format!("{root}/hooks/hooks.json");
+            let link = format!("{root}/.claude-plugin/hooks/hooks.json");
+            let phys_exists = std::path::Path::new(&phys).exists();
+            let link_exists = std::path::Path::new(&link).exists();
+            if phys_exists && link_exists {
+                ("PASS", format!("hooks.json present; symlink resolves"))
+            } else if phys_exists {
+                ("WARN", format!("hooks.json present but .claude-plugin symlink missing — run: npm run build"))
+            } else {
+                ("FAIL", format!("hooks.json missing at {phys}"))
+            }
+        } else {
+            ("WARN", "CLAUDE_PLUGIN_ROOT not set; cannot check hooks.json symlink".into())
+        };
+        checks.push(DoctorCheck { name: "hooks-json-symlink", status, detail });
+    }
+
+    // Check 4: pipeline-enforce hook registered in hooks.json
+    {
+        let (status, detail) = if let Some(ref root) = plugin_root {
+            let hooks_path = format!("{root}/hooks/hooks.json");
+            let content = std::fs::read_to_string(&hooks_path).unwrap_or_default();
+            if content.contains("pipeline-enforce") {
+                ("PASS", "pipeline-enforce registered in hooks.json".into())
+            } else {
+                ("FAIL", "pipeline-enforce not found in hooks.json — SP-012 may not be applied".into())
+            }
+        } else {
+            ("WARN", "CLAUDE_PLUGIN_ROOT not set; cannot check hooks.json content".into())
+        };
+        checks.push(DoctorCheck { name: "pipeline-enforce-registered", status, detail });
+    }
+
+    // Check 5: per-project KB scoping configured (project root detected)
+    {
+        let (status, detail) = match find_project_root() {
+            Some(root) => {
+                let kb = root.join(".prometheus").join("knowledge");
+                if kb.exists() {
+                    ("PASS", format!("project KB at {}", kb.display()))
+                } else {
+                    ("WARN", format!("project root found at {} but KB not yet initialized (run: pk ingest)", root.display()))
+                }
+            }
+            None => ("WARN", "no project root detected in current directory tree".into()),
+        };
+        checks.push(DoctorCheck { name: "kb-scoping", status, detail });
+    }
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&checks).unwrap_or_else(|_| "[]".into()));
+        return;
+    }
+
+    println!("\npk doctor — Prometheus setup health report\n");
+    let mut any_fail = false;
+    for c in &checks {
+        let icon = match c.status {
+            "PASS" => "✓",
+            "WARN" => "⚠",
+            _ => { any_fail = true; "✗" }
+        };
+        println!("  {icon} [{:<30}] {} — {}", c.name, c.status, c.detail);
+    }
+    println!();
+    if any_fail {
+        println!("  One or more checks FAILED. Address the issues above.");
+    } else {
+        println!("  All checks passed.");
+    }
+    println!();
 }
