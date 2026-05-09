@@ -1,5 +1,6 @@
 use crate::{
     keyword_extract::extract_query,
+    parse::parse_json,
     prompts::{
         compile_user_prompt, fix_user_prompt, focus_user_prompt, lint_user_prompt,
         COMPILE_SYSTEM, FIX_SYSTEM, FOCUS_SYSTEM, LINT_SYSTEM,
@@ -158,17 +159,7 @@ impl Librarian {
     }
 }
 
-fn strip_json_fences(s: &str) -> &str {
-    let s = s.trim();
-    let s = s.strip_prefix("```json").unwrap_or(s);
-    let s = s.strip_prefix("```").unwrap_or(s);
-    let s = s.strip_suffix("```").unwrap_or(s);
-    s.trim()
-}
-
 fn parse_compile_response(raw: &str) -> PkResult<WikiEntry> {
-    let json_str = strip_json_fences(raw);
-
     #[derive(serde::Deserialize)]
     struct CompileOutput {
         title: String,
@@ -181,8 +172,8 @@ fn parse_compile_response(raw: &str) -> PkResult<WikiEntry> {
         sources: Vec<String>,
     }
 
-    let out: CompileOutput = serde_json::from_str(json_str)
-        .map_err(|e| PkError::llm(format!("compile response parse: {e}\nraw: {json_str}")))?;
+    let out: CompileOutput = parse_json(raw)
+        .map_err(|e| PkError::llm(e.to_string()))?;
 
     let entry = WikiEntry::new(out.title, out.content)
         .with_tags(out.tags)
@@ -195,8 +186,6 @@ fn parse_compile_response(raw: &str) -> PkResult<WikiEntry> {
 }
 
 fn parse_lint_response(raw: &str) -> PkResult<Vec<LintReport>> {
-    let json_str = strip_json_fences(raw);
-
     #[derive(serde::Deserialize)]
     struct RawReport {
         entry_id: Option<String>,
@@ -207,8 +196,8 @@ fn parse_lint_response(raw: &str) -> PkResult<Vec<LintReport>> {
         auto_fixable: bool,
     }
 
-    let raw_reports: Vec<RawReport> = serde_json::from_str(json_str)
-        .map_err(|e| PkError::llm(format!("lint response parse: {e}\nraw: {json_str}")))?;
+    let raw_reports: Vec<RawReport> = parse_json(raw)
+        .map_err(|e| PkError::llm(e.to_string()))?;
 
     let reports = raw_reports
         .into_iter()

@@ -1,6 +1,7 @@
 pub mod client;
 pub mod keyword_extract;
 pub mod librarian;
+pub mod parse;
 pub mod prompts;
 pub mod router;
 
