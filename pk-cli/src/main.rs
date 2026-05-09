@@ -84,6 +84,18 @@ enum Cmd {
     List,
     /// Dump knowledge base stats
     Stats,
+    /// Initialize a new project with Prometheus conventions
+    Init {
+        /// Project name (defaults to current directory name)
+        #[arg(long)]
+        name: Option<String>,
+        /// Technology stack descriptor (e.g. "rust", "typescript", "python")
+        #[arg(long)]
+        stack: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
     /// Check Prometheus setup health (hooks, sycophancy binary, KB scoping)
     Doctor {
         /// Output as JSON instead of human-readable report
@@ -361,6 +373,10 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Init { name, stack, yes } => {
+            run_init(name, stack, yes)?;
+        }
+
         Cmd::Doctor { json } => {
             run_doctor(json);
         }
@@ -705,4 +721,135 @@ fn run_doctor(json_output: bool) {
         println!("  All checks passed.");
     }
     println!();
+}
+
+// ── pk init ───────────────────────────────────────────────────────────────────
+
+fn run_init(name: Option<String>, stack: Option<String>, yes: bool) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+
+    // Resolve project name
+    let project_name = name.unwrap_or_else(|| {
+        cwd.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("my-project")
+            .to_owned()
+    });
+
+    let stack_name = stack.unwrap_or_else(|| detect_stack(&cwd));
+
+    println!("\npk init — Prometheus project onboarding\n");
+    println!("  Project name: {project_name}");
+    println!("  Stack:        {stack_name}");
+    println!("  Directory:    {}", cwd.display());
+    println!();
+
+    if !yes {
+        print!("Continue? [y/N] ");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    // Step 1: Create per-project KB directory
+    let prometheus_dir = cwd.join(".prometheus");
+    let kb_dir = prometheus_dir.join("knowledge");
+    std::fs::create_dir_all(&kb_dir)?;
+    println!("✓ Created KB directory: {}", kb_dir.display());
+
+    // Step 2: Create .prometheus/hooks/ symlink target if missing
+    let hooks_dir = prometheus_dir.join("hooks");
+    std::fs::create_dir_all(&hooks_dir)?;
+
+    // Step 3: Write a starter CLAUDE.md (non-destructive — skip if already exists)
+    let claude_md = cwd.join("CLAUDE.md");
+    if !claude_md.exists() {
+        let content = generate_claude_md(&project_name, &stack_name);
+        std::fs::write(&claude_md, content)?;
+        println!("✓ Generated CLAUDE.md");
+    } else {
+        println!("· CLAUDE.md already exists — skipping");
+    }
+
+    // Step 4: Write .gitignore entry for .prometheus/ artifacts (non-destructive)
+    let gitignore = cwd.join(".gitignore");
+    let prometheus_entry = "\n# Prometheus runtime artifacts\n.prometheus/knowledge/\n.prometheus/hooks.log\nSCRATCHPAD.md\n";
+    if gitignore.exists() {
+        let existing = std::fs::read_to_string(&gitignore)?;
+        if !existing.contains(".prometheus/knowledge") {
+            std::fs::OpenOptions::new().append(true).open(&gitignore)
+                .and_then(|mut f| { use std::io::Write; f.write_all(prometheus_entry.as_bytes()) })?;
+            println!("✓ Added .prometheus/knowledge/ to .gitignore");
+        } else {
+            println!("· .gitignore already has .prometheus/ entry");
+        }
+    } else {
+        std::fs::write(&gitignore, prometheus_entry.trim_start())?;
+        println!("✓ Created .gitignore with .prometheus/ entry");
+    }
+
+    println!("\nDone. Next steps:");
+    println!("  1. Run `pk ingest <file>` to add your first document to the KB");
+    println!("  2. Run `pk doctor` to verify your Prometheus setup");
+    println!("  3. Run `/kbd-assess` to start the KBD lifecycle for this project");
+    println!();
+
+    Ok(())
+}
+
+fn detect_stack(dir: &std::path::Path) -> String {
+    if dir.join("Cargo.toml").exists() { return "rust".into(); }
+    if dir.join("package.json").exists() { return "typescript".into(); }
+    if dir.join("pyproject.toml").exists() || dir.join("setup.py").exists() { return "python".into(); }
+    if dir.join("go.mod").exists() { return "go".into(); }
+    "unknown".into()
+}
+
+fn generate_claude_md(project_name: &str, stack: &str) -> String {
+    format!(r#"# CLAUDE.md
+
+This file provides guidance to Claude Code when working in this repository.
+
+## Project
+
+**Name**: {project_name}
+**Stack**: {stack}
+
+## Memory
+
+Check `~/.claude/projects/.../memory/MEMORY.md` at the start of each session.
+
+## Progress Signaling (MANDATORY)
+
+Emit before and after every phase and task:
+
+```
+Starting phase N out of M: <name>
+Starting task N out of M: <name>
+Completed task N out of M: <name>
+Completed phase N out of M: <name>
+```
+
+## KB Scoping
+
+This project uses a per-project knowledge base at `.prometheus/knowledge/`.
+Run `pk ingest <file>` to add documents. Run `pk focus <topic>` to retrieve context.
+
+## KBD Lifecycle
+
+When implementing features:
+1. `/kbd-assess` — gap analysis
+2. `/kbd-plan` — ordered change list
+3. `/kbd-execute` — implement changes
+4. `/kbd-reflect` — summarize and advance
+
+## References
+
+- [Prometheus Skill Pack](https://github.com/gqadonis/prometheus-skill-pack)
+"#)
 }
