@@ -85,6 +85,28 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         execute: bool,
     },
+    /// BDD codegraph operations (scenario → source file mapping)
+    Codegraph {
+        #[command(subcommand)]
+        action: CodegraphCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CodegraphCmd {
+    /// Extract static codegraph from feature files and TypeScript source
+    Extract {
+        /// Path to the project root containing scripts/codegraph-extract.ts
+        /// (defaults to cwd or detected project root)
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Output path for codegraph.json (default: tests/reports/codegraph.json)
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// CI mode: exit 1 if no scenarios extracted
+        #[arg(long, default_value_t = false)]
+        ci: bool,
+    },
 }
 
 #[tokio::main]
@@ -208,6 +230,56 @@ async fn main() -> Result<()> {
         }
 
         Cmd::MigrateToPerProject { .. } => unreachable!("handled above"),
+
+        Cmd::Codegraph { action } => {
+            match action {
+                CodegraphCmd::Extract { project, output, ci } => {
+                    run_codegraph_extract(project, output, ci)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn run_codegraph_extract(
+    project: Option<PathBuf>,
+    output: Option<PathBuf>,
+    ci: bool,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    // Resolve project root: explicit flag > project detection > cwd
+    let project_root = project
+        .or_else(find_project_root)
+        .unwrap_or_else(|| std::env::current_dir().expect("cwd must exist"));
+
+    let script = project_root.join("scripts").join("codegraph-extract.ts");
+    if !script.exists() {
+        anyhow::bail!(
+            "codegraph-extract.ts not found at {}\n\
+             Run `pk codegraph extract` from a project that has scripts/codegraph-extract.ts",
+            script.display()
+        );
+    }
+
+    let mut cmd = std::process::Command::new("npx");
+    cmd.arg("tsx").arg(&script);
+    if let Some(out) = output {
+        cmd.arg("--output").arg(out);
+    }
+    if ci {
+        cmd.arg("--ci");
+    }
+    cmd.current_dir(&project_root);
+
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to run tsx {}", script.display()))?;
+
+    if !status.success() {
+        anyhow::bail!("codegraph-extract.ts exited with status {}", status);
     }
 
     Ok(())
