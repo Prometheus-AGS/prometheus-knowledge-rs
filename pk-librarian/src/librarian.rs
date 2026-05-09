@@ -1,4 +1,5 @@
 use crate::{
+    keyword_extract::extract_query,
     prompts::{
         compile_user_prompt, fix_user_prompt, focus_user_prompt, lint_user_prompt,
         COMPILE_SYSTEM, FIX_SYSTEM, FOCUS_SYSTEM, LINT_SYSTEM,
@@ -83,8 +84,10 @@ impl Librarian {
     }
 
     pub async fn focus(&self, topic: &str, k: usize) -> PkResult<String> {
-        let candidates = self.store.search(topic, k).await?;
-        info!(topic, candidates = candidates.len(), "building focus brief");
+        // SP-002: sliding-window extraction for long prompts (> 2000 chars)
+        let search_query = extract_query(topic);
+        let candidates = self.store.search(&search_query, k).await?;
+        info!(topic_len = topic.len(), query_len = search_query.len(), candidates = candidates.len(), "building focus brief");
 
         if candidates.is_empty() {
             return Ok(format!("# {topic}\n\nNo matching articles found in the knowledge base."));
