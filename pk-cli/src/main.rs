@@ -96,6 +96,15 @@ enum Cmd {
         #[command(subcommand)]
         action: EventsCmd,
     },
+    /// Migrate single-store events to dual-store (KG + episodic) layout (SP-020)
+    MigrateStores {
+        /// Print migration plan without applying changes (default: true)
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+        /// Apply the migration (reshards .prometheus/events.jsonl into kg + episodic shards)
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -335,6 +344,29 @@ async fn main() -> Result<()> {
                         println!("\n{} event(s) for {entry_id}", records.len());
                     }
                 }
+            }
+        }
+        Cmd::MigrateStores { execute, .. } => {
+            let project_root = find_project_root()
+                .unwrap_or_else(|| std::env::current_dir().expect("cwd must exist"));
+
+            let plan = pk_event_store::migrate::plan(&project_root)?;
+            println!("Migration plan:");
+            println!("  KG records:       {}", plan.kg_records.len());
+            println!("  Episodic records: {}", plan.episodic_records.len());
+            println!("  Unclassified:     {}", plan.unclassified.len());
+
+            if !execute {
+                println!("\n(dry-run) Pass --execute to apply the migration.");
+                return Ok(());
+            }
+
+            pk_event_store::migrate::apply(&plan, &project_root)?;
+            println!("✓ Migration applied:");
+            println!("  → .prometheus/events-kg.jsonl");
+            println!("  → .prometheus/events-episodic.jsonl");
+            if !plan.unclassified.is_empty() {
+                println!("  → .prometheus/events-unsorted.jsonl ({} records need manual triage)", plan.unclassified.len());
             }
         }
     }

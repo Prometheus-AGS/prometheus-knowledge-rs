@@ -7,15 +7,13 @@ use pk_core::LibrarianEvent;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
-/// SurrealDB HTTP endpoint used when SURREAL_URL env var is set.
-const SURREAL_TABLE: &str = "event";
-
 pub struct EventStore {
     project_root: PathBuf,
     session_id: String,
     scope: String,
     surreal_url: Option<String>,
     surreal_ns: String,
+    #[allow(dead_code)]
     surreal_db: String,
     client: reqwest::Client,
     fallback: JsonlFallback,
@@ -75,25 +73,9 @@ impl EventStore {
         Ok(())
     }
 
-    /// Write a record to the SurrealDB HTTP API.
+    /// Write a record to the appropriate SurrealDB store (dual-store routing — SP-020).
     async fn write_to_surreal(&self, base_url: &str, record: &EventRecord) -> Result<()> {
-        let url = format!("{}/key/{}/{}", base_url, SURREAL_TABLE, record.id);
-        let resp = self
-            .client
-            .post(&url)
-            .header("NS", &self.surreal_ns)
-            .header("DB", &self.surreal_db)
-            .header("Accept", "application/json")
-            .json(record)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("SurrealDB POST {url} returned {status}: {body}");
-        }
-        Ok(())
+        crate::dual_store::write_to_target(&self.client, base_url, &self.surreal_ns, record).await
     }
 
     /// List recent events for this project.
