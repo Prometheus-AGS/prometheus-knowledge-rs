@@ -25,6 +25,49 @@ const MIN_SCORE: f32 = 0.15;
 /// Maximum keywords to return.
 const MAX_KEYWORDS: usize = 12;
 
+/// Extract keywords from a multi-turn conversation.
+///
+/// The input is a newline-separated sequence of turns. The last `n_turns` are
+/// used. Keywords from earlier turns decay per DECAY; keywords from later turns
+/// can reinforce or override earlier focus. Returns a compact query string.
+pub fn extract_query_multi_turn(turns_text: &str, n_turns: usize) -> String {
+    let turns: Vec<&str> = turns_text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = if turns.len() > n_turns { turns.len() - n_turns } else { 0 };
+    let active_turns = &turns[start..];
+
+    if active_turns.is_empty() {
+        return turns_text.to_owned();
+    }
+
+    let total = active_turns.len();
+    let mut scores: HashMap<String, f32> = HashMap::new();
+
+    for (turn_idx, turn) in active_turns.iter().enumerate() {
+        let window_keywords = extract_from_window(turn);
+        // Earlier turns decay more (turn 0 is oldest, turn total-1 is newest)
+        let age = (total - 1 - turn_idx) as i32;
+        let decay_factor = DECAY.powi(age);
+
+        for (kw, score) in window_keywords {
+            let entry = scores.entry(kw).or_insert(0.0);
+            *entry += score * decay_factor;
+        }
+    }
+
+    let mut ranked: Vec<(String, f32)> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let cutoff = ranked.first().map(|(_, s)| s * 0.1_f32).unwrap_or(0.0);
+    ranked.retain(|(_, s)| *s >= cutoff);
+    ranked.truncate(MAX_KEYWORDS);
+
+    if ranked.is_empty() {
+        return active_turns.last().copied().unwrap_or(turns_text).to_owned();
+    }
+
+    ranked.into_iter().map(|(kw, _)| kw).collect::<Vec<_>>().join(" ")
+}
+
 /// Extract keywords from a potentially long prompt using a sliding window.
 ///
 /// Returns a compact query string suitable for vector search. If the prompt is
@@ -174,6 +217,28 @@ mod tests {
         let repeated = "SurrealDB ".repeat(200) + &" PostgreSQL ".repeat(100);
         let result = extract_query(&(repeated + &"x".repeat(500)));
         assert!(result.contains("SurrealDB") || result.contains("surrealdb") || result.to_lowercase().contains("surrealdb"));
+    }
+
+    #[test]
+    fn multi_turn_latest_turn_dominates() {
+        // First turn about Rust, last turn about SurrealDB — SurrealDB should win
+        let turns = "rust ownership borrowing lifetimes\nSurrealDB SurrealDB SurrealDB schema tables";
+        let result = extract_query_multi_turn(turns, 10);
+        assert!(
+            result.to_lowercase().contains("surrealdb"),
+            "latest turn should dominate: got '{result}'"
+        );
+    }
+
+    #[test]
+    fn multi_turn_n_turns_limits_context() {
+        // 5 turns total but we only use last 2
+        let turns = "rust\nrust\nrust\nSurrealDB tables schema\nSurrealDB schema migrations";
+        let result = extract_query_multi_turn(turns, 2);
+        assert!(
+            result.to_lowercase().contains("surrealdb"),
+            "should use last 2 turns: got '{result}'"
+        );
     }
 
     #[test]

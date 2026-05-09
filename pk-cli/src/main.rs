@@ -63,6 +63,10 @@ enum Cmd {
         topic: String,
         #[arg(long, default_value_t = 10)]
         k: usize,
+        /// Treat the topic as N prior turns (newline-separated); later turns
+        /// reinforce keywords while earlier turns decay. SP-004.
+        #[arg(long, value_name = "N")]
+        context_window: Option<usize>,
     },
     /// Full-text search the knowledge base
     Search {
@@ -249,8 +253,13 @@ async fn main() -> Result<()> {
             if fix { println!("{fixed} auto-fixed"); }
         }
 
-        Cmd::Focus { topic, k } => {
-            println!("{}", librarian.focus(&topic, k).await?);
+        Cmd::Focus { topic, k, context_window } => {
+            let effective_topic = if let Some(n_turns) = context_window {
+                pk_librarian::extract_query_multi_turn(&topic, n_turns)
+            } else {
+                pk_librarian::extract_query(&topic)
+            };
+            println!("{}", librarian.focus(&effective_topic, k).await?);
         }
 
         Cmd::Search { query, k } => {
