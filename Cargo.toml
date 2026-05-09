@@ -64,6 +64,12 @@ tikv-jemallocator = { version = "0.6", optional = false }
 # Async trait objects
 async-trait = "0.1"
 
+# Cryptography
+sha2 = "0.10"
+
+# Platform directories
+dirs = "5"
+
 # Internal crates
 pk-core        = { path = "pk-core" }
 pk-store       = { path = "pk-store" }

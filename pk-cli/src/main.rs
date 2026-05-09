@@ -11,6 +11,7 @@ use pk_event_store::EventStore;
 use pk_core::types::RawDoc;
 use pk_librarian::{Librarian, ModelRouter};
 use pk_store::MarkdownStore;
+use sha2::{Digest, Sha256};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::broadcast;
 
@@ -67,6 +68,9 @@ enum Cmd {
         /// reinforce keywords while earlier turns decay. SP-004.
         #[arg(long, value_name = "N")]
         context_window: Option<usize>,
+        /// Skip cache lookup and write; always call the full focus pipeline. SP-003.
+        #[arg(long, default_value_t = false)]
+        no_cache: bool,
     },
     /// Full-text search the knowledge base
     Search {
@@ -271,13 +275,43 @@ async fn main() -> Result<()> {
             if fix { println!("{fixed} auto-fixed"); }
         }
 
-        Cmd::Focus { topic, k, context_window } => {
+        Cmd::Focus { topic, k, context_window, no_cache } => {
             let effective_topic = if let Some(n_turns) = context_window {
                 pk_librarian::extract_query_multi_turn(&topic, n_turns)
             } else {
                 pk_librarian::extract_query(&topic)
             };
-            println!("{}", librarian.focus(&effective_topic, k).await?);
+
+            // SP-003: SHA256-keyed result cache under ~/.prometheus/pk-focus-cache/
+            let cache_key = {
+                let mut h = Sha256::new();
+                h.update(effective_topic.as_bytes());
+                h.update(k.to_string().as_bytes());
+                format!("{:x}", h.finalize())
+            };
+            let cache_dir = dirs::home_dir()
+                .map(|h| h.join(".prometheus").join("pk-focus-cache"))
+                .unwrap_or_else(|| PathBuf::from(".prometheus/pk-focus-cache"));
+            let cache_file = cache_dir.join(format!("{cache_key}.md"));
+
+            if !no_cache {
+                if let Ok(cached) = tokio::fs::read_to_string(&cache_file).await {
+                    print!("{cached}");
+                    return Ok(());
+                }
+            }
+
+            let result = librarian.focus(&effective_topic, k).await?;
+
+            if !no_cache {
+                if let Err(e) = tokio::fs::create_dir_all(&cache_dir).await {
+                    tracing::warn!("pk-focus-cache dir create failed: {e}");
+                } else if let Err(e) = tokio::fs::write(&cache_file, result.as_bytes()).await {
+                    tracing::warn!("pk-focus-cache write failed: {e}");
+                }
+            }
+
+            println!("{result}");
         }
 
         Cmd::Search { query, k } => {
