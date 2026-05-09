@@ -71,6 +71,10 @@ enum Cmd {
         /// Skip cache lookup and write; always call the full focus pipeline. SP-003.
         #[arg(long, default_value_t = false)]
         no_cache: bool,
+        /// Wrap output as a system-context block for injection into AI prompts. SP-005.
+        /// Outputs: <system-context>\n{result}\n</system-context>
+        #[arg(long, default_value_t = false)]
+        inject_as_system_context: bool,
     },
     /// Full-text search the knowledge base
     Search {
@@ -275,7 +279,7 @@ async fn main() -> Result<()> {
             if fix { println!("{fixed} auto-fixed"); }
         }
 
-        Cmd::Focus { topic, k, context_window, no_cache } => {
+        Cmd::Focus { topic, k, context_window, no_cache, inject_as_system_context } => {
             let effective_topic = if let Some(n_turns) = context_window {
                 pk_librarian::extract_query_multi_turn(&topic, n_turns)
             } else {
@@ -296,7 +300,11 @@ async fn main() -> Result<()> {
 
             if !no_cache {
                 if let Ok(cached) = tokio::fs::read_to_string(&cache_file).await {
-                    print!("{cached}");
+                    if inject_as_system_context {
+                        println!("<system-context>\n{cached}\n</system-context>");
+                    } else {
+                        print!("{cached}");
+                    }
                     return Ok(());
                 }
             }
@@ -311,7 +319,11 @@ async fn main() -> Result<()> {
                 }
             }
 
-            println!("{result}");
+            if inject_as_system_context {
+                println!("<system-context>\n{result}\n</system-context>");
+            } else {
+                println!("{result}");
+            }
         }
 
         Cmd::Search { query, k } => {
