@@ -10,10 +10,11 @@ name = "pk"
 path = "src/main.rs"
 
 [dependencies]
-pk-core      = { workspace = true }
-pk-store     = { workspace = true }
-pk-librarian = { workspace = true }
-pk-watcher   = { workspace = true }
+pk-core        = { workspace = true }
+pk-store       = { workspace = true }
+pk-librarian   = { workspace = true }
+pk-watcher     = { workspace = true }
+pk-event-store = { workspace = true }
 tokio        = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }

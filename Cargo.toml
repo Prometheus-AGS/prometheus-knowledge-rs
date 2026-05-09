@@ -7,6 +7,7 @@ members = [
     "pk-mcp",
     "pk-uar",
     "pk-cherry",
+    "pk-event-store",
     "pk-cli",
 ]
 resolver = "2"
@@ -64,8 +65,9 @@ tikv-jemallocator = { version = "0.6", optional = false }
 async-trait = "0.1"
 
 # Internal crates
-pk-core     = { path = "pk-core" }
-pk-store    = { path = "pk-store" }
-pk-watcher  = { path = "pk-watcher" }
-pk-librarian = { path = "pk-librarian" }
-pk-mcp      = { path = "pk-mcp" }
+pk-core        = { path = "pk-core" }
+pk-store       = { path = "pk-store" }
+pk-watcher     = { path = "pk-watcher" }
+pk-librarian   = { path = "pk-librarian" }
+pk-mcp         = { path = "pk-mcp" }
+pk-event-store = { path = "pk-event-store" }

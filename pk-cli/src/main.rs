@@ -7,6 +7,7 @@ static ALLOC: Jemalloc = Jemalloc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use pk_event_store::EventStore;
 use pk_core::types::RawDoc;
 use pk_librarian::{Librarian, ModelRouter};
 use pk_store::MarkdownStore;
@@ -90,6 +91,35 @@ enum Cmd {
         #[command(subcommand)]
         action: CodegraphCmd,
     },
+    /// LibrarianEvent query and inspection (SP-019)
+    Events {
+        #[command(subcommand)]
+        action: EventsCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EventsCmd {
+    /// List recent events for this project
+    List {
+        /// Filter by event kind (compiled, lint_completed, focused, updated, etc.)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Max events to show
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show all events that affected a specific entry
+    ForEntry {
+        #[arg()]
+        entry_id: String,
+        /// Output as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -126,8 +156,29 @@ async fn main() -> Result<()> {
     }
 
     let store = Arc::new(MarkdownStore::open(&kb_dir).await?);
-    let (event_tx, _) = broadcast::channel(64);
+    let (event_tx, event_rx) = broadcast::channel(64);
     let librarian = Arc::new(Librarian::new(Arc::clone(&store), ModelRouter::from_env(), event_tx));
+
+    // Spawn background task: persist LibrarianEvents to EventStore (SP-019)
+    let persist_project_root = find_project_root()
+        .unwrap_or_else(|| std::env::current_dir().expect("cwd must exist"));
+    let _persist_handle = tokio::spawn(async move {
+        let event_store = EventStore::for_project(&persist_project_root, "project");
+        let mut rx = event_rx;
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if let Err(e) = event_store.persist(&event).await {
+                        tracing::warn!("event persist failed: {e}");
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("event persist subscriber lagged by {n} messages");
+                }
+            }
+        }
+    });
 
     match cli.command {
         Cmd::Ingest { file, source, scope, yes } => {
@@ -235,6 +286,54 @@ async fn main() -> Result<()> {
             match action {
                 CodegraphCmd::Extract { project, output, ci } => {
                     run_codegraph_extract(project, output, ci)?;
+                }
+            }
+        }
+
+        Cmd::Events { action } => {
+            let project_root = find_project_root()
+                .unwrap_or_else(|| std::env::current_dir().expect("cwd must exist"));
+            let event_store = EventStore::for_project(&project_root, "project");
+
+            match action {
+                EventsCmd::List { kind, limit, json } => {
+                    let records = event_store.list(kind.as_deref(), limit)?;
+                    if records.is_empty() {
+                        println!("(no events recorded for this project)");
+                    } else if json {
+                        println!("{}", serde_json::to_string_pretty(&records)?);
+                    } else {
+                        for r in &records {
+                            println!("[{}] {} — {} ({})",
+                                r.timestamp.format("%Y-%m-%d %H:%M:%S"),
+                                r.kind,
+                                if r.affects.is_empty() {
+                                    "(no entry)".to_string()
+                                } else {
+                                    r.affects.join(", ")
+                                },
+                                r.id
+                            );
+                        }
+                        println!("\n{} event(s)", records.len());
+                    }
+                }
+                EventsCmd::ForEntry { entry_id, json } => {
+                    let records = event_store.for_entry(&entry_id)?;
+                    if records.is_empty() {
+                        println!("(no events found for entry {entry_id})");
+                    } else if json {
+                        println!("{}", serde_json::to_string_pretty(&records)?);
+                    } else {
+                        for r in &records {
+                            println!("[{}] {} — {}",
+                                r.timestamp.format("%Y-%m-%d %H:%M:%S"),
+                                r.kind,
+                                r.id
+                            );
+                        }
+                        println!("\n{} event(s) for {entry_id}", records.len());
+                    }
                 }
             }
         }
