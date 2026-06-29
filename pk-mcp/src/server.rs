@@ -1,4 +1,4 @@
-use crate::tools::{dispatch, McpRequest, McpResponse};
+use crate::tools::{dispatch, McpRequest};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -63,8 +63,13 @@ impl McpServer {
 async fn mcp_handler(
     State(state): State<AppState>,
     Json(req): Json<McpRequest>,
-) -> Json<McpResponse> {
-    Json(dispatch(&state.librarian, req).await)
+) -> axum::response::Response {
+    // JSON-RPC notifications (no `id`, e.g. notifications/initialized) expect no
+    // response body — acknowledge with 202 so the client proceeds.
+    if req.id.is_null() {
+        return StatusCode::ACCEPTED.into_response();
+    }
+    Json(dispatch(&state.librarian, req).await).into_response()
 }
 
 async fn sse_handler(

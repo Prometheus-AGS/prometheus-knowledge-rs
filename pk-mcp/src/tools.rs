@@ -6,12 +6,17 @@ use std::sync::Arc;
 #[derive(Debug, Deserialize)]
 pub struct McpRequest {
     pub method: String,
+    // Tolerant: `initialize`/notifications may omit params, notifications omit id.
+    #[serde(default)]
     pub params: serde_json::Value,
+    #[serde(default)]
     pub id: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
 pub struct McpResponse {
+    // JSON-RPC 2.0 requires this on every response; strict MCP clients reject its absence.
+    pub jsonrpc: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -28,6 +33,7 @@ pub struct McpError {
 impl McpResponse {
     pub fn ok(id: serde_json::Value, result: impl Serialize) -> Self {
         Self {
+            jsonrpc: "2.0",
             result: Some(serde_json::to_value(result).unwrap_or_default()),
             error: None,
             id,
@@ -38,6 +44,7 @@ impl McpResponse {
     #[inline(never)]
     pub fn err(id: serde_json::Value, code: i32, msg: impl std::fmt::Display) -> Self {
         Self {
+            jsonrpc: "2.0",
             result: None,
             error: Some(McpError { code, message: msg.to_string() }),
             id,
@@ -107,7 +114,35 @@ pub fn tool_list() -> serde_json::Value {
 
 pub async fn dispatch(librarian: &Arc<Librarian>, req: McpRequest) -> McpResponse {
     match req.method.as_str() {
-        "tools/list"       => McpResponse::ok(req.id, tool_list()),
+        // MCP lifecycle — required so spec-compliant clients (Claude Code, etc.)
+        // complete the Streamable HTTP handshake before listing/calling tools.
+        "initialize" => McpResponse::ok(
+            req.id,
+            serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "prometheus-knowledge", "version": env!("CARGO_PKG_VERSION") }
+            }),
+        ),
+        "ping" => McpResponse::ok(req.id, serde_json::json!({})),
+        "tools/list" => McpResponse::ok(req.id, tool_list()),
+
+        // Standard MCP tool invocation: params = { name, arguments }.
+        "tools/call" => {
+            let name = req.params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let arguments = req.params.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+            let sub = McpRequest { method: name.clone(), params: arguments, id: req.id.clone() };
+            match name.as_str() {
+                "knowledge_ingest" => handle_ingest(librarian, sub).await,
+                "knowledge_lint"   => handle_lint(librarian, sub).await,
+                "knowledge_focus"  => handle_focus(librarian, sub).await,
+                "knowledge_search" => handle_search(librarian, sub).await,
+                "knowledge_get"    => handle_get(librarian, sub).await,
+                other => McpResponse::err(req.id, -32601, format!("unknown tool: {other}")),
+            }
+        }
+
+        // Back-compat: bare method names still work for existing callers.
         "knowledge_ingest" => handle_ingest(librarian, req).await,
         "knowledge_lint"   => handle_lint(librarian, req).await,
         "knowledge_focus"  => handle_focus(librarian, req).await,
