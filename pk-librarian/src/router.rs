@@ -30,8 +30,11 @@ impl ModelRoute {
     fn local_qwen(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
+            // Defaults to the local openai-proxy (git@github.com:GQAdonis/openai-proxy.git,
+            // systemd --user unit ai.prometheus.openai-proxy.service) bridging Codex CLI auth
+            // rather than an LM Studio/Cherry Studio instance, since none runs on this box.
             base_url: std::env::var("LOCAL_LLM_URL")
-                .unwrap_or_else(|_| "http://localhost:1234/v1".into()),
+                .unwrap_or_else(|_| "http://localhost:8181/v1".into()),
             api_key: None,
             temperature: 0.3,
         }
@@ -40,8 +43,11 @@ impl ModelRoute {
     fn cloud(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
+            // Defaults to the local openai-proxy rather than api.openai.com so Compile
+            // works with zero extra credentials (auth is handled proxy-side via
+            // ~/.codex/auth.json).
             base_url: std::env::var("CLOUD_LLM_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
+                .unwrap_or_else(|_| "http://localhost:8181/v1".into()),
             api_key: std::env::var("CLOUD_LLM_API_KEY").ok(),
             temperature: 0.2,
         }
@@ -64,20 +70,16 @@ impl ModelRouter {
     pub fn from_env() -> Self {
         Self {
             compile: ModelRoute::cloud(
-                std::env::var("PK_COMPILE_MODEL")
-                    .unwrap_or_else(|_| "claude-sonnet-4-6".into()),
+                std::env::var("PK_COMPILE_MODEL").unwrap_or_else(|_| "gpt-5.5".into()),
             ),
             lint: ModelRoute::local_qwen(
-                std::env::var("PK_LINT_MODEL")
-                    .unwrap_or_else(|_| "qwen2.5-14b-instruct-q4_k_m".into()),
+                std::env::var("PK_LINT_MODEL").unwrap_or_else(|_| "gpt-5.4-mini".into()),
             ),
             focus: ModelRoute::local_qwen(
-                std::env::var("PK_FOCUS_MODEL")
-                    .unwrap_or_else(|_| "qwen2.5-14b-instruct-q4_k_m".into()),
+                std::env::var("PK_FOCUS_MODEL").unwrap_or_else(|_| "gpt-5.4-mini".into()),
             ),
             fix: ModelRoute::local_qwen(
-                std::env::var("PK_FIX_MODEL")
-                    .unwrap_or_else(|_| "qwen2.5-14b-instruct-q4_k_m".into()),
+                std::env::var("PK_FIX_MODEL").unwrap_or_else(|_| "gpt-5.4-mini".into()),
             ),
         }
     }
