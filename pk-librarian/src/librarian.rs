@@ -79,22 +79,34 @@ impl Librarian {
         let count = snapshot.len();
         info!(entries = count, "starting lint pass");
 
-        if snapshot.is_empty() {
-            return Ok(Vec::new());
+        // Deterministic OKF §9 conformance always runs first — it needs no
+        // model, so it stays reliable even when the lint LLM is unavailable.
+        let mut reports = self.store.okf_conformance_reports().await?;
+        let okf_count = reports.len();
+
+        // LLM content-quality lint (missing links, staleness, duplicates, …)
+        // is best-effort: a lint-model failure must not suppress the
+        // conformance results, so on error we log and return what we have.
+        if !snapshot.is_empty() {
+            match serde_json::to_string(&snapshot) {
+                Ok(snapshot_json) => {
+                    let client = self.router.build_client(TaskKind::Lint);
+                    match client
+                        .complete(LINT_SYSTEM, &lint_user_prompt(&snapshot_json), None, 0.1)
+                        .await
+                    {
+                        Ok(response) => match parse_lint_response(&response) {
+                            Ok(llm_reports) => reports.extend(llm_reports),
+                            Err(e) => error!(err = %e, "lint LLM response parse failed; keeping OKF conformance reports only"),
+                        },
+                        Err(e) => error!(err = %e, "lint LLM call failed; keeping OKF conformance reports only"),
+                    }
+                }
+                Err(e) => error!(err = %e, "snapshot serialization failed; keeping OKF conformance reports only"),
+            }
         }
 
-        let snapshot_json = serde_json::to_string(&snapshot)
-            .map_err(|e| PkError::llm(format!("snapshot serialization: {e}")))?;
-
-        let client = self.router.build_client(TaskKind::Lint);
-        let response = client
-            .complete(LINT_SYSTEM, &lint_user_prompt(&snapshot_json), None, 0.1)
-            .await
-            .map_err(|e| PkError::llm(e.to_string()))?;
-
-        let reports = parse_lint_response(&response)?;
-        info!(issues = reports.len(), "lint pass complete");
-
+        info!(issues = reports.len(), okf_conformance = okf_count, "lint pass complete");
         let _ = self.event_tx.send(LibrarianEvent::lint_completed(reports.clone(), count));
         Ok(reports)
     }
@@ -130,6 +142,19 @@ impl Librarian {
             .entry_id
             .as_ref()
             .ok_or_else(|| PkError::llm("auto_fix requires an entry_id"))?;
+
+        // Deterministic OKF structural fix: an entry missing its required
+        // `type` is repaired by assigning the default — no LLM needed. Keyed
+        // on the stored entry's actual state, not the report text, so it is
+        // robust. Falls through to the content fixer when nothing to repair.
+        if let Some(fixed) = self.store.okf_autofix_type(entry_id).await? {
+            let _ = self.event_tx.send(LibrarianEvent::Updated {
+                entry_id: fixed.id.clone(),
+                revision: fixed.revision,
+                ts: chrono::Utc::now(),
+            });
+            return Ok(fixed);
+        }
 
         let mut entry = self.store.get(entry_id).await?;
         let client = self.router.build_client(TaskKind::Fix);

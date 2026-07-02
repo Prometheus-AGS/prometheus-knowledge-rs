@@ -5,8 +5,9 @@
 //! Everything here is a pure function of its inputs so it can be unit-tested
 //! without a store or an LLM; `MarkdownStore` wires these to disk.
 
-use pk_core::types::{ArticleId, WikiEntry};
+use pk_core::types::{ArticleId, LintReport, LintSeverity, WikiEntry};
 use pulldown_cmark::{Event, Parser, Tag};
+use std::collections::HashSet;
 
 /// OKF §5.1: a bundle-relative link begins with `/` (interpreted from the
 /// bundle root) and, for a concept link, ends in `.md`. Converts such a link
@@ -151,6 +152,181 @@ fn finish_log(lines: Vec<String>) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// OKF v0.1 §9 conformance lint (deterministic; no LLM).
+//
+// Permissive consumption (§9) shapes the severity split: the ONLY hard
+// requirements are a parseable frontmatter block and a non-empty `type` —
+// those are errors. Everything else (missing recommended fields, unknown
+// types, broken cross-links, orphans, reserved-file shape) is advisory and
+// is reported as a warning, never a rejection.
+// ---------------------------------------------------------------------------
+
+fn report(
+    id: Option<&str>,
+    severity: LintSeverity,
+    issue: impl Into<String>,
+    suggestion: impl Into<String>,
+    auto_fixable: bool,
+) -> LintReport {
+    LintReport {
+        entry_id: id.map(ArticleId::from),
+        severity,
+        issue: issue.into(),
+        suggestion: suggestion.into(),
+        auto_fixable,
+    }
+}
+
+/// OKF §9 conformance checks for one concept document. `raw` is the file's
+/// full content; `concept_id` is its wiki-relative id (used as the parse
+/// fallback and the report subject); `known_ids` is every concept ID in the
+/// bundle, for broken-link detection.
+pub fn okf_document_reports(
+    concept_id: &str,
+    raw: &str,
+    known_ids: &HashSet<String>,
+) -> Vec<LintReport> {
+    let mut reports = Vec::new();
+
+    // §9.1: parseable frontmatter is a hard requirement.
+    let entry = match crate::markdown::markdown_to_entry(raw, Some(concept_id)) {
+        Ok(entry) => entry,
+        Err(e) => {
+            reports.push(report(
+                Some(concept_id),
+                LintSeverity::Error,
+                format!("frontmatter does not parse: {e}"),
+                "fix the YAML frontmatter block (delimited by --- fences)",
+                false,
+            ));
+            return reports;
+        }
+    };
+
+    // §9.2: a non-empty `type` is the format's one required field.
+    if entry.entry_type.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        reports.push(report(
+            Some(concept_id),
+            LintSeverity::Error,
+            "missing or empty required OKF `type` frontmatter key",
+            "add a non-empty `type:` line (e.g. `type: Reference`)",
+            true,
+        ));
+    }
+
+    // Recommended field (§4.1): advisory only.
+    if entry.description.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        reports.push(report(
+            Some(concept_id),
+            LintSeverity::Warning,
+            "missing recommended OKF `description`",
+            "add a one-sentence `description:` for index and search snippets",
+            false,
+        ));
+    }
+
+    // Broken cross-links (§5): tolerated, so warn — never error.
+    for link in extract_body_links(&entry.content) {
+        if !known_ids.contains(link.as_str()) {
+            reports.push(report(
+                Some(concept_id),
+                LintSeverity::Warning,
+                format!("body links to /{}.md, which is not in the bundle", link.as_str()),
+                "create the target page or fix the link (OKF §5 tolerates broken links)",
+                false,
+            ));
+        }
+    }
+
+    reports
+}
+
+/// OKF orphan detection: concepts with no inbound body link from any other
+/// concept. Advisory (§: healthy-wiki guidance, not conformance). Skipped
+/// for a single-entry bundle where "orphan" is meaningless.
+pub fn okf_orphan_reports(entries: &[WikiEntry]) -> Vec<LintReport> {
+    let mut reports = Vec::new();
+    if entries.len() <= 1 {
+        return reports;
+    }
+    let mut linked_to: HashSet<String> = HashSet::new();
+    for e in entries {
+        for l in extract_body_links(&e.content) {
+            linked_to.insert(l.0);
+        }
+    }
+    for e in entries {
+        if !linked_to.contains(e.id.as_str()) {
+            reports.push(report(
+                Some(e.id.as_str()),
+                LintSeverity::Warning,
+                "orphan page: no inbound links from any other page",
+                "link to this page from a related page or from index.md",
+                false,
+            ));
+        }
+    }
+    reports
+}
+
+fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[8..].iter().all(u8::is_ascii_digit)
+}
+
+/// OKF §6 structure check for a root `index.md`: it carries no frontmatter,
+/// except that the bundle-root index MAY carry a block declaring only
+/// `okf_version` (§11). Any other leading `---` block is a warning.
+pub fn okf_index_reports(raw: &str) -> Vec<LintReport> {
+    let mut reports = Vec::new();
+    let trimmed = raw.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
+            let fm = &rest[..end];
+            let only_okf_version = fm
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .all(|l| l.trim_start().starts_with("okf_version"));
+            if !only_okf_version {
+                reports.push(report(
+                    Some("index.md"),
+                    LintSeverity::Warning,
+                    "index.md carries frontmatter beyond an okf_version declaration",
+                    "remove the frontmatter (OKF §6: index.md has none; only the root MAY declare okf_version)",
+                    false,
+                ));
+            }
+        }
+    }
+    reports
+}
+
+/// OKF §7 structure check for `log.md`: every `## ` heading is an ISO
+/// `YYYY-MM-DD` date.
+pub fn okf_log_reports(raw: &str) -> Vec<LintReport> {
+    let mut reports = Vec::new();
+    for line in raw.lines() {
+        if let Some(heading) = line.trim().strip_prefix("## ") {
+            if !is_iso_date(heading.trim()) {
+                reports.push(report(
+                    Some("log.md"),
+                    LintSeverity::Warning,
+                    format!("log.md date heading {heading:?} is not ISO YYYY-MM-DD"),
+                    "use `## YYYY-MM-DD` date headings (OKF §7)",
+                    false,
+                ));
+            }
+        }
+    }
+    reports
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +413,91 @@ mod tests {
         let new_group = out.find("## 2026-07-02").unwrap();
         let old_group = out.find("## 2026-07-01").unwrap();
         assert!(new_group < old_group, "newest date group must lead");
+    }
+
+    fn ids(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn conformant_document_produces_no_errors() {
+        let raw = "---\ntype: Reference\ntitle: Foo\ndescription: A thing.\n---\n\nBody with [Bar](/bar.md).";
+        let reports = okf_document_reports("foo", raw, &ids(&["foo", "bar"]));
+        assert!(reports.iter().all(|r| r.severity != LintSeverity::Error), "{reports:?}");
+    }
+
+    #[test]
+    fn unparseable_frontmatter_is_an_error() {
+        let raw = "no frontmatter fence here";
+        let reports = okf_document_reports("foo", raw, &ids(&["foo"]));
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].severity, LintSeverity::Error);
+        assert!(reports[0].issue.contains("does not parse"));
+    }
+
+    #[test]
+    fn missing_type_is_an_autofixable_error() {
+        let raw = "---\ntitle: No Type\ndescription: x\n---\n\nBody.";
+        let reports = okf_document_reports("foo", raw, &ids(&["foo"]));
+        let type_err = reports
+            .iter()
+            .find(|r| r.issue.contains("`type`"))
+            .expect("expected a type error");
+        assert_eq!(type_err.severity, LintSeverity::Error);
+        assert!(type_err.auto_fixable);
+    }
+
+    #[test]
+    fn missing_description_is_a_warning_not_an_error() {
+        let raw = "---\ntype: Reference\ntitle: Foo\n---\n\nBody.";
+        let reports = okf_document_reports("foo", raw, &ids(&["foo"]));
+        assert!(reports.iter().all(|r| r.severity != LintSeverity::Error));
+        assert!(reports.iter().any(|r| r.issue.contains("description") && r.severity == LintSeverity::Warning));
+    }
+
+    #[test]
+    fn broken_body_link_is_a_warning() {
+        let raw = "---\ntype: Reference\ntitle: Foo\ndescription: x\n---\n\nSee [Gone](/missing.md).";
+        let reports = okf_document_reports("foo", raw, &ids(&["foo"]));
+        let broken = reports.iter().find(|r| r.issue.contains("missing.md")).expect("broken link");
+        assert_eq!(broken.severity, LintSeverity::Warning);
+    }
+
+    #[test]
+    fn orphan_detection_flags_unlinked_pages() {
+        let mut a = entry("a", "A", Some("Reference"), Some("d"));
+        a.content = "Links to [B](/b.md).".into();
+        let b = entry("b", "B", Some("Reference"), Some("d")); // no inbound? a links to b
+        let c = entry("c", "C", Some("Reference"), Some("d")); // orphan
+        let reports = okf_orphan_reports(&[a, b, c]);
+        let orphans: Vec<_> = reports.iter().filter_map(|r| r.entry_id.as_ref().map(|i| i.as_str())).collect();
+        assert!(orphans.contains(&"c"), "c should be an orphan: {orphans:?}");
+        assert!(orphans.contains(&"a"), "a has no inbound link either: {orphans:?}");
+        assert!(!orphans.contains(&"b"), "b is linked from a: {orphans:?}");
+    }
+
+    #[test]
+    fn index_with_extra_frontmatter_warns_but_okf_version_ok() {
+        let with_version = "---\nokf_version: \"0.1\"\n---\n\n# Wiki Index\n";
+        assert!(okf_index_reports(with_version).is_empty());
+
+        let with_extra = "---\nokf_version: \"0.1\"\ntitle: nope\n---\n\n# Wiki Index\n";
+        let reports = okf_index_reports(with_extra);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].severity, LintSeverity::Warning);
+
+        let no_fm = "# Wiki Index\n\n* [Foo](/foo.md)\n";
+        assert!(okf_index_reports(no_fm).is_empty());
+    }
+
+    #[test]
+    fn log_non_iso_date_heading_warns() {
+        let bad = "# Update Log\n\n## July 2 2026\n* **Creation**: [Foo](/foo.md)\n";
+        let reports = okf_log_reports(bad);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].severity, LintSeverity::Warning);
+
+        let good = "# Update Log\n\n## 2026-07-02\n* **Creation**: [Foo](/foo.md)\n";
+        assert!(okf_log_reports(good).is_empty());
     }
 }

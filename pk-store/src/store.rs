@@ -4,7 +4,7 @@ use crate::{
 };
 use pk_core::{
     error::{PkError, PkResult},
-    types::{ArticleId, RawDoc, WikiEntry},
+    types::{ArticleId, LintReport, RawDoc, WikiEntry},
 };
 use std::{
     collections::HashMap,
@@ -198,6 +198,91 @@ impl MarkdownStore {
 
     pub async fn entry_count(&self) -> usize {
         self.inner.read().await.entries.len()
+    }
+
+    /// Scan the wiki tree and return OKF v0.1 §9 conformance reports
+    /// (deterministic; no LLM). Reads raw files so it can flag documents the
+    /// store skipped on load (e.g. unparseable frontmatter), and checks the
+    /// reserved `index.md`/`log.md` structure. Orphan detection uses the
+    /// in-memory snapshot.
+    pub async fn okf_conformance_reports(&self) -> PkResult<Vec<LintReport>> {
+        use std::collections::HashSet;
+
+        let mut concept_files: Vec<(String, String)> = Vec::new();
+        let mut index_raw: Option<String> = None;
+        let mut log_raw: Option<String> = None;
+
+        let mut dirs = vec![self.wiki_dir.clone()];
+        while let Some(dir_path) = dirs.pop() {
+            let mut rd = tokio::fs::read_dir(&dir_path).await?;
+            while let Some(entry) = rd.next_entry().await? {
+                let path = entry.path();
+                if entry.file_type().await?.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+                let at_root = dir_path == self.wiki_dir;
+                if crate::markdown::is_reserved_filename(name) {
+                    // Only the bundle-root index.md/log.md get structure checks.
+                    if at_root && name == "index.md" {
+                        index_raw = Some(content);
+                    } else if at_root && name == "log.md" {
+                        log_raw = Some(content);
+                    }
+                    continue;
+                }
+                let relative = path.strip_prefix(&self.wiki_dir).unwrap_or(&path);
+                let id: String = relative
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let id = id.trim_end_matches(".md").to_string();
+                concept_files.push((id, content));
+            }
+        }
+
+        let known_ids: HashSet<String> =
+            concept_files.iter().map(|(id, _)| id.clone()).collect();
+
+        let mut reports = Vec::new();
+        for (id, raw) in &concept_files {
+            reports.extend(crate::bundle::okf_document_reports(id, raw, &known_ids));
+        }
+        let snapshot = self.snapshot().await?;
+        reports.extend(crate::bundle::okf_orphan_reports(&snapshot));
+        if let Some(idx) = index_raw {
+            reports.extend(crate::bundle::okf_index_reports(&idx));
+        }
+        if let Some(log) = log_raw {
+            reports.extend(crate::bundle::okf_log_reports(&log));
+        }
+        Ok(reports)
+    }
+
+    /// Deterministically fix an entry missing a non-empty OKF `type` by
+    /// assigning the generic default and re-persisting it. Returns the fixed
+    /// entry, or `None` if the entry already had a type (nothing to fix).
+    pub async fn okf_autofix_type(&self, id: &ArticleId) -> PkResult<Option<WikiEntry>> {
+        let mut entry = self.get(id).await?;
+        if entry
+            .entry_type
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            entry.entry_type = Some("Reference".to_string());
+            return Ok(Some(self.upsert(entry).await?));
+        }
+        Ok(None)
     }
 
     pub async fn related_entries(&self, doc: &RawDoc, k: usize) -> PkResult<Vec<WikiEntry>> {

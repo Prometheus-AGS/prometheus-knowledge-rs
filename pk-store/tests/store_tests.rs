@@ -12,6 +12,71 @@ async fn temp_store() -> (Arc<MarkdownStore>, tempfile::TempDir) {
     (store, dir)
 }
 
+/// OKF §9: pk lint scans raw files (so it catches documents the store skips
+/// on load) and classifies violations by the permissive-consumption split —
+/// a missing `type` is an auto-fixable error; a healthy page is clean.
+/// okf_autofix_type then repairs it deterministically.
+#[tokio::test]
+async fn okf_conformance_lint_and_autofix() {
+    use pk_core::types::LintSeverity;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wiki = dir.path().join("wiki");
+    tokio::fs::create_dir_all(&wiki).await.unwrap();
+
+    // A conformant page (type + description).
+    tokio::fs::write(
+        wiki.join("good.md"),
+        "---\ntype: Reference\ntitle: Good\ndescription: A conformant page.\n---\n\nBody.\n",
+    )
+    .await
+    .unwrap();
+    // A parseable page missing the required `type`.
+    tokio::fs::write(
+        wiki.join("no-type.md"),
+        "---\ntitle: No Type\ndescription: Present.\n---\n\nBody.\n",
+    )
+    .await
+    .unwrap();
+
+    let store = MarkdownStore::open(dir.path()).await.unwrap();
+    let reports = store.okf_conformance_reports().await.unwrap();
+
+    // The type-less page yields exactly one auto-fixable error; the good page
+    // yields no error.
+    let type_errors: Vec<_> = reports
+        .iter()
+        .filter(|r| r.severity == LintSeverity::Error && r.issue.contains("`type`"))
+        .collect();
+    assert_eq!(type_errors.len(), 1, "one type error expected: {reports:?}");
+    assert_eq!(type_errors[0].entry_id.as_ref().unwrap().as_str(), "no-type");
+    assert!(type_errors[0].auto_fixable);
+    assert!(
+        !reports
+            .iter()
+            .any(|r| r.severity == LintSeverity::Error
+                && r.entry_id.as_ref().map(|i| i.as_str()) == Some("good")),
+        "good.md must produce no error: {reports:?}"
+    );
+
+    // Deterministic auto-fix repairs the type-less page.
+    let fixed = store
+        .okf_autofix_type(&ArticleId::from("no-type"))
+        .await
+        .unwrap();
+    assert!(fixed.is_some());
+    assert_eq!(fixed.unwrap().entry_type.as_deref(), Some("Reference"));
+
+    // After the fix, no type errors remain.
+    let after = store.okf_conformance_reports().await.unwrap();
+    assert!(
+        after
+            .iter()
+            .all(|r| !(r.severity == LintSeverity::Error && r.issue.contains("`type`"))),
+        "no type errors after fix: {after:?}"
+    );
+}
+
 /// OKF §6/§7: after ingests, the wiki root carries an index.md cataloging
 /// every entry and a log.md with dated, newest-first entries. Reserved files
 /// must survive a store reopen (they are skipped as concept documents).
