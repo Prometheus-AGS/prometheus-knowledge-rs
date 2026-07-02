@@ -47,7 +47,22 @@ impl Librarian {
             .map_err(|e| PkError::llm(e.to_string()))?;
 
         let entry = parse_compile_response(&response)?;
+        // revision 0 means this id did not exist before upsert (WikiEntry::new
+        // starts at 0; upsert bumps it only for an existing id) — so it drives
+        // the Creation vs Update distinction in the OKF log.
+        let is_new = entry.revision == 0;
         let entry = self.store.upsert(entry).await?;
+
+        // Maintain the two OKF reserved bundle files (§6 index, §7 log) after
+        // every ingest. Best-effort: a bookkeeping failure must not lose the
+        // compiled entry, which is already persisted.
+        if let Err(e) = self.store.regenerate_index().await {
+            error!(err = %e, "failed to regenerate index.md");
+        }
+        let action = if is_new { "Creation" } else { "Update" };
+        if let Err(e) = self.store.append_log(action, &entry.title, &entry.id).await {
+            error!(err = %e, "failed to append log.md");
+        }
 
         let _ = self.event_tx.send(LibrarianEvent::compiled(
             entry.id.clone(),
@@ -180,7 +195,17 @@ fn parse_compile_response(raw: &str) -> PkResult<WikiEntry> {
         .with_sources(out.sources);
 
     let mut entry = entry;
-    entry.links = out.links.into_iter().map(ArticleId::from).collect();
+    // Link graph is derived from bundle-relative links the model embedded in
+    // the body (OKF §5); the JSON `links` array is honored only for
+    // back-compat with older prompts. Body links win and lead.
+    let mut links = pk_store::bundle::extract_body_links(&entry.content);
+    for slug in out.links {
+        let id = ArticleId::from(slug);
+        if !links.contains(&id) {
+            links.push(id);
+        }
+    }
+    entry.links = links;
     // OKF v0.1 §4.1: `type` is the format's one required frontmatter key.
     // The compile prompt doesn't yet ask the model to classify entries, so
     // every Librarian-compiled entry defaults to the generic OKF type.

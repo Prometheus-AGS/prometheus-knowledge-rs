@@ -171,6 +171,31 @@ impl MarkdownStore {
         Ok(inner.entries.values().cloned().collect())
     }
 
+    /// Regenerate the wiki-root `index.md` (OKF §6) from the current entries.
+    /// Called after every ingest so the catalog stays current.
+    pub async fn regenerate_index(&self) -> PkResult<()> {
+        let entries = self.snapshot().await?;
+        let content = crate::bundle::render_index(&entries);
+        let path = self.wiki_dir.join("index.md");
+        tokio::fs::write(&path, content).await?;
+        debug!(path = %path.display(), "index.md regenerated");
+        Ok(())
+    }
+
+    /// Append an entry to the wiki-root `log.md` (OKF §7) under today's date
+    /// group, newest first. `action` is the leading bold verb (`Creation`,
+    /// `Update`, …).
+    pub async fn append_log(&self, action: &str, title: &str, id: &ArticleId) -> PkResult<()> {
+        let path = self.wiki_dir.join("log.md");
+        let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let line = format!("* **{action}**: [{title}](/{}.md)", id.as_str());
+        let updated = crate::bundle::append_log_line(&existing, &date, &line);
+        tokio::fs::write(&path, updated).await?;
+        debug!(path = %path.display(), action, "log.md appended");
+        Ok(())
+    }
+
     pub async fn entry_count(&self) -> usize {
         self.inner.read().await.entries.len()
     }

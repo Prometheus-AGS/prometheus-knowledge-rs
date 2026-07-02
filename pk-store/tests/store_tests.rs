@@ -12,6 +12,47 @@ async fn temp_store() -> (Arc<MarkdownStore>, tempfile::TempDir) {
     (store, dir)
 }
 
+/// OKF §6/§7: after ingests, the wiki root carries an index.md cataloging
+/// every entry and a log.md with dated, newest-first entries. Reserved files
+/// must survive a store reopen (they are skipped as concept documents).
+#[tokio::test]
+async fn index_and_log_are_written_and_survive_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wiki = dir.path().join("wiki");
+
+    {
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+
+        let mut a = WikiEntry::new("Axum", "Async web framework.");
+        a.description = Some("Async Rust web framework.".into());
+        store.upsert(a.clone()).await.unwrap();
+        store.regenerate_index().await.unwrap();
+        store.append_log("Creation", &a.title, &a.id).await.unwrap();
+
+        let mut b = WikiEntry::new("Tower", "Middleware layers.");
+        b.description = Some("Composable middleware.".into());
+        store.upsert(b.clone()).await.unwrap();
+        store.regenerate_index().await.unwrap();
+        store.append_log("Creation", &b.title, &b.id).await.unwrap();
+    }
+
+    let index = tokio::fs::read_to_string(wiki.join("index.md")).await.unwrap();
+    assert!(index.contains("[Axum](/axum.md)"), "index missing Axum: {index}");
+    assert!(index.contains("[Tower](/tower.md)"), "index missing Tower: {index}");
+    assert!(index.contains("Async Rust web framework."));
+
+    let log = tokio::fs::read_to_string(wiki.join("log.md")).await.unwrap();
+    assert!(log.contains("## "), "log missing a date heading: {log}");
+    // Newest entry (Tower) appended most recently → leads within the day.
+    let tower = log.find("[Tower]").unwrap();
+    let axum = log.find("[Axum]").unwrap();
+    assert!(tower < axum, "newest log entry must lead: {log}");
+
+    // Reserved files are not loaded as concept documents.
+    let store2 = MarkdownStore::open(dir.path()).await.unwrap();
+    assert_eq!(store2.entry_count().await, 2);
+}
+
 #[tokio::test]
 async fn upsert_and_get_roundtrip() {
     let (store, _dir) = temp_store().await;
