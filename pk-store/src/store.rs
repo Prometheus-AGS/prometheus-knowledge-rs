@@ -1,6 +1,6 @@
 use crate::{
     index::TextIndex,
-    markdown::{article_path, entry_to_markdown, markdown_to_entry},
+    markdown::{article_path, entry_to_markdown, is_reserved_filename, markdown_to_entry},
 };
 use pk_core::{
     error::{PkError, PkResult},
@@ -46,18 +46,30 @@ impl MarkdownStore {
         let mut dir = tokio::fs::read_dir(&wiki_dir).await?;
         while let Some(entry) = dir.next_entry().await? {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                match tokio::fs::read_to_string(&path).await {
-                    Ok(content) => match markdown_to_entry(&content) {
-                        Ok(wiki_entry) => {
-                            debug!(id = %wiki_entry.id, "loaded entry");
-                            inner.index.upsert(&wiki_entry);
-                            inner.entries.insert(wiki_entry.id.clone(), wiki_entry);
-                        }
-                        Err(e) => warn!(path = %path.display(), err = %e, "skipping malformed entry"),
-                    },
-                    Err(e) => warn!(path = %path.display(), err = %e, "failed to read entry"),
-                }
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // OKF v0.1 §3.1: index.md and log.md are reserved bundle files,
+            // never concept documents — skip them rather than trying (and
+            // failing) to parse them as wiki entries.
+            if is_reserved_filename(file_name) {
+                debug!(path = %path.display(), "skipping reserved OKF filename");
+                continue;
+            }
+            let fallback_id = file_name.trim_end_matches(".md");
+            match tokio::fs::read_to_string(&path).await {
+                Ok(content) => match markdown_to_entry(&content, Some(fallback_id)) {
+                    Ok(wiki_entry) => {
+                        debug!(id = %wiki_entry.id, "loaded entry");
+                        inner.index.upsert(&wiki_entry);
+                        inner.entries.insert(wiki_entry.id.clone(), wiki_entry);
+                    }
+                    Err(e) => warn!(path = %path.display(), err = %e, "skipping malformed entry"),
+                },
+                Err(e) => warn!(path = %path.display(), err = %e, "failed to read entry"),
             }
         }
 

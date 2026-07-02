@@ -129,6 +129,34 @@ async fn entries_persist_across_store_reopen() {
     assert_eq!(uar.title, "UAR");
 }
 
+/// OKF v0.1 §3.1: index.md and log.md are reserved bundle files, never
+/// concept documents. A frontmatter-less index.md must not be treated as a
+/// malformed entry or block store load.
+#[tokio::test]
+async fn reserved_filenames_are_skipped_on_load() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wiki_dir = dir.path().join("wiki");
+    tokio::fs::create_dir_all(&wiki_dir).await.unwrap();
+
+    tokio::fs::write(wiki_dir.join("index.md"), "# Index\n\n* [Foo](foo.md) - a concept\n")
+        .await
+        .unwrap();
+    tokio::fs::write(wiki_dir.join("log.md"), "# Log\n\n## 2026-07-02\n* **Creation**: seeded\n")
+        .await
+        .unwrap();
+
+    let store = MarkdownStore::open(dir.path()).await.unwrap();
+    assert_eq!(store.entry_count().await, 0);
+
+    store
+        .upsert(WikiEntry::new("Foo", "A real concept."))
+        .await
+        .unwrap();
+
+    let store2 = MarkdownStore::open(dir.path()).await.unwrap();
+    assert_eq!(store2.entry_count().await, 1);
+}
+
 #[tokio::test]
 async fn related_entries_finds_overlapping_content() {
     let (store, _dir) = temp_store().await;

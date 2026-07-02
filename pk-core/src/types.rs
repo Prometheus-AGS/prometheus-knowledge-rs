@@ -89,6 +89,19 @@ pub struct WikiEntry {
 
     /// Revision counter — incremented on every upsert
     pub revision: u32,
+
+    /// Open Knowledge Format (OKF) v0.1 §4.1 `type` — the format's one
+    /// required frontmatter key. `None` for entries compiled before OKF
+    /// adoption or lacking a producer-assigned type.
+    #[serde(default)]
+    pub entry_type: Option<String>,
+
+    /// Frontmatter keys pk does not model structurally (OKF producer
+    /// extensions, or fields from a future OKF minor version). Preserved
+    /// verbatim across parse → serialize round-trips per OKF §9's permissive
+    /// consumption rule — unknown keys are never grounds to drop data.
+    #[serde(default)]
+    pub extra: std::collections::BTreeMap<String, serde_yaml::Value>,
 }
 
 impl WikiEntry {
@@ -105,6 +118,8 @@ impl WikiEntry {
             created_at: now,
             updated_at: now,
             revision: 0,
+            entry_type: None,
+            extra: std::collections::BTreeMap::new(),
         }
     }
 
