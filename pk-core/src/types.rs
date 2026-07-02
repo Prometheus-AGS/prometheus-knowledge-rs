@@ -36,6 +36,15 @@ impl ArticleId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// OKF v0.1 §2: a Concept ID is the file's wiki-relative path with the
+    /// `.md` suffix removed, so an ArticleId MAY contain `/` to address a
+    /// nested concept (e.g. `tables/orders`). This checks it is safe to join
+    /// onto the wiki root as a filesystem path: no parent-directory
+    /// traversal (`..` segments) and no absolute-path leading slash.
+    pub fn is_safe_path(&self) -> bool {
+        !self.0.starts_with('/') && !self.0.split('/').any(|seg| seg.is_empty() || seg == "..")
+    }
 }
 
 impl Default for ArticleId {
@@ -96,6 +105,11 @@ pub struct WikiEntry {
     #[serde(default)]
     pub entry_type: Option<String>,
 
+    /// OKF v0.1 §4.1 `description` — a one-sentence summary used by index
+    /// generators, search snippets, and previews.
+    #[serde(default)]
+    pub description: Option<String>,
+
     /// Frontmatter keys pk does not model structurally (OKF producer
     /// extensions, or fields from a future OKF minor version). Preserved
     /// verbatim across parse → serialize round-trips per OKF §9's permissive
@@ -119,6 +133,7 @@ impl WikiEntry {
             updated_at: now,
             revision: 0,
             entry_type: None,
+            description: None,
             extra: std::collections::BTreeMap::new(),
         }
     }

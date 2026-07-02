@@ -43,33 +43,56 @@ impl MarkdownStore {
             index: TextIndex::new(),
         };
 
-        let mut dir = tokio::fs::read_dir(&wiki_dir).await?;
-        while let Some(entry) = dir.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
-            }
-            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            // OKF v0.1 §3.1: index.md and log.md are reserved bundle files,
-            // never concept documents — skip them rather than trying (and
-            // failing) to parse them as wiki entries.
-            if is_reserved_filename(file_name) {
-                debug!(path = %path.display(), "skipping reserved OKF filename");
-                continue;
-            }
-            let fallback_id = file_name.trim_end_matches(".md");
-            match tokio::fs::read_to_string(&path).await {
-                Ok(content) => match markdown_to_entry(&content, Some(fallback_id)) {
-                    Ok(wiki_entry) => {
-                        debug!(id = %wiki_entry.id, "loaded entry");
-                        inner.index.upsert(&wiki_entry);
-                        inner.entries.insert(wiki_entry.id.clone(), wiki_entry);
-                    }
-                    Err(e) => warn!(path = %path.display(), err = %e, "skipping malformed entry"),
-                },
-                Err(e) => warn!(path = %path.display(), err = %e, "failed to read entry"),
+        // OKF v0.1 §3: a bundle is a directory TREE — subdirectories group
+        // concepts (§3.1's reserved filenames apply "at any level of the
+        // hierarchy"). Walk recursively so nested concepts load like root
+        // ones.
+        let mut dirs_to_visit = vec![wiki_dir.clone()];
+        while let Some(dir_path) = dirs_to_visit.pop() {
+            let mut dir = tokio::fs::read_dir(&dir_path).await?;
+            while let Some(entry) = dir.next_entry().await? {
+                let path = entry.path();
+                let file_type = entry.file_type().await?;
+
+                if file_type.is_dir() {
+                    dirs_to_visit.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                // OKF v0.1 §3.1: index.md and log.md are reserved bundle
+                // files at any level — skip them rather than trying (and
+                // failing) to parse them as wiki entries.
+                if is_reserved_filename(file_name) {
+                    debug!(path = %path.display(), "skipping reserved OKF filename");
+                    continue;
+                }
+
+                // Concept ID (OKF §2) = wiki-relative path minus `.md`,
+                // forward-slash-joined regardless of host path separator.
+                let relative = path.strip_prefix(&wiki_dir).unwrap_or(&path);
+                let fallback_id: String = relative
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let fallback_id = fallback_id.trim_end_matches(".md");
+
+                match tokio::fs::read_to_string(&path).await {
+                    Ok(content) => match markdown_to_entry(&content, Some(fallback_id)) {
+                        Ok(wiki_entry) => {
+                            debug!(id = %wiki_entry.id, "loaded entry");
+                            inner.index.upsert(&wiki_entry);
+                            inner.entries.insert(wiki_entry.id.clone(), wiki_entry);
+                        }
+                        Err(e) => warn!(path = %path.display(), err = %e, "skipping malformed entry"),
+                    },
+                    Err(e) => warn!(path = %path.display(), err = %e, "failed to read entry"),
+                }
             }
         }
 
@@ -87,6 +110,13 @@ impl MarkdownStore {
     }
 
     pub async fn upsert(&self, mut entry: WikiEntry) -> PkResult<WikiEntry> {
+        if !entry.id.is_safe_path() {
+            return Err(PkError::frontmatter(format!(
+                "id {:?} is not a safe concept path (no leading '/', no '..' or empty segments)",
+                entry.id.as_str()
+            )));
+        }
+
         let file_content = {
             let mut inner = self.inner.write().await;
 
@@ -101,6 +131,9 @@ impl MarkdownStore {
         };
 
         let path = article_path(&self.wiki_dir, &entry.id);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
         tokio::fs::write(&path, file_content).await?;
         debug!(id = %entry.id, path = %path.display(), "entry flushed");
 

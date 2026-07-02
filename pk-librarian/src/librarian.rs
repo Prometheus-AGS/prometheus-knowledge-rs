@@ -181,6 +181,10 @@ fn parse_compile_response(raw: &str) -> PkResult<WikiEntry> {
 
     let mut entry = entry;
     entry.links = out.links.into_iter().map(ArticleId::from).collect();
+    // OKF v0.1 §4.1: `type` is the format's one required frontmatter key.
+    // The compile prompt doesn't yet ask the model to classify entries, so
+    // every Librarian-compiled entry defaults to the generic OKF type.
+    entry.entry_type = Some("Reference".to_string());
 
     Ok(entry)
 }
@@ -233,4 +237,16 @@ fn entries_to_context_str(entries: &[WikiEntry]) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compiled_entries_default_to_reference_type() {
+        let response = r#"{"title":"Test","content":"body","tags":[],"links":[],"sources":[]}"#;
+        let entry = parse_compile_response(response).unwrap();
+        assert_eq!(entry.entry_type.as_deref(), Some("Reference"));
+    }
 }

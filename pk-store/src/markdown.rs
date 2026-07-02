@@ -60,12 +60,14 @@ pub fn entry_to_markdown(entry: &WikiEntry) -> PkResult<String> {
         entry_type: entry.entry_type.clone(),
         id: Some(entry.id.as_str().to_owned()),
         title: Some(entry.title.clone()),
-        description: None,
+        description: entry.description.clone(),
         resource: None,
         tags: entry.tags.clone(),
         links: entry.links.iter().map(|l| l.as_str().to_owned()).collect(),
         sources: entry.sources.clone(),
-        timestamp: None,
+        // OKF §4.1 `timestamp` mirrors pk's `updated_at`, which is also
+        // written below as a pk extension key for full round-trip fidelity.
+        timestamp: Some(entry.updated_at.to_rfc3339()),
         created_at: Some(entry.created_at.to_rfc3339()),
         updated_at: Some(entry.updated_at.to_rfc3339()),
         revision: Some(entry.revision),
@@ -111,6 +113,12 @@ pub fn markdown_to_entry(raw: &str, fallback_id: Option<&str>) -> PkResult<WikiE
         .or_else(|| fallback_id.map(str::to_owned))
         .ok_or_else(|| PkError::frontmatter("no id in frontmatter and no fallback path given"))?;
 
+    if !ArticleId::from(id.clone()).is_safe_path() {
+        return Err(PkError::frontmatter(format!(
+            "id {id:?} is not a safe concept path (no leading '/', no '..' or empty segments)"
+        )));
+    }
+
     let title = fm.title.unwrap_or_else(|| id.clone());
 
     let now = chrono::Utc::now();
@@ -140,6 +148,7 @@ pub fn markdown_to_entry(raw: &str, fallback_id: Option<&str>) -> PkResult<WikiE
         updated_at,
         revision: fm.revision.unwrap_or(1),
         entry_type: fm.entry_type,
+        description: fm.description,
         extra: fm.extra,
     })
 }

@@ -129,6 +129,40 @@ async fn entries_persist_across_store_reopen() {
     assert_eq!(uar.title, "UAR");
 }
 
+/// OKF v0.1 §2: a Concept ID is the wiki-relative path minus `.md`, so
+/// concepts MAY live in subdirectories (§3's bundle tree). A nested entry
+/// must write to, and reload correctly from, a subdirectory of wiki/.
+#[tokio::test]
+async fn nested_concept_paths_round_trip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let mut entry = WikiEntry::new("Orders", "One row per completed order.");
+    entry.id = ArticleId::from("tables/orders");
+
+    {
+        let store = MarkdownStore::open(dir.path()).await.unwrap();
+        store.upsert(entry.clone()).await.unwrap();
+
+        let on_disk = dir.path().join("wiki/tables/orders.md");
+        assert!(on_disk.exists(), "expected {on_disk:?} to exist");
+    }
+
+    let store2 = MarkdownStore::open(dir.path()).await.unwrap();
+    assert_eq!(store2.entry_count().await, 1);
+    let reloaded = store2.get(&ArticleId::from("tables/orders")).await.unwrap();
+    assert_eq!(reloaded.title, "Orders");
+}
+
+#[tokio::test]
+async fn unsafe_article_id_is_rejected_on_upsert() {
+    let (store, _dir) = temp_store().await;
+
+    let mut entry = WikiEntry::new("Evil", "body");
+    entry.id = ArticleId::from("../../etc/passwd");
+
+    assert!(store.upsert(entry).await.is_err());
+}
+
 /// OKF v0.1 §3.1: index.md and log.md are reserved bundle files, never
 /// concept documents. A frontmatter-less index.md must not be treated as a
 /// malformed entry or block store load.
