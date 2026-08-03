@@ -7,12 +7,19 @@ static ALLOC: Jemalloc = Jemalloc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use pk_event_store::EventStore;
 use pk_core::types::RawDoc;
+use pk_event_store::EventStore;
 use pk_librarian::{Librarian, ModelRouter};
 use pk_store::MarkdownStore;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::HashSet,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::broadcast;
 
 /// KB scope: project-local (default) or globally shared across projects.
@@ -22,6 +29,37 @@ enum KbScope {
     Project,
     /// Write to ~/.prometheus/knowledge/shared/ (cross-project patterns)
     Shared,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
+enum ContextScope {
+    Project,
+    Shared,
+    Global,
+}
+
+impl ContextScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Shared => "shared",
+            Self::Global => "global",
+        }
+    }
+
+    fn priority(self) -> u8 {
+        match self {
+            Self::Project => 0,
+            Self::Shared => 1,
+            Self::Global => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ContextFormat {
+    Hook,
+    Json,
 }
 
 #[derive(Debug, Parser)]
@@ -57,6 +95,18 @@ enum Cmd {
     Lint {
         #[arg(long, default_value_t = false)]
         fix: bool,
+        /// Run deterministic schema and parse checks only; never call an LLM.
+        #[arg(long, default_value_t = false)]
+        mechanical_only: bool,
+        /// Emit a machine-readable report.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Exit nonzero when any required-schema or parse error remains.
+        #[arg(long, default_value_t = false)]
+        strict_errors: bool,
+        /// Maximum entries sent in one semantic lint request.
+        #[arg(long, default_value_t = 50)]
+        semantic_batch_size: usize,
     },
     /// Build a focused mini-KB for a topic and print to stdout
     Focus {
@@ -75,6 +125,20 @@ enum Cmd {
         /// Outputs: <system-context>\n{result}\n</system-context>
         #[arg(long, default_value_t = false)]
         inject_as_system_context: bool,
+    },
+    /// Retrieve bounded local context without invoking an LLM
+    Context {
+        #[arg()]
+        query: String,
+        /// Knowledge scopes to search. Repeat for multiple scopes; defaults to all three.
+        #[arg(long = "scope", value_enum)]
+        scopes: Vec<ContextScope>,
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+        #[arg(long, default_value_t = 2_000)]
+        timeout_ms: u64,
+        #[arg(long, value_enum, default_value = "hook")]
+        format: ContextFormat,
     },
     /// Full-text search the knowledge base
     Search {
@@ -184,6 +248,7 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()))
+        .with_writer(std::io::stderr)
         .init();
 
     // Resolve KB directory: explicit flag > env > project-root > global fallback
@@ -194,33 +259,67 @@ async fn main() -> Result<()> {
         return run_migrate(*execute).await;
     }
 
+    if let Cmd::Context {
+        query,
+        scopes,
+        limit,
+        timeout_ms,
+        format,
+    } = &cli.command
+    {
+        return run_context(
+            query,
+            scopes,
+            *limit,
+            *timeout_ms,
+            *format,
+            cli.kb_dir.as_deref(),
+        )
+        .await;
+    }
+
     let store = Arc::new(MarkdownStore::open(&kb_dir).await?);
     let (event_tx, event_rx) = broadcast::channel(64);
-    let librarian = Arc::new(Librarian::new(Arc::clone(&store), ModelRouter::from_env(), event_tx));
+    let librarian = Arc::new(Librarian::new(
+        Arc::clone(&store),
+        ModelRouter::from_env(),
+        event_tx,
+    ));
 
-    // Spawn background task: persist LibrarianEvents to EventStore (SP-019)
-    let persist_project_root = find_project_root()
-        .unwrap_or_else(|| std::env::current_dir().expect("cwd must exist"));
-    let _persist_handle = tokio::spawn(async move {
-        let event_store = EventStore::for_project(&persist_project_root, "project");
-        let mut rx = event_rx;
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if let Err(e) = event_store.persist(&event).await {
-                        tracing::warn!("event persist failed: {e}");
+    // Read-only commands must not create `.prometheus/events.jsonl` in the
+    // caller's current repository. Persist events only for commands that
+    // intentionally produce durable knowledge events.
+    let _persist_handle = if matches!(&cli.command, Cmd::Ingest { .. } | Cmd::Focus { .. }) {
+        let persist_project_root =
+            find_project_root().unwrap_or_else(|| std::env::current_dir().expect("cwd must exist"));
+        Some(tokio::spawn(async move {
+            let event_store = EventStore::for_project(&persist_project_root, "project");
+            let mut rx = event_rx;
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if let Err(e) = event_store.persist(&event).await {
+                            tracing::warn!("event persist failed: {e}");
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("event persist subscriber lagged by {n} messages");
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("event persist subscriber lagged by {n} messages");
-                }
             }
-        }
-    });
+        }))
+    } else {
+        None
+    };
 
     match cli.command {
-        Cmd::Ingest { file, source, scope, yes } => {
+        Cmd::Ingest {
+            file,
+            source,
+            scope,
+            yes,
+        } => {
             // For shared scope, require confirmation unless --yes passed
             if matches!(scope, KbScope::Shared) && !yes {
                 eprint!("Writing to shared KB (~/.prometheus/knowledge/shared/). This crosses project boundaries. Continue? [y/N] ");
@@ -250,36 +349,85 @@ async fn main() -> Result<()> {
             println!("✓ compiled → {} [{}]", entry.title, entry.id);
         }
 
-        Cmd::Lint { fix } => {
-            let reports = librarian.lint().await?;
+        Cmd::Lint {
+            fix,
+            mechanical_only,
+            json,
+            strict_errors,
+            semantic_batch_size,
+        } => {
+            let reports = librarian
+                .lint_with_options(!mechanical_only, semantic_batch_size)
+                .await?;
             if reports.is_empty() {
-                println!("✓ no issues found");
+                if json {
+                    println!("{}", serde_json::json!({"issues": [], "fixed": 0}));
+                } else {
+                    println!("✓ no issues found");
+                }
                 return Ok(());
             }
             let mut fixed = 0usize;
             for report in &reports {
+                if json {
+                    if fix && report.auto_fixable && librarian.auto_fix(report).await.is_ok() {
+                        fixed += 1;
+                    }
+                    continue;
+                }
                 let icon = match report.severity {
-                    pk_core::types::LintSeverity::Error   => "✗",
+                    pk_core::types::LintSeverity::Error => "✗",
                     pk_core::types::LintSeverity::Warning => "⚠",
-                    pk_core::types::LintSeverity::Info    => "ℹ",
+                    pk_core::types::LintSeverity::Info => "ℹ",
                 };
-                let entry_label = report.entry_id.as_ref()
+                let entry_label = report
+                    .entry_id
+                    .as_ref()
                     .map(|id| id.as_str().to_owned())
                     .unwrap_or_else(|| "(global)".into());
-                println!("{icon} [{entry_label}] {} — {}", report.severity, report.issue);
+                println!(
+                    "{icon} [{entry_label}] {} — {}",
+                    report.severity, report.issue
+                );
                 println!("  → {}", report.suggestion);
                 if fix && report.auto_fixable {
                     match librarian.auto_fix(report).await {
-                        Ok(entry) => { println!("  ✓ fixed → revision {}", entry.revision); fixed += 1; }
-                        Err(e)    => println!("  ✗ fix failed: {e}"),
+                        Ok(entry) => {
+                            println!("  ✓ fixed → revision {}", entry.revision);
+                            fixed += 1;
+                        }
+                        Err(e) => println!("  ✗ fix failed: {e}"),
                     }
                 }
             }
-            println!("\n{} issue(s)", reports.len());
-            if fix { println!("{fixed} auto-fixed"); }
+            if fix && fixed > 0 {
+                store.regenerate_index().await?;
+            }
+            if json {
+                println!("{}", serde_json::json!({"issues": reports, "fixed": fixed}));
+            } else {
+                println!("\n{} issue(s)", reports.len());
+                if fix {
+                    println!("{fixed} auto-fixed");
+                }
+            }
+            let remaining_errors = store
+                .okf_conformance_reports()
+                .await?
+                .iter()
+                .any(|report| report.severity == pk_core::types::LintSeverity::Error);
+            if strict_errors && remaining_errors {
+                anyhow::bail!("strict lint failed: required-schema or parse errors remain");
+            }
         }
 
-        Cmd::Focus { topic, k, context_window, no_cache, inject_as_system_context } => {
+        Cmd::Focus {
+            topic,
+            k,
+            context_window,
+            no_cache,
+            inject_as_system_context,
+        } => {
             let effective_topic = if let Some(n_turns) = context_window {
                 pk_librarian::extract_query_multi_turn(&topic, n_turns)
             } else {
@@ -326,6 +474,8 @@ async fn main() -> Result<()> {
             }
         }
 
+        Cmd::Context { .. } => unreachable!("handled before opening the default store"),
+
         Cmd::Search { query, k } => {
             let results = store.search(&query, k).await?;
             if results.is_empty() {
@@ -339,7 +489,12 @@ async fn main() -> Result<()> {
 
         Cmd::Get { id } => {
             let entry = store.get(&pk_core::types::ArticleId::from(id)).await?;
-            println!("# {}\n\ntags: {}\n\n{}", entry.title, entry.tags.join(", "), entry.content);
+            println!(
+                "# {}\n\ntags: {}\n\n{}",
+                entry.title,
+                entry.tags.join(", "),
+                entry.content
+            );
         }
 
         Cmd::List => {
@@ -347,14 +502,16 @@ async fn main() -> Result<()> {
             if entries.is_empty() {
                 println!("(empty knowledge base)");
             } else {
-                for e in &entries { println!("[{}] {} (rev {})", e.id, e.title, e.revision); }
+                for e in &entries {
+                    println!("[{}] {} (rev {})", e.id, e.title, e.revision);
+                }
                 println!("\n{} entries", entries.len());
             }
         }
 
         Cmd::Stats => {
             let entries = store.snapshot().await?;
-            let total_tags: usize  = entries.iter().map(|e| e.tags.len()).sum();
+            let total_tags: usize = entries.iter().map(|e| e.tags.len()).sum();
             let total_links: usize = entries.iter().map(|e| e.links.len()).sum();
             println!("entries:     {}", entries.len());
             println!("total tags:  {total_tags}");
@@ -364,13 +521,15 @@ async fn main() -> Result<()> {
 
         Cmd::MigrateToPerProject { .. } => unreachable!("handled above"),
 
-        Cmd::Codegraph { action } => {
-            match action {
-                CodegraphCmd::Extract { project, output, ci } => {
-                    run_codegraph_extract(project, output, ci)?;
-                }
+        Cmd::Codegraph { action } => match action {
+            CodegraphCmd::Extract {
+                project,
+                output,
+                ci,
+            } => {
+                run_codegraph_extract(project, output, ci)?;
             }
-        }
+        },
 
         Cmd::Events { action } => {
             let project_root = find_project_root()
@@ -386,7 +545,8 @@ async fn main() -> Result<()> {
                         println!("{}", serde_json::to_string_pretty(&records)?);
                     } else {
                         for r in &records {
-                            println!("[{}] {} — {} ({})",
+                            println!(
+                                "[{}] {} — {} ({})",
                                 r.timestamp.format("%Y-%m-%d %H:%M:%S"),
                                 r.kind,
                                 if r.affects.is_empty() {
@@ -408,7 +568,8 @@ async fn main() -> Result<()> {
                         println!("{}", serde_json::to_string_pretty(&records)?);
                     } else {
                         for r in &records {
-                            println!("[{}] {} — {}",
+                            println!(
+                                "[{}] {} — {}",
                                 r.timestamp.format("%Y-%m-%d %H:%M:%S"),
                                 r.kind,
                                 r.id
@@ -447,12 +608,264 @@ async fn main() -> Result<()> {
             println!("  → .prometheus/events-kg.jsonl");
             println!("  → .prometheus/events-episodic.jsonl");
             if !plan.unclassified.is_empty() {
-                println!("  → .prometheus/events-unsorted.jsonl ({} records need manual triage)", plan.unclassified.len());
+                println!(
+                    "  → .prometheus/events-unsorted.jsonl ({} records need manual triage)",
+                    plan.unclassified.len()
+                );
             }
         }
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct ContextCandidate {
+    scope: ContextScope,
+    entry: pk_core::types::WikiEntry,
+    score: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextOutput {
+    query: String,
+    duration_ms: u128,
+    timed_out: bool,
+    failures: Vec<ContextFailure>,
+    results: Vec<ContextItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextFailure {
+    scope: String,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextItem {
+    scope: String,
+    id: String,
+    title: String,
+    snippet: String,
+    score: f32,
+}
+
+async fn run_context(
+    query: &str,
+    requested_scopes: &[ContextScope],
+    limit: usize,
+    timeout_ms: u64,
+    format: ContextFormat,
+    explicit_project_kb: Option<&str>,
+) -> Result<()> {
+    let started = Instant::now();
+    let timeout_ms = timeout_ms.clamp(1, 2_000);
+    let deadline = Duration::from_millis(timeout_ms);
+    let per_scope_limit = limit.max(1).min(32);
+
+    let scopes = if requested_scopes.is_empty() {
+        vec![
+            ContextScope::Project,
+            ContextScope::Shared,
+            ContextScope::Global,
+        ]
+    } else {
+        let mut seen = HashSet::new();
+        requested_scopes
+            .iter()
+            .copied()
+            .filter(|scope| seen.insert(*scope))
+            .collect()
+    };
+
+    let global = global_kb_dir();
+    let project = explicit_project_kb
+        .map(expand_tilde)
+        .or_else(|| find_project_root().map(|root| root.join(".prometheus").join("knowledge")));
+
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut failures = Vec::new();
+    for scope in scopes {
+        let path = match scope {
+            ContextScope::Project => match project.clone() {
+                Some(path) => path,
+                None => {
+                    failures.push(ContextFailure {
+                        scope: scope.label().to_owned(),
+                        error: "no project root detected".to_owned(),
+                    });
+                    continue;
+                }
+            },
+            ContextScope::Shared => global.join("shared"),
+            ContextScope::Global => global.clone(),
+        };
+
+        if !path.join("wiki").is_dir() {
+            failures.push(ContextFailure {
+                scope: scope.label().to_owned(),
+                error: format!("wiki store missing at {}", path.display()),
+            });
+            continue;
+        }
+
+        let query = query.to_owned();
+        tasks.spawn(async move {
+            let store = MarkdownStore::open(&path)
+                .await
+                .map_err(|error| error.to_string())?;
+            let results = store
+                .search_scored(&query, per_scope_limit)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((scope, results))
+        });
+    }
+
+    let mut candidates = Vec::new();
+    let mut timed_out = false;
+    while !tasks.is_empty() {
+        let elapsed = started.elapsed();
+        let Some(remaining) = deadline.checked_sub(elapsed) else {
+            timed_out = true;
+            break;
+        };
+        match tokio::time::timeout(remaining, tasks.join_next()).await {
+            Ok(Some(Ok(Ok((scope, results))))) => {
+                candidates.extend(results.into_iter().map(|(entry, score)| ContextCandidate {
+                    scope,
+                    entry,
+                    score,
+                }));
+            }
+            Ok(Some(Ok(Err(error)))) => failures.push(ContextFailure {
+                scope: "unknown".to_owned(),
+                error,
+            }),
+            Ok(Some(Err(error))) => failures.push(ContextFailure {
+                scope: "unknown".to_owned(),
+                error: format!("context task failed: {error}"),
+            }),
+            Ok(None) => break,
+            Err(_) => {
+                timed_out = true;
+                break;
+            }
+        }
+    }
+    if timed_out {
+        tasks.abort_all();
+    }
+
+    // Select a canonical copy of duplicate IDs or duplicate content. Scope
+    // priority is applied before relevance so project-local knowledge wins
+    // over shared/global copies of the same document.
+    candidates.sort_by(|left, right| {
+        left.scope
+            .priority()
+            .cmp(&right.scope.priority())
+            .then_with(|| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| left.entry.id.as_str().cmp(right.entry.id.as_str()))
+    });
+    let mut seen_ids = HashSet::new();
+    let mut seen_content = HashSet::new();
+    let mut selected = Vec::new();
+    for candidate in candidates {
+        let mut hasher = Sha256::new();
+        hasher.update(candidate.entry.title.as_bytes());
+        hasher.update([0]);
+        hasher.update(candidate.entry.content.as_bytes());
+        let content_hash = format!("{:x}", hasher.finalize());
+        if !seen_ids.insert(candidate.entry.id.as_str().to_owned())
+            || !seen_content.insert(content_hash)
+        {
+            continue;
+        }
+        selected.push(candidate);
+    }
+    selected.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.scope.priority().cmp(&right.scope.priority()))
+            .then_with(|| left.entry.id.as_str().cmp(right.entry.id.as_str()))
+    });
+    selected.truncate(limit.max(1).min(32));
+
+    let results = selected
+        .into_iter()
+        .map(|candidate| ContextItem {
+            scope: candidate.scope.label().to_owned(),
+            id: candidate.entry.id.as_str().to_owned(),
+            title: candidate.entry.title,
+            snippet: context_snippet(
+                candidate.entry.description.as_deref(),
+                &candidate.entry.content,
+            ),
+            score: candidate.score,
+        })
+        .collect();
+    let output = ContextOutput {
+        query: query.to_owned(),
+        duration_ms: started.elapsed().as_millis(),
+        timed_out,
+        failures,
+        results,
+    };
+
+    match format {
+        ContextFormat::Json => println!("{}", serde_json::to_string_pretty(&output)?),
+        ContextFormat::Hook => print_context_hook(&output),
+    }
+    Ok(())
+}
+
+fn context_snippet(description: Option<&str>, content: &str) -> String {
+    let source = description
+        .filter(|description| !description.trim().is_empty())
+        .unwrap_or(content);
+    let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_utf8(&normalized, 360).to_owned()
+}
+
+fn print_context_hook(output: &ContextOutput) {
+    if output.results.is_empty() {
+        return;
+    }
+    let mut rendered = String::from("--- prometheus-knowledge context ---\n");
+    for result in &output.results {
+        rendered.push_str(&format!(
+            "[{}:{}] {}\n{}\n",
+            result.scope, result.id, result.title, result.snippet
+        ));
+    }
+    if output.timed_out || !output.failures.is_empty() {
+        rendered.push_str(&format!(
+            "[context-status] partial={} failed_scopes={} duration_ms={}\n",
+            output.timed_out,
+            output.failures.len(),
+            output.duration_ms
+        ));
+    }
+    rendered.push_str("--- end pk context ---\n");
+    print!("{}", truncate_utf8(&rendered, 6_000));
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn run_codegraph_extract(
@@ -508,7 +921,11 @@ fn resolve_kb_dir(explicit: Option<&str>, cmd: &Cmd) -> PathBuf {
     }
 
     // Shared scope writes to the global shared subdirectory
-    if let Cmd::Ingest { scope: KbScope::Shared, .. } = cmd {
+    if let Cmd::Ingest {
+        scope: KbScope::Shared,
+        ..
+    } = cmd
+    {
         return global_kb_dir().join("shared");
     }
 
@@ -520,7 +937,10 @@ fn resolve_kb_dir(explicit: Option<&str>, cmd: &Cmd) -> PathBuf {
 
     // Global fallback with info message
     let global = global_kb_dir();
-    eprintln!("info: no project root detected; using global KB at {}", global.display());
+    eprintln!(
+        "info: no project root detected; using global KB at {}",
+        global.display()
+    );
     eprintln!("info: run pk inside a project directory to use per-project KB scoping");
     global
 }
@@ -529,7 +949,13 @@ fn resolve_kb_dir(explicit: Option<&str>, cmd: &Cmd) -> PathBuf {
 /// Markers (in priority order): .git, .kbd-orchestrator, Cargo.toml, package.json, pyproject.toml
 fn find_project_root() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
-    let markers = [".git", ".kbd-orchestrator", "Cargo.toml", "package.json", "pyproject.toml"];
+    let markers = [
+        ".git",
+        ".kbd-orchestrator",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+    ];
 
     let mut dir = cwd.as_path();
     loop {
@@ -563,12 +989,22 @@ async fn run_migrate(execute: bool) -> Result<()> {
     let global = global_kb_dir();
 
     if !global.exists() {
-        println!("Global KB at {} does not exist. Nothing to migrate.", global.display());
+        println!(
+            "Global KB at {} does not exist. Nothing to migrate.",
+            global.display()
+        );
         return Ok(());
     }
 
     println!("Migration report — global KB: {}", global.display());
-    println!("Mode: {}", if execute { "EXECUTE" } else { "DRY-RUN (pass --execute to apply)" });
+    println!(
+        "Mode: {}",
+        if execute {
+            "EXECUTE"
+        } else {
+            "DRY-RUN (pass --execute to apply)"
+        }
+    );
     println!();
 
     // Read all markdown files in the global KB
@@ -585,7 +1021,11 @@ async fn run_migrate(execute: bool) -> Result<()> {
 
             match project_hint {
                 Some(hint) => {
-                    println!("  [associate] {} → project: {}", path.file_name().unwrap().to_string_lossy(), hint);
+                    println!(
+                        "  [associate] {} → project: {}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        hint
+                    );
                     if execute {
                         // Move to project-scoped directory if the project root exists
                         if let Some(target) = resolve_project_kb_for_hint(&hint) {
@@ -599,7 +1039,10 @@ async fn run_migrate(execute: bool) -> Result<()> {
                     }
                 }
                 None => {
-                    println!("  [no-hint]   {} → stays in shared KB", path.file_name().unwrap().to_string_lossy());
+                    println!(
+                        "  [no-hint]   {} → stays in shared KB",
+                        path.file_name().unwrap().to_string_lossy()
+                    );
                 }
             }
             count += 1;
@@ -617,7 +1060,10 @@ async fn run_migrate(execute: bool) -> Result<()> {
 fn extract_project_hint(content: &str) -> Option<String> {
     // Look for "source_project: <name>" or "project: <name>" in frontmatter
     for line in content.lines().take(20) {
-        if let Some(val) = line.strip_prefix("source_project:").or_else(|| line.strip_prefix("project:")) {
+        if let Some(val) = line
+            .strip_prefix("source_project:")
+            .or_else(|| line.strip_prefix("project:"))
+        {
             let hint = val.trim().to_string();
             if !hint.is_empty() {
                 return Some(hint);
@@ -630,7 +1076,9 @@ fn extract_project_hint(content: &str) -> Option<String> {
 fn resolve_project_kb_for_hint(hint: &str) -> Option<PathBuf> {
     // Search common project parent directories for a matching project name
     let search_parents = [
-        std::env::var("HOME").ok().map(|h| PathBuf::from(h).join("Projects")),
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join("Projects")),
         Some(PathBuf::from("/Users")),
     ];
 
@@ -641,7 +1089,11 @@ fn resolve_project_kb_for_hint(hint: &str) -> Option<PathBuf> {
                 return Some(candidate);
             }
             // Also try nested: Projects/prometheus/<hint>
-            let nested = parent.join("prometheus").join(hint).join(".prometheus").join("knowledge");
+            let nested = parent
+                .join("prometheus")
+                .join(hint)
+                .join(".prometheus")
+                .join("knowledge");
             if parent.join("prometheus").join(hint).exists() {
                 return Some(nested);
             }
@@ -670,7 +1122,11 @@ fn run_doctor(json_output: bool) {
         let log_path = format!("{home}/.prometheus/hooks.log");
         let dir = format!("{home}/.prometheus");
         let writable = std::fs::create_dir_all(&dir).is_ok()
-            && std::fs::OpenOptions::new().create(true).append(true).open(&log_path).is_ok();
+            && std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .is_ok();
         checks.push(DoctorCheck {
             name: "hooks-log-writable",
             status: if writable { "PASS" } else { "FAIL" },
@@ -681,16 +1137,28 @@ fn run_doctor(json_output: bool) {
     // Check 2: sycophancy binary present and executable
     {
         let (status, detail) = if let Some(ref root) = plugin_root {
-            let bin = format!("{root}/skills/imported/sycophancy-correction/target/release/sycophancy-correction");
+            let bin = format!(
+                "{root}/skills/imported/sycophancy-correction/target/release/sycophancy-correction"
+            );
             if std::path::Path::new(&bin).exists() {
                 ("PASS", format!("binary present at {bin}"))
             } else {
-                ("WARN", format!("binary not found at {bin} — run: cargo build --release"))
+                (
+                    "WARN",
+                    format!("binary not found at {bin} — run: cargo build --release"),
+                )
             }
         } else {
-            ("WARN", "CLAUDE_PLUGIN_ROOT not set; cannot check sycophancy binary path".into())
+            (
+                "WARN",
+                "CLAUDE_PLUGIN_ROOT not set; cannot check sycophancy binary path".into(),
+            )
         };
-        checks.push(DoctorCheck { name: "sycophancy-binary", status, detail });
+        checks.push(DoctorCheck {
+            name: "sycophancy-binary",
+            status,
+            detail,
+        });
     }
 
     // Check 3: hooks.json symlink integrity
@@ -708,9 +1176,16 @@ fn run_doctor(json_output: bool) {
                 ("FAIL", format!("hooks.json missing at {phys}"))
             }
         } else {
-            ("WARN", "CLAUDE_PLUGIN_ROOT not set; cannot check hooks.json symlink".into())
+            (
+                "WARN",
+                "CLAUDE_PLUGIN_ROOT not set; cannot check hooks.json symlink".into(),
+            )
         };
-        checks.push(DoctorCheck { name: "hooks-json-symlink", status, detail });
+        checks.push(DoctorCheck {
+            name: "hooks-json-symlink",
+            status,
+            detail,
+        });
     }
 
     // Check 4: pipeline-enforce hook registered in hooks.json
@@ -721,12 +1196,22 @@ fn run_doctor(json_output: bool) {
             if content.contains("pipeline-enforce") {
                 ("PASS", "pipeline-enforce registered in hooks.json".into())
             } else {
-                ("FAIL", "pipeline-enforce not found in hooks.json — SP-012 may not be applied".into())
+                (
+                    "FAIL",
+                    "pipeline-enforce not found in hooks.json — SP-012 may not be applied".into(),
+                )
             }
         } else {
-            ("WARN", "CLAUDE_PLUGIN_ROOT not set; cannot check hooks.json content".into())
+            (
+                "WARN",
+                "CLAUDE_PLUGIN_ROOT not set; cannot check hooks.json content".into(),
+            )
         };
-        checks.push(DoctorCheck { name: "pipeline-enforce-registered", status, detail });
+        checks.push(DoctorCheck {
+            name: "pipeline-enforce-registered",
+            status,
+            detail,
+        });
     }
 
     // Check 5: per-project KB scoping configured (project root detected)
@@ -737,16 +1222,32 @@ fn run_doctor(json_output: bool) {
                 if kb.exists() {
                     ("PASS", format!("project KB at {}", kb.display()))
                 } else {
-                    ("WARN", format!("project root found at {} but KB not yet initialized (run: pk ingest)", root.display()))
+                    (
+                        "WARN",
+                        format!(
+                            "project root found at {} but KB not yet initialized (run: pk ingest)",
+                            root.display()
+                        ),
+                    )
                 }
             }
-            None => ("WARN", "no project root detected in current directory tree".into()),
+            None => (
+                "WARN",
+                "no project root detected in current directory tree".into(),
+            ),
         };
-        checks.push(DoctorCheck { name: "kb-scoping", status, detail });
+        checks.push(DoctorCheck {
+            name: "kb-scoping",
+            status,
+            detail,
+        });
     }
 
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&checks).unwrap_or_else(|_| "[]".into()));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&checks).unwrap_or_else(|_| "[]".into())
+        );
         return;
     }
 
@@ -756,7 +1257,10 @@ fn run_doctor(json_output: bool) {
         let icon = match c.status {
             "PASS" => "✓",
             "WARN" => "⚠",
-            _ => { any_fail = true; "✗" }
+            _ => {
+                any_fail = true;
+                "✗"
+            }
         };
         println!("  {icon} [{:<30}] {} — {}", c.name, c.status, c.detail);
     }
@@ -828,8 +1332,13 @@ fn run_init(name: Option<String>, stack: Option<String>, yes: bool) -> anyhow::R
     if gitignore.exists() {
         let existing = std::fs::read_to_string(&gitignore)?;
         if !existing.contains(".prometheus/knowledge") {
-            std::fs::OpenOptions::new().append(true).open(&gitignore)
-                .and_then(|mut f| { use std::io::Write; f.write_all(prometheus_entry.as_bytes()) })?;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&gitignore)
+                .and_then(|mut f| {
+                    use std::io::Write;
+                    f.write_all(prometheus_entry.as_bytes())
+                })?;
             println!("✓ Added .prometheus/knowledge/ to .gitignore");
         } else {
             println!("· .gitignore already has .prometheus/ entry");
@@ -849,15 +1358,24 @@ fn run_init(name: Option<String>, stack: Option<String>, yes: bool) -> anyhow::R
 }
 
 fn detect_stack(dir: &std::path::Path) -> String {
-    if dir.join("Cargo.toml").exists() { return "rust".into(); }
-    if dir.join("package.json").exists() { return "typescript".into(); }
-    if dir.join("pyproject.toml").exists() || dir.join("setup.py").exists() { return "python".into(); }
-    if dir.join("go.mod").exists() { return "go".into(); }
+    if dir.join("Cargo.toml").exists() {
+        return "rust".into();
+    }
+    if dir.join("package.json").exists() {
+        return "typescript".into();
+    }
+    if dir.join("pyproject.toml").exists() || dir.join("setup.py").exists() {
+        return "python".into();
+    }
+    if dir.join("go.mod").exists() {
+        return "go".into();
+    }
     "unknown".into()
 }
 
 fn generate_claude_md(project_name: &str, stack: &str) -> String {
-    format!(r#"# CLAUDE.md
+    format!(
+        r#"# CLAUDE.md
 
 This file provides guidance to Claude Code when working in this repository.
 
@@ -897,5 +1415,6 @@ When implementing features:
 ## References
 
 - [Prometheus Skill Pack](https://github.com/gqadonis/prometheus-skill-pack)
-"#)
+"#
+    )
 }

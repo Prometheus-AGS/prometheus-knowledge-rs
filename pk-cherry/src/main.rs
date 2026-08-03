@@ -9,9 +9,9 @@ static ALLOC: Jemalloc = Jemalloc;
 use anyhow::Result;
 use clap::Parser;
 use pk_librarian::{Librarian, ModelRouter};
-use pk_mcp::McpServer;
+use pk_mcp::{McpServer, ReadinessHandle};
 use pk_store::MarkdownStore;
-use pk_watcher::InboxWatcher;
+use pk_watcher::{spawn_wiki_watcher, InboxWatcher, WikiWatchEvent};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, mpsc};
 use tracing::info;
@@ -52,6 +52,10 @@ async fn main() -> Result<()> {
 
     let store = Arc::new(MarkdownStore::open(&kb_dir).await?);
     info!(entries = store.entry_count().await, "store opened");
+    let readiness = ReadinessHandle::new(&kb_dir);
+    readiness
+        .update_store(&store.readiness_report().await)
+        .await;
 
     let (event_tx, _) = broadcast::channel::<pk_core::LibrarianEvent>(256);
     let (raw_tx, raw_rx) = mpsc::channel(32);
@@ -67,12 +71,46 @@ async fn main() -> Result<()> {
     let _watch_handle = watcher.spawn()?;
     info!("inbox watcher spawned");
 
+    let (wiki_watch_tx, mut wiki_watch_rx) = mpsc::channel(64);
+    let _wiki_watch_handle = spawn_wiki_watcher(store.wiki_dir().to_path_buf(), wiki_watch_tx)?;
     {
-        let lib = Arc::clone(&librarian);
-        tokio::spawn(async move { lib.run_inbox_loop(raw_rx).await; });
+        let store = Arc::clone(&store);
+        let readiness = readiness.clone();
+        tokio::spawn(async move {
+            while let Some(event) = wiki_watch_rx.recv().await {
+                match event {
+                    WikiWatchEvent::Started => readiness.set_watcher("active").await,
+                    WikiWatchEvent::Failed(error) => {
+                        readiness.set_watcher(format!("failed: {error}")).await;
+                    }
+                    WikiWatchEvent::Changed => {
+                        // Debounce bursts from atomic rename/create sequences.
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        while matches!(wiki_watch_rx.try_recv(), Ok(WikiWatchEvent::Changed)) {}
+                        match store.reconcile_from_disk().await {
+                            Ok(report) => readiness.update_store(&report).await,
+                            Err(error) => {
+                                readiness
+                                    .set_watcher(format!("reconcile_failed: {error}"))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            }
+            readiness.set_watcher("stopped").await;
+        });
     }
 
-    let server = McpServer::new(Arc::clone(&librarian), event_tx, &args.bind);
+    {
+        let lib = Arc::clone(&librarian);
+        tokio::spawn(async move {
+            lib.run_inbox_loop(raw_rx).await;
+        });
+    }
+
+    let server =
+        McpServer::new_with_readiness(Arc::clone(&librarian), event_tx, readiness, &args.bind);
 
     info!(bind = %args.bind, "MCP server starting");
     println!(

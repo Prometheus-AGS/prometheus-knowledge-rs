@@ -2,8 +2,8 @@ use crate::{
     keyword_extract::extract_query,
     parse::parse_json,
     prompts::{
-        compile_user_prompt, fix_user_prompt, focus_user_prompt, lint_user_prompt,
-        COMPILE_SYSTEM, FIX_SYSTEM, FOCUS_SYSTEM, LINT_SYSTEM,
+        compile_user_prompt, fix_user_prompt, focus_user_prompt, lint_user_prompt, COMPILE_SYSTEM,
+        FIX_SYSTEM, FOCUS_SYSTEM, LINT_SYSTEM,
     },
     router::{ModelRouter, TaskKind},
 };
@@ -29,7 +29,11 @@ impl Librarian {
         router: ModelRouter,
         event_tx: broadcast::Sender<LibrarianEvent>,
     ) -> Self {
-        Self { store, router: Arc::new(router), event_tx }
+        Self {
+            store,
+            router: Arc::new(router),
+            event_tx,
+        }
     }
 
     pub async fn compile(&self, raw: RawDoc) -> PkResult<WikiEntry> {
@@ -75,6 +79,18 @@ impl Librarian {
     }
 
     pub async fn lint(&self) -> PkResult<Vec<LintReport>> {
+        self.lint_with_options(true, 50).await
+    }
+
+    /// Run deterministic conformance checks and, when requested, semantic
+    /// checks in bounded batches. Batching prevents large shared stores from
+    /// exceeding model-server request limits while keeping legacy `lint()`
+    /// behavior intact.
+    pub async fn lint_with_options(
+        &self,
+        include_semantic: bool,
+        semantic_batch_size: usize,
+    ) -> PkResult<Vec<LintReport>> {
         let snapshot = self.store.snapshot().await?;
         let count = snapshot.len();
         info!(entries = count, "starting lint pass");
@@ -87,27 +103,47 @@ impl Librarian {
         // LLM content-quality lint (missing links, staleness, duplicates, …)
         // is best-effort: a lint-model failure must not suppress the
         // conformance results, so on error we log and return what we have.
-        if !snapshot.is_empty() {
-            match serde_json::to_string(&snapshot) {
-                Ok(snapshot_json) => {
-                    let client = self.router.build_client(TaskKind::Lint);
-                    match client
-                        .complete(LINT_SYSTEM, &lint_user_prompt(&snapshot_json), None, 0.1)
-                        .await
-                    {
-                        Ok(response) => match parse_lint_response(&response) {
-                            Ok(llm_reports) => reports.extend(llm_reports),
-                            Err(e) => error!(err = %e, "lint LLM response parse failed; keeping OKF conformance reports only"),
-                        },
-                        Err(e) => error!(err = %e, "lint LLM call failed; keeping OKF conformance reports only"),
+        if include_semantic && !snapshot.is_empty() {
+            let batch_size = semantic_batch_size.clamp(1, 100);
+            for (batch_index, batch) in snapshot.chunks(batch_size).enumerate() {
+                match serde_json::to_string(batch) {
+                    Ok(snapshot_json) => {
+                        let client = self.router.build_client(TaskKind::Lint);
+                        match client
+                            .complete(LINT_SYSTEM, &lint_user_prompt(&snapshot_json), None, 0.1)
+                            .await
+                        {
+                            Ok(response) => match parse_lint_response(&response) {
+                                Ok(llm_reports) => reports.extend(llm_reports),
+                                Err(e) => {
+                                    error!(batch = batch_index, err = %e, "lint LLM response parse failed; keeping completed reports");
+                                    reports.push(semantic_batch_failure(batch_index, &e));
+                                }
+                            },
+                            Err(e) => {
+                                let error = PkError::llm(e.to_string());
+                                error!(batch = batch_index, err = %error, "lint LLM call failed; keeping completed reports");
+                                reports.push(semantic_batch_failure(batch_index, &error));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let error = PkError::llm(e.to_string());
+                        error!(batch = batch_index, err = %error, "snapshot serialization failed; skipping batch");
+                        reports.push(semantic_batch_failure(batch_index, &error));
                     }
                 }
-                Err(e) => error!(err = %e, "snapshot serialization failed; keeping OKF conformance reports only"),
             }
         }
 
-        info!(issues = reports.len(), okf_conformance = okf_count, "lint pass complete");
-        let _ = self.event_tx.send(LibrarianEvent::lint_completed(reports.clone(), count));
+        info!(
+            issues = reports.len(),
+            okf_conformance = okf_count,
+            "lint pass complete"
+        );
+        let _ = self
+            .event_tx
+            .send(LibrarianEvent::lint_completed(reports.clone(), count));
         Ok(reports)
     }
 
@@ -115,16 +151,28 @@ impl Librarian {
         // SP-002: sliding-window extraction for long prompts (> 2000 chars)
         let search_query = extract_query(topic);
         let candidates = self.store.search(&search_query, k).await?;
-        info!(topic_len = topic.len(), query_len = search_query.len(), candidates = candidates.len(), "building focus brief");
+        info!(
+            topic_len = topic.len(),
+            query_len = search_query.len(),
+            candidates = candidates.len(),
+            "building focus brief"
+        );
 
         if candidates.is_empty() {
-            return Ok(format!("# {topic}\n\nNo matching articles found in the knowledge base."));
+            return Ok(format!(
+                "# {topic}\n\nNo matching articles found in the knowledge base."
+            ));
         }
 
         let candidates_md = entries_to_context_str(&candidates);
         let client = self.router.build_client(TaskKind::Focus);
         let response = client
-            .complete(FOCUS_SYSTEM, &focus_user_prompt(topic, &candidates_md), None, 0.3)
+            .complete(
+                FOCUS_SYSTEM,
+                &focus_user_prompt(topic, &candidates_md),
+                None,
+                0.3,
+            )
             .await
             .map_err(|e| PkError::llm(e.to_string()))?;
 
@@ -190,12 +238,27 @@ impl Librarian {
                     Ok(entry) => info!(id = %entry.id, "inbox: compiled"),
                     Err(e) => {
                         error!(err = %e, "inbox: compile failed");
-                        let _ = librarian.event_tx.send(LibrarianEvent::error(e.to_string()));
+                        let _ = librarian
+                            .event_tx
+                            .send(LibrarianEvent::error(e.to_string()));
                     }
                 }
             });
         }
         info!("inbox loop ended");
+    }
+}
+
+fn semantic_batch_failure(batch_index: usize, error: &PkError) -> LintReport {
+    LintReport {
+        entry_id: None,
+        severity: LintSeverity::Warning,
+        issue: format!(
+            "semantic lint batch {} did not produce a usable report",
+            batch_index + 1
+        ),
+        suggestion: format!("retry this bounded semantic batch; diagnostic: {error}"),
+        auto_fixable: false,
     }
 }
 
@@ -212,8 +275,7 @@ fn parse_compile_response(raw: &str) -> PkResult<WikiEntry> {
         sources: Vec<String>,
     }
 
-    let out: CompileOutput = parse_json(raw)
-        .map_err(|e| PkError::llm(e.to_string()))?;
+    let out: CompileOutput = parse_json(raw).map_err(|e| PkError::llm(e.to_string()))?;
 
     let entry = WikiEntry::new(out.title, out.content)
         .with_tags(out.tags)
@@ -250,17 +312,16 @@ fn parse_lint_response(raw: &str) -> PkResult<Vec<LintReport>> {
         auto_fixable: bool,
     }
 
-    let raw_reports: Vec<RawReport> = parse_json(raw)
-        .map_err(|e| PkError::llm(e.to_string()))?;
+    let raw_reports: Vec<RawReport> = parse_json(raw).map_err(|e| PkError::llm(e.to_string()))?;
 
     let reports = raw_reports
         .into_iter()
         .map(|r| LintReport {
             entry_id: r.entry_id.map(ArticleId::from),
             severity: match r.severity.as_str() {
-                "error"   => LintSeverity::Error,
+                "error" => LintSeverity::Error,
                 "warning" => LintSeverity::Warning,
-                _         => LintSeverity::Info,
+                _ => LintSeverity::Info,
             },
             issue: r.issue,
             suggestion: r.suggestion,
@@ -283,7 +344,11 @@ fn entries_to_context_str(entries: &[WikiEntry]) -> String {
             e.title,
             e.id,
             e.tags.join(", "),
-            if e.content.len() > 1200 { &e.content[..1200] } else { &e.content }
+            if e.content.len() > 1200 {
+                &e.content[..1200]
+            } else {
+                &e.content
+            }
         ));
     }
     out

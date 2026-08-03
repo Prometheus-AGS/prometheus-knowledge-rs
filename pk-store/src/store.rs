@@ -6,6 +6,8 @@ use pk_core::{
     error::{PkError, PkResult},
     types::{ArticleId, LintReport, RawDoc, WikiEntry},
 };
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -20,9 +22,28 @@ pub struct MarkdownStore {
     inner: Arc<RwLock<StoreInner>>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreReconcileReport {
+    pub indexed_count: usize,
+    pub on_disk_count: usize,
+    pub parse_failures: usize,
+    pub changed: bool,
+    pub last_reload: chrono::DateTime<chrono::Utc>,
+}
+
 struct StoreInner {
     entries: HashMap<ArticleId, WikiEntry>,
     index: TextIndex,
+    source_hashes: HashMap<PathBuf, String>,
+    report: StoreReconcileReport,
+}
+
+struct ScanOutcome {
+    entries: HashMap<ArticleId, WikiEntry>,
+    index: TextIndex,
+    source_hashes: HashMap<PathBuf, String>,
+    on_disk_count: usize,
+    parse_failures: usize,
 }
 
 impl MarkdownStore {
@@ -38,66 +59,24 @@ impl MarkdownStore {
         tokio::fs::create_dir_all(&wiki_dir).await?;
         tokio::fs::create_dir_all(&raw_dir).await?;
 
-        let mut inner = StoreInner {
-            entries: HashMap::new(),
-            index: TextIndex::new(),
+        let scan = scan_wiki_tree(&wiki_dir).await?;
+        let now = chrono::Utc::now();
+        let inner = StoreInner {
+            report: StoreReconcileReport {
+                indexed_count: scan.entries.len(),
+                on_disk_count: scan.on_disk_count,
+                parse_failures: scan.parse_failures,
+                changed: true,
+                last_reload: now,
+            },
+            entries: scan.entries,
+            index: scan.index,
+            source_hashes: scan.source_hashes,
         };
-
-        // OKF v0.1 §3: a bundle is a directory TREE — subdirectories group
-        // concepts (§3.1's reserved filenames apply "at any level of the
-        // hierarchy"). Walk recursively so nested concepts load like root
-        // ones.
-        let mut dirs_to_visit = vec![wiki_dir.clone()];
-        while let Some(dir_path) = dirs_to_visit.pop() {
-            let mut dir = tokio::fs::read_dir(&dir_path).await?;
-            while let Some(entry) = dir.next_entry().await? {
-                let path = entry.path();
-                let file_type = entry.file_type().await?;
-
-                if file_type.is_dir() {
-                    dirs_to_visit.push(path);
-                    continue;
-                }
-                if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                    continue;
-                }
-                let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                // OKF v0.1 §3.1: index.md and log.md are reserved bundle
-                // files at any level — skip them rather than trying (and
-                // failing) to parse them as wiki entries.
-                if is_reserved_filename(file_name) {
-                    debug!(path = %path.display(), "skipping reserved OKF filename");
-                    continue;
-                }
-
-                // Concept ID (OKF §2) = wiki-relative path minus `.md`,
-                // forward-slash-joined regardless of host path separator.
-                let relative = path.strip_prefix(&wiki_dir).unwrap_or(&path);
-                let fallback_id: String = relative
-                    .components()
-                    .map(|c| c.as_os_str().to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                let fallback_id = fallback_id.trim_end_matches(".md");
-
-                match tokio::fs::read_to_string(&path).await {
-                    Ok(content) => match markdown_to_entry(&content, Some(fallback_id)) {
-                        Ok(wiki_entry) => {
-                            debug!(id = %wiki_entry.id, "loaded entry");
-                            inner.index.upsert(&wiki_entry);
-                            inner.entries.insert(wiki_entry.id.clone(), wiki_entry);
-                        }
-                        Err(e) => warn!(path = %path.display(), err = %e, "skipping malformed entry"),
-                    },
-                    Err(e) => warn!(path = %path.display(), err = %e, "failed to read entry"),
-                }
-            }
-        }
 
         info!(
             count = inner.entries.len(),
+            parse_failures = inner.report.parse_failures,
             wiki_dir = %wiki_dir.display(),
             "store loaded"
         );
@@ -107,6 +86,38 @@ impl MarkdownStore {
             raw_dir,
             inner: Arc::new(RwLock::new(inner)),
         })
+    }
+
+    /// Reconcile the in-memory index with the complete on-disk wiki tree.
+    /// Canonical paths and SHA-256 content hashes make direct writes, renames,
+    /// and deletions deterministic. A fresh index is swapped under one write
+    /// lock, so readers never observe a partially reloaded store.
+    pub async fn reconcile_from_disk(&self) -> PkResult<StoreReconcileReport> {
+        let scan = scan_wiki_tree(&self.wiki_dir).await?;
+        let mut inner = self.inner.write().await;
+        let changed = inner.source_hashes != scan.source_hashes;
+        let last_reload = if changed {
+            chrono::Utc::now()
+        } else {
+            inner.report.last_reload
+        };
+        if changed {
+            inner.entries = scan.entries;
+            inner.index = scan.index;
+            inner.source_hashes = scan.source_hashes;
+        }
+        inner.report = StoreReconcileReport {
+            indexed_count: inner.entries.len(),
+            on_disk_count: scan.on_disk_count,
+            parse_failures: scan.parse_failures,
+            changed,
+            last_reload,
+        };
+        Ok(inner.report.clone())
+    }
+
+    pub async fn readiness_report(&self) -> StoreReconcileReport {
+        self.inner.read().await.report.clone()
     }
 
     pub async fn upsert(&self, mut entry: WikiEntry) -> PkResult<WikiEntry> {
@@ -249,8 +260,7 @@ impl MarkdownStore {
             }
         }
 
-        let known_ids: HashSet<String> =
-            concept_files.iter().map(|(id, _)| id.clone()).collect();
+        let known_ids: HashSet<String> = concept_files.iter().map(|(id, _)| id.clone()).collect();
 
         let mut reports = Vec::new();
         for (id, raw) in &concept_files {
@@ -291,11 +301,22 @@ impl MarkdownStore {
     }
 
     pub async fn search(&self, query: &str, k: usize) -> PkResult<Vec<WikiEntry>> {
+        Ok(self
+            .search_scored(query, k)
+            .await?
+            .into_iter()
+            .map(|(entry, _score)| entry)
+            .collect())
+    }
+
+    /// Search the transparent TF-IDF index while retaining scores for callers
+    /// that need to merge results from more than one knowledge scope.
+    pub async fn search_scored(&self, query: &str, k: usize) -> PkResult<Vec<(WikiEntry, f32)>> {
         let inner = self.inner.read().await;
         let ranked = inner.index.search(query, k);
         let results = ranked
             .into_iter()
-            .filter_map(|(id, _score)| inner.entries.get(&id).cloned())
+            .filter_map(|(id, score)| inner.entries.get(&id).cloned().map(|entry| (entry, score)))
             .collect();
         Ok(results)
     }
@@ -313,4 +334,74 @@ impl MarkdownStore {
         tokio::fs::write(&path, content).await?;
         Ok(path)
     }
+}
+
+async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
+    let mut outcome = ScanOutcome {
+        entries: HashMap::new(),
+        index: TextIndex::new(),
+        source_hashes: HashMap::new(),
+        on_disk_count: 0,
+        parse_failures: 0,
+    };
+    let mut dirs_to_visit = vec![wiki_dir.to_path_buf()];
+
+    while let Some(dir_path) = dirs_to_visit.pop() {
+        let mut dir = tokio::fs::read_dir(&dir_path).await?;
+        while let Some(entry) = dir.next_entry().await? {
+            let path = entry.path();
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                dirs_to_visit.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if is_reserved_filename(file_name) {
+                debug!(path = %path.display(), "skipping reserved OKF filename");
+                continue;
+            }
+
+            outcome.on_disk_count += 1;
+            let canonical_path = tokio::fs::canonicalize(&path)
+                .await
+                .unwrap_or_else(|_| path.clone());
+            let content = match tokio::fs::read_to_string(&path).await {
+                Ok(content) => content,
+                Err(error) => {
+                    outcome.parse_failures += 1;
+                    warn!(path = %path.display(), err = %error, "failed to read entry");
+                    continue;
+                }
+            };
+            outcome.source_hashes.insert(
+                canonical_path,
+                format!("{:x}", Sha256::digest(content.as_bytes())),
+            );
+
+            let relative = path.strip_prefix(wiki_dir).unwrap_or(&path);
+            let fallback_id: String = relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let fallback_id = fallback_id.trim_end_matches(".md");
+            match markdown_to_entry(&content, Some(fallback_id)) {
+                Ok(wiki_entry) => {
+                    debug!(id = %wiki_entry.id, "loaded entry");
+                    outcome.index.upsert(&wiki_entry);
+                    outcome.entries.insert(wiki_entry.id.clone(), wiki_entry);
+                }
+                Err(error) => {
+                    outcome.parse_failures += 1;
+                    warn!(path = %path.display(), err = %error, "skipping malformed entry");
+                }
+            }
+        }
+    }
+    Ok(outcome)
 }
