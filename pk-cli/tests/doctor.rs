@@ -38,16 +38,14 @@ fn doctor_is_non_mutating_and_reports_current_runtime_surfaces() {
         .current_dir(&project)
         .env("HOME", &home)
         .env("RUST_LOG", "error")
-        .args([
-            "--kb-dir",
-            knowledge.to_str().unwrap(),
-            "doctor",
-            "--json",
-        ])
+        .args(["--kb-dir", knowledge.to_str().unwrap(), "doctor", "--json"])
         .output()
         .unwrap();
 
-    assert!(!output.status.success(), "empty fixture should be unhealthy");
+    assert!(
+        !output.status.success(),
+        "empty fixture should be unhealthy"
+    );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     let checks = report["checks"].as_array().unwrap();
     let names = checks
