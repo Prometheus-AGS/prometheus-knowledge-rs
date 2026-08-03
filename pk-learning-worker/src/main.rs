@@ -6,12 +6,12 @@ use pk_core::WikiEntry;
 use pk_store::MarkdownStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
 };
 
 #[derive(Debug, Parser)]
@@ -62,9 +62,39 @@ struct MemoryOperation {
     operation_id: String,
     method: String,
     arguments: Value,
-    attempt: u32,
+    #[serde(default)]
+    dependencies: Vec<String>,
+    #[serde(default)]
+    payload_hash: Option<String>,
+    #[serde(default = "default_delivery_state")]
+    state: String,
     queued_at: String,
+    #[serde(default)]
     last_error: Option<String>,
+    #[serde(default)]
+    receipt: Option<OperationReceipt>,
+}
+
+fn default_delivery_state() -> String {
+    "pending".to_owned()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct OperationReceipt {
+    operation_id: String,
+    schema_version: u32,
+    kind: String,
+    payload_hash: String,
+    dependencies: Vec<String>,
+    state: String,
+    blocked_by: Vec<String>,
+    result: Option<Value>,
+    error: Option<String>,
+    executor_generation: u64,
+    progress_seq: u64,
+    created_at: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -76,7 +106,7 @@ struct RunSummary {
     jobs_retried: usize,
     jobs_dead_lettered: usize,
     memory_delivered: usize,
-    memory_retried: usize,
+    memory_awaiting_reconciliation: usize,
     last_error: Option<String>,
 }
 
@@ -90,7 +120,11 @@ struct QueueStatus {
     completed: usize,
     dead_letter: usize,
     memory_pending: usize,
-    memory_dead_letter: usize,
+    memory_submitting: usize,
+    memory_accepted: usize,
+    memory_rejected: usize,
+    memory_completed: usize,
+    ambiguous_delivery: usize,
     last_run: Option<Value>,
 }
 
@@ -127,8 +161,11 @@ fn ensure_layout(root: &Path) -> Result<()> {
         "completed",
         "dead-letter",
         "memory/pending",
+        "memory/submitting",
+        "memory/accepted",
         "memory/retry",
         "memory/completed",
+        "memory/rejected",
         "memory/dead-letter",
     ] {
         fs::create_dir_all(root.join(directory))?;
@@ -141,6 +178,7 @@ async fn run_once(root: &Path, memory_url: &str) -> Result<()> {
     let lock_path = root.join("worker.lock");
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)?;
@@ -150,8 +188,8 @@ async fn run_once(root: &Path, memory_url: &str) -> Result<()> {
     }
 
     recover_processing(root)?;
-    promote_retry(root, "retry", "pending")?;
-    promote_retry(root, "memory/retry", "memory/pending")?;
+    recover_memory_submitting(root)?;
+    migrate_legacy_memory_retry(root)?;
 
     let mut summary = RunSummary {
         started_at: Utc::now().to_rfc3339(),
@@ -171,17 +209,16 @@ async fn run_once(root: &Path, memory_url: &str) -> Result<()> {
         }
     }
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(20))
-        .build()?;
-    for path in json_files(&root.join("memory/pending"))? {
-        match deliver_memory(root, &path, memory_url, &client).await {
-            Ok(()) => summary.memory_delivered += 1,
-            Err(error) => {
-                summary.last_error = Some(error.to_string());
-                retry_memory(root, &path, &error.to_string())?;
-                summary.memory_retried += 1;
+    let client = reqwest::Client::builder().build()?;
+    for directory in ["memory/submitting", "memory/accepted", "memory/pending"] {
+        for path in json_files(&root.join(directory))? {
+            match reconcile_memory(root, &path, memory_url, &client).await {
+                Ok(()) => summary.memory_delivered += 1,
+                Err(error) => {
+                    summary.last_error = Some(error.to_string());
+                    record_memory_error(root, &path, &error.to_string())?;
+                    summary.memory_awaiting_reconciliation += 1;
+                }
             }
         }
     }
@@ -206,15 +243,31 @@ fn recover_processing(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn promote_retry(root: &Path, from: &str, to: &str) -> Result<()> {
-    for path in json_files(&root.join(from))? {
+fn recover_memory_submitting(root: &Path) -> Result<()> {
+    // A submitting file represents an intentionally ambiguous transport
+    // outcome. It stays in place and is reconciled by operation id; it is
+    // never blindly moved back to pending.
+    for path in json_files(&root.join("memory/submitting"))? {
+        let mut operation = read_operation(&path)?;
+        operation.state = "submitting".to_owned();
+        atomic_json(&path, &operation)?;
+    }
+    Ok(())
+}
+
+fn migrate_legacy_memory_retry(root: &Path) -> Result<()> {
+    for path in json_files(&root.join("memory/retry"))? {
         let Some(name) = path.file_name() else {
             continue;
         };
-        let target = root.join(to).join(name);
+        let target = root.join("memory/pending").join(name);
         if target.exists() {
-            preserve_duplicate(root, &path, "duplicate-retry")?;
+            preserve_duplicate(root, &path, "legacy-memory-retry")?;
         } else {
+            let mut operation = read_operation(&path)?;
+            operation.state = "pending".to_owned();
+            operation.last_error = None;
+            atomic_json(&path, &operation)?;
             fs::rename(path, target)?;
         }
     }
@@ -401,22 +454,28 @@ fn append_learning_log(job: &LearningJob, packet: &str) -> Result<()> {
 }
 
 fn enqueue_memory(root: &Path, job: &LearningJob, packet: &str) -> Result<()> {
+    let arguments = json!({
+        "content": packet,
+        "user_id": if packet.contains("[GLOBAL]") {
+            "global".to_owned()
+        } else {
+            project_scope(&job.project_root)
+        },
+        "agent_id": null,
+        "session_id": job.session_id,
+        "categories": ["karpathy", "session-learning"]
+    });
     let operation = MemoryOperation {
-        schema_version: 1,
+        schema_version: 2,
         operation_id: job.event_id.clone(),
         method: "add_memory".to_owned(),
-        arguments: json!({
-            "content": packet,
-            "user_id": if packet.contains("[GLOBAL]") {
-                "global".to_owned()
-            } else {
-                project_scope(&job.project_root)
-            },
-            "metadata": {"source":"prometheus-learning-worker","event_id":job.event_id}
-        }),
-        attempt: 0,
+        payload_hash: Some(canonical_payload_hash(&arguments)?),
+        arguments,
+        dependencies: Vec::new(),
+        state: "pending".to_owned(),
         queued_at: Utc::now().to_rfc3339(),
         last_error: None,
+        receipt: None,
     };
     let path = root
         .join("memory/pending")
@@ -432,33 +491,200 @@ fn enqueue_memory(root: &Path, job: &LearningJob, packet: &str) -> Result<()> {
     Ok(())
 }
 
-async fn deliver_memory(
+async fn reconcile_memory(
     root: &Path,
     path: &Path,
     memory_url: &str,
     client: &reqwest::Client,
 ) -> Result<()> {
-    let operation: MemoryOperation = serde_json::from_slice(&fs::read(path)?)?;
-    if operation.method != "add_memory" {
-        anyhow::bail!("unsupported memory method {}", operation.method);
+    let mut current_path = path.to_path_buf();
+    let mut operation = read_operation(&current_path)?;
+    if operation.state == "pending" {
+        let target = root.join("memory/submitting").join(
+            current_path
+                .file_name()
+                .context("memory operation has no filename")?,
+        );
+        operation.state = "submitting".to_owned();
+        operation.last_error = None;
+        atomic_json(&current_path, &operation)?;
+        fs::rename(&current_path, &target)?;
+        current_path = target;
     }
+    let endpoint = format!(
+        "{}/api/v2/operations/{}",
+        memory_url.trim_end_matches('/'),
+        operation.operation_id
+    );
+    let response = client.get(&endpoint).send().await?;
+    let receipt = if response.status() == reqwest::StatusCode::NOT_FOUND {
+        ensure_ledger_ready(memory_url, client).await?;
+        submit_operation(memory_url, client, &operation).await?
+    } else if response.status().is_success() {
+        response.json::<OperationReceipt>().await?
+    } else {
+        anyhow::bail!(
+            "operation lookup returned {}: {}",
+            response.status(),
+            bounded_error(&response.text().await.unwrap_or_default())
+        );
+    };
+    apply_receipt(root, &current_path, &mut operation, receipt)
+}
+
+async fn ensure_ledger_ready(memory_url: &str, client: &reqwest::Client) -> Result<()> {
     let response = client
-        .post(format!(
-            "{}/api/v1/memory",
-            memory_url.trim_end_matches('/')
-        ))
-        .json(&operation.arguments)
+        .get(format!("{}/ready", memory_url.trim_end_matches('/')))
         .send()
         .await?;
-    if !response.status().is_success() {
-        anyhow::bail!("memory endpoint returned {}", response.status());
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success()
+        || body
+            .pointer("/capabilities/ledger")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        anyhow::bail!("memory operation ledger is not explicitly ready");
     }
-    let target = root.join("memory/completed").join(
+    Ok(())
+}
+
+async fn submit_operation(
+    memory_url: &str,
+    client: &reqwest::Client,
+    operation: &MemoryOperation,
+) -> Result<OperationReceipt> {
+    let payload_hash = operation
+        .payload_hash
+        .as_deref()
+        .context("normalized operation is missing payload_hash")?;
+    let response = client
+        .post(format!(
+            "{}/api/v2/operations",
+            memory_url.trim_end_matches('/')
+        ))
+        .json(&json!({
+            "operation_id": operation.operation_id,
+            "schema_version": 2,
+            "kind": operation.method,
+            "dependencies": operation.dependencies,
+            "payload_hash": payload_hash,
+            "payload": operation.arguments
+        }))
+        .send()
+        .await?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response.json().await?);
+    }
+    let detail = response.text().await.unwrap_or_default();
+    anyhow::bail!(
+        "operation submission returned {status}: {}",
+        bounded_error(&detail)
+    )
+}
+
+fn apply_receipt(
+    root: &Path,
+    path: &Path,
+    operation: &mut MemoryOperation,
+    receipt: OperationReceipt,
+) -> Result<()> {
+    let expected_hash = operation
+        .payload_hash
+        .as_deref()
+        .context("normalized operation is missing payload_hash")?;
+    if receipt.operation_id != operation.operation_id || receipt.payload_hash != expected_hash {
+        anyhow::bail!("receipt identity or payload hash does not match local operation");
+    }
+    operation.receipt = Some(receipt.clone());
+    operation.last_error = receipt.error.clone();
+    let destination = match receipt.state.as_str() {
+        "committed" => {
+            operation.state = "completed".to_owned();
+            root.join("memory/completed")
+        }
+        "rejected" => {
+            operation.state = "rejected".to_owned();
+            root.join("memory/rejected")
+        }
+        _ => {
+            operation.state = "accepted".to_owned();
+            root.join("memory/accepted")
+        }
+    };
+    atomic_json(path, operation)?;
+    let target = destination.join(
         path.file_name()
             .context("memory operation has no filename")?,
     );
-    fs::rename(path, target)?;
+    if path != target {
+        if target.exists() {
+            preserve_duplicate(root, path, "receipt-reconciliation")?;
+        } else {
+            fs::rename(path, target)?;
+        }
+    }
     Ok(())
+}
+
+fn read_operation(path: &Path) -> Result<MemoryOperation> {
+    let mut operation: MemoryOperation = serde_json::from_slice(&fs::read(path)?)?;
+    operation.arguments = normalize_payload(&operation.method, &operation.arguments)?;
+    operation.schema_version = 2;
+    operation.payload_hash = Some(canonical_payload_hash(&operation.arguments)?);
+    if operation.state.trim().is_empty() {
+        operation.state = "pending".to_owned();
+    }
+    Ok(operation)
+}
+
+fn normalize_payload(method: &str, arguments: &Value) -> Result<Value> {
+    match method {
+        "add_memory" | "create_task_stream" => Ok(arguments.clone()),
+        "add_task_step" if arguments.get("stream_name").is_some() => Ok(arguments.clone()),
+        "add_task_step" => {
+            let stream = arguments
+                .get("stream")
+                .and_then(Value::as_str)
+                .context("add_task_step arguments require stream")?;
+            let description = arguments
+                .get("description")
+                .and_then(Value::as_str)
+                .context("add_task_step arguments require description")?;
+            Ok(json!({
+                "stream_name": stream,
+                "ordinal": 1,
+                "name": description,
+                "description": description,
+                "idempotency_key": description,
+                "agent_id": null,
+                "user_id": null
+            }))
+        }
+        "complete_step" if arguments.get("idempotency_key").is_some() => Ok(arguments.clone()),
+        "complete_step" => {
+            let step = arguments
+                .get("step")
+                .and_then(Value::as_str)
+                .context("complete_step arguments require step")?;
+            Ok(json!({"idempotency_key":step,"result":"completed via memory bridge"}))
+        }
+        other => anyhow::bail!("unsupported memory method {other}"),
+    }
+}
+
+fn canonical_payload_hash(payload: &Value) -> Result<String> {
+    let encoded = serde_json::to_vec(payload)?;
+    Ok(Sha256::digest(encoded)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn bounded_error(detail: &str) -> String {
+    detail.chars().take(500).collect()
 }
 
 fn retry_job(root: &Path, path: &Path, error: &str) -> Result<bool> {
@@ -489,24 +715,30 @@ fn retry_job(root: &Path, path: &Path, error: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn retry_memory(root: &Path, path: &Path, error: &str) -> Result<()> {
-    let mut operation: MemoryOperation = serde_json::from_slice(&fs::read(path)?)?;
-    operation.attempt += 1;
+fn record_memory_error(root: &Path, original_path: &Path, error: &str) -> Result<()> {
+    let path = locate_memory_operation(root, original_path)?;
+    let mut operation = read_operation(&path)?;
     operation.last_error = Some(error.to_owned());
-    if operation.attempt >= 8 {
-        let target = root
-            .join("memory/dead-letter")
-            .join(path.file_name().context("operation has no filename")?);
-        atomic_json(path, &operation)?;
-        fs::rename(path, target)?;
-    } else {
-        atomic_json(path, &operation)?;
-        let target = root
-            .join("memory/retry")
-            .join(path.file_name().context("operation has no filename")?);
-        fs::rename(path, target)?;
+    atomic_json(&path, &operation)
+}
+
+fn locate_memory_operation(root: &Path, original_path: &Path) -> Result<PathBuf> {
+    if original_path.exists() {
+        return Ok(original_path.to_path_buf());
     }
-    Ok(())
+    let name = original_path
+        .file_name()
+        .context("memory operation has no filename")?;
+    for state in ["submitting", "accepted", "pending", "completed", "rejected"] {
+        let candidate = root.join("memory").join(state).join(name);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!(
+        "memory operation {} is absent from every durable local state",
+        name.to_string_lossy()
+    )
 }
 
 fn preserve_duplicate(root: &Path, path: &Path, label: &str) -> Result<()> {
@@ -563,7 +795,12 @@ fn print_status(root: &Path, json_output: bool) -> Result<()> {
         dead_letter: json_files(&root.join("dead-letter"))?.len(),
         memory_pending: json_files(&root.join("memory/pending"))?.len()
             + json_files(&root.join("memory/retry"))?.len(),
-        memory_dead_letter: json_files(&root.join("memory/dead-letter"))?.len(),
+        memory_submitting: json_files(&root.join("memory/submitting"))?.len(),
+        memory_accepted: json_files(&root.join("memory/accepted"))?.len(),
+        memory_rejected: json_files(&root.join("memory/rejected"))?.len()
+            + json_files(&root.join("memory/dead-letter"))?.len(),
+        memory_completed: json_files(&root.join("memory/completed"))?.len(),
+        ambiguous_delivery: 0,
         last_run: fs::read(root.join("status.json"))
             .ok()
             .and_then(|raw| serde_json::from_slice(&raw).ok()),
@@ -577,7 +814,11 @@ fn print_status(root: &Path, json_output: bool) -> Result<()> {
         println!("completed: {}", status.completed);
         println!("dead-letter: {}", status.dead_letter);
         println!("memory pending: {}", status.memory_pending);
-        println!("memory dead-letter: {}", status.memory_dead_letter);
+        println!("memory submitting: {}", status.memory_submitting);
+        println!("memory accepted: {}", status.memory_accepted);
+        println!("memory completed: {}", status.memory_completed);
+        println!("memory rejected: {}", status.memory_rejected);
+        println!("ambiguous delivery: {}", status.ambiguous_delivery);
     }
     Ok(())
 }
@@ -629,4 +870,85 @@ fn harden_file(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn harden_file(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn operation(method: &str, arguments: Value) -> MemoryOperation {
+        MemoryOperation {
+            schema_version: 2,
+            operation_id: "operation-1".to_owned(),
+            method: method.to_owned(),
+            arguments,
+            dependencies: Vec::new(),
+            payload_hash: None,
+            state: "pending".to_owned(),
+            queued_at: "2026-08-03T00:00:00Z".to_owned(),
+            last_error: None,
+            receipt: None,
+        }
+    }
+
+    #[test]
+    fn payload_hash_is_stable_without_character_chunking() {
+        let payload = json!({"content":"Delta 🦀 root cause and corrective action".repeat(80)});
+        assert_eq!(
+            canonical_payload_hash(&payload).unwrap(),
+            canonical_payload_hash(&payload).unwrap()
+        );
+    }
+
+    #[test]
+    fn maps_legacy_task_step_arguments_to_v2_contract() {
+        let add = normalize_payload(
+            "add_task_step",
+            &json!({"stream":"legacy:test:phase","description":"change-001"}),
+        )
+        .unwrap();
+        assert_eq!(add["stream_name"], "legacy:test:phase");
+        assert_eq!(add["idempotency_key"], "change-001");
+        assert_eq!(add["ordinal"], 1);
+
+        let complete = normalize_payload(
+            "complete_step",
+            &json!({"stream":"legacy:test:phase","step":"change-001"}),
+        )
+        .unwrap();
+        assert_eq!(complete["idempotency_key"], "change-001");
+    }
+
+    #[test]
+    fn terminal_receipt_moves_operation_exactly_once() {
+        let temp = TempDir::new().unwrap();
+        ensure_layout(temp.path()).unwrap();
+        let mut operation = operation("add_memory", json!({"content":"delta"}));
+        operation.payload_hash = Some(canonical_payload_hash(&operation.arguments).unwrap());
+        let path = temp.path().join("memory/submitting/operation-1.json");
+        atomic_json(&path, &operation).unwrap();
+        let receipt = OperationReceipt {
+            operation_id: operation.operation_id.clone(),
+            schema_version: 2,
+            kind: operation.method.clone(),
+            payload_hash: operation.payload_hash.clone().unwrap(),
+            dependencies: Vec::new(),
+            state: "committed".to_owned(),
+            blocked_by: Vec::new(),
+            result: Some(json!({"id":"memory:operation-1"})),
+            error: None,
+            executor_generation: 1,
+            progress_seq: 6,
+            created_at: "2026-08-03T00:00:00Z".to_owned(),
+            updated_at: "2026-08-03T00:00:01Z".to_owned(),
+        };
+        apply_receipt(temp.path(), &path, &mut operation, receipt).unwrap();
+        assert!(!path.exists());
+        let completed = temp.path().join("memory/completed/operation-1.json");
+        assert!(completed.exists());
+        let stored = read_operation(&completed).unwrap();
+        assert_eq!(stored.state, "completed");
+        assert_eq!(stored.receipt.unwrap().state, "committed");
+    }
 }

@@ -2,7 +2,7 @@ use serde_json::json;
 use std::{fs, process::Command};
 
 #[test]
-fn processes_a_job_once_and_retries_memory_delivery() {
+fn processes_a_job_once_and_preserves_ambiguous_memory_delivery() {
     let fixture = tempfile::tempdir().unwrap();
     let home = fixture.path().join("home");
     let project = fixture.path().join("project");
@@ -65,7 +65,13 @@ fn processes_a_job_once_and_retries_memory_delivery() {
         .count();
     assert_eq!(wiki_entries, 1);
     assert_eq!(fs::read_dir(queue.join("completed")).unwrap().count(), 1);
-    assert_eq!(fs::read_dir(queue.join("memory/retry")).unwrap().count(), 1);
+    assert_eq!(
+        fs::read_dir(queue.join("memory/submitting"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(fs::read_dir(queue.join("memory/retry")).unwrap().count(), 0);
     let learning_log_path = fs::read_dir(home.join(".prometheus/learning-log"))
         .unwrap()
         .filter_map(|entry| entry.ok())
