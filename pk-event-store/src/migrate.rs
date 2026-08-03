@@ -44,7 +44,11 @@ pub fn plan(project_root: &Path) -> Result<MigrationPlan> {
         }
     }
 
-    Ok(MigrationPlan { kg_records, episodic_records, unclassified })
+    Ok(MigrationPlan {
+        kg_records,
+        episodic_records,
+        unclassified,
+    })
 }
 
 /// Apply the migration plan: write shard files.
@@ -64,7 +68,10 @@ pub fn apply(plan: &MigrationPlan, project_root: &Path) -> Result<()> {
 
 fn write_shard(records: &[EventRecord], path: &PathBuf) -> Result<()> {
     use std::io::Write as _;
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     for r in records {
         let line = serde_json::to_string(r)? + "\n";
         file.write_all(line.as_bytes())?;

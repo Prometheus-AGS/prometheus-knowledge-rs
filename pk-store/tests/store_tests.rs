@@ -197,6 +197,29 @@ async fn snapshot_returns_all_entries() {
 }
 
 #[tokio::test]
+async fn failed_reconcile_keeps_the_last_complete_in_memory_snapshot() {
+    let (store, _dir) = temp_store().await;
+    let entry = store
+        .upsert(WikiEntry::new("Stable snapshot", "last committed content"))
+        .await
+        .unwrap();
+    store.reconcile_from_disk().await.unwrap();
+    let path = store.wiki_dir().join(format!("{}.md", entry.id.as_str()));
+    tokio::fs::write(&path, "---\ntitle: [invalid\n---\nbroken")
+        .await
+        .unwrap();
+
+    let report = store.reconcile_from_disk().await.unwrap();
+
+    assert!(report.parse_failures > 0);
+    assert!(!report.changed);
+    assert_eq!(
+        store.get(&entry.id).await.unwrap().content,
+        "last committed content"
+    );
+}
+
+#[tokio::test]
 async fn search_returns_relevant_results() {
     let (store, _dir) = temp_store().await;
 

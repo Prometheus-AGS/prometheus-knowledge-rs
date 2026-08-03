@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::{fs, path::Path, process::Command, time::Instant};
+use std::{fs, path::Path, process::Command};
 
 fn write_entry(base: &Path, id: &str, title: &str, token: &str) {
     let wiki = base.join("wiki");
@@ -14,7 +14,7 @@ fn write_entry(base: &Path, id: &str, title: &str, token: &str) {
 }
 
 #[test]
-fn context_searches_all_scopes_within_the_hard_budget() {
+fn context_searches_committed_snapshots_with_candidate_and_byte_bounds() {
     let fixture = tempfile::tempdir().unwrap();
     let home = fixture.path().join("home");
     let project = fixture.path().join("project");
@@ -38,7 +38,18 @@ fn context_searches_all_scopes_within_the_hard_budget() {
         "globaluniquetoken",
     );
 
-    let started = Instant::now();
+    let snapshot = Command::new(env!("CARGO_BIN_EXE_pk"))
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("RUST_LOG", "error")
+        .args(["snapshot"])
+        .output()
+        .unwrap();
+    assert!(
+        snapshot.status.success(),
+        "{}",
+        String::from_utf8_lossy(&snapshot.stderr)
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_pk"))
         .current_dir(&project)
         .env("HOME", &home)
@@ -54,8 +65,10 @@ fn context_searches_all_scopes_within_the_hard_budget() {
             "global",
             "--limit",
             "8",
-            "--timeout-ms",
-            "2000",
+            "--max-candidates",
+            "8",
+            "--max-bytes",
+            "4096",
             "--format",
             "json",
         ])
@@ -66,9 +79,10 @@ fn context_searches_all_scopes_within_the_hard_budget() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(started.elapsed().as_millis() <= 2_000);
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["timed_out"], false);
+    assert!(report["candidate_count"].as_u64().unwrap() <= 8);
+    assert!(report["byte_count"].as_u64().unwrap() <= 4096);
+    assert_eq!(report["snapshot_generations"].as_object().unwrap().len(), 3);
     let scopes = report["results"]
         .as_array()
         .unwrap()
@@ -90,6 +104,14 @@ fn context_returns_partial_results_when_a_scope_is_missing() {
         "Available",
         "availabletoken",
     );
+    let snapshot = Command::new(env!("CARGO_BIN_EXE_pk"))
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("RUST_LOG", "error")
+        .args(["snapshot", "--scope", "project"])
+        .output()
+        .unwrap();
+    assert!(snapshot.status.success());
     let output = Command::new(env!("CARGO_BIN_EXE_pk"))
         .current_dir(&project)
         .env("HOME", &home)
@@ -110,4 +132,58 @@ fn context_returns_partial_results_when_a_scope_is_missing() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["results"].as_array().unwrap().len(), 1);
     assert_eq!(report["failures"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn candidate_budget_is_shared_across_requested_scopes() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    let project = fixture.path().join("project");
+    fs::create_dir_all(project.join(".git")).unwrap();
+    for index in 0..4 {
+        write_entry(
+            &project.join(".prometheus/knowledge"),
+            &format!("irrelevant-{index}"),
+            "Irrelevant",
+            "unrelatedtoken",
+        );
+    }
+    write_entry(
+        &home.join(".prometheus/knowledge/shared"),
+        "shared-target",
+        "Shared target",
+        "sharedbudgettoken",
+    );
+    let snapshot = Command::new(env!("CARGO_BIN_EXE_pk"))
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("RUST_LOG", "error")
+        .args(["snapshot", "--scope", "project", "--scope", "shared"])
+        .output()
+        .unwrap();
+    assert!(snapshot.status.success());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pk"))
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env("RUST_LOG", "error")
+        .args([
+            "context",
+            "sharedbudgettoken",
+            "--scope",
+            "project",
+            "--scope",
+            "shared",
+            "--max-candidates",
+            "2",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["candidate_count"], 2);
+    assert_eq!(report["results"][0]["id"], "shared-target");
 }

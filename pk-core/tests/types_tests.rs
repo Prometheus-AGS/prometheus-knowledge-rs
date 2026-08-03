@@ -1,5 +1,5 @@
-use pk_core::types::{ArticleId, LintReport, LintSeverity, RawDoc, WikiEntry};
 use pk_core::event::LibrarianEvent;
+use pk_core::types::{ArticleId, LintReport, LintSeverity, RawDoc, WikiEntry};
 
 #[test]
 fn article_id_slug_from_title() {
@@ -21,9 +21,12 @@ fn article_id_display() {
 
 #[test]
 fn wiki_entry_builder_roundtrip() {
-    let entry = WikiEntry::new("TurboQuant KV Compression", "3-bit FWHT KV cache compression.")
-        .with_tags(["rust", "turboquant", "kv-cache"])
-        .with_sources(["session:2026-04-10"]);
+    let entry = WikiEntry::new(
+        "TurboQuant KV Compression",
+        "3-bit FWHT KV cache compression.",
+    )
+    .with_tags(["rust", "turboquant", "kv-cache"])
+    .with_sources(["session:2026-04-10"]);
 
     assert_eq!(entry.title, "TurboQuant KV Compression");
     assert_eq!(entry.id, ArticleId::from_slug("TurboQuant KV Compression"));
@@ -45,9 +48,12 @@ fn wiki_entry_bump_revision_increments() {
 
 #[test]
 fn wiki_entry_serde_roundtrip() {
-    let original = WikiEntry::new("Kaia Agent Certification", "W3C Verifiable Credentials for agents.")
-        .with_tags(["kaia", "vc", "did"])
-        .with_sources(["kaia-mvp-spec.md"]);
+    let original = WikiEntry::new(
+        "Kaia Agent Certification",
+        "W3C Verifiable Credentials for agents.",
+    )
+    .with_tags(["kaia", "vc", "did"])
+    .with_sources(["kaia-mvp-spec.md"]);
 
     let json = serde_json::to_string(&original).unwrap();
     let recovered: WikiEntry = serde_json::from_str(&json).unwrap();
@@ -62,9 +68,9 @@ fn wiki_entry_serde_roundtrip() {
 fn raw_doc_media_type_inferred() {
     use pk_core::types::RawDocMediaType;
 
-    let md  = RawDoc::from_path("notes.md", "content");
+    let md = RawDoc::from_path("notes.md", "content");
     let txt = RawDoc::from_path("notes.txt", "content");
-    let js  = RawDoc::from_path("data.json", "{}");
+    let js = RawDoc::from_path("data.json", "{}");
 
     assert_eq!(md.media_type, RawDocMediaType::Markdown);
     assert_eq!(txt.media_type, RawDocMediaType::PlainText);

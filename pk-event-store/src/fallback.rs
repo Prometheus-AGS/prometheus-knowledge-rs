@@ -43,7 +43,12 @@ impl JsonlFallback {
     }
 
     /// Filter by project root and optional kind.
-    pub fn list(&self, project_root: &str, kind: Option<&str>, limit: usize) -> Result<Vec<EventRecord>> {
+    pub fn list(
+        &self,
+        project_root: &str,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>> {
         if !self.path.exists() {
             return Ok(vec![]);
         }
@@ -55,7 +60,7 @@ impl JsonlFallback {
             .filter(|r| r.project_root == project_root)
             .filter(|r| kind.is_none_or(|k| r.kind == k))
             .collect();
-        records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        records.sort_by_key(|record| std::cmp::Reverse(record.timestamp));
         records.truncate(limit);
         Ok(records)
     }
@@ -72,7 +77,7 @@ impl JsonlFallback {
             .filter_map(|l| serde_json::from_str::<EventRecord>(l).ok())
             .filter(|r| r.project_root == project_root && r.affects.iter().any(|a| a == entry_id))
             .collect();
-        records.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        records.sort_by_key(|record| record.timestamp);
         Ok(records)
     }
 }

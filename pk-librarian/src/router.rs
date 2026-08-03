@@ -87,9 +87,9 @@ impl ModelRouter {
     pub fn route(&self, kind: TaskKind) -> &ModelRoute {
         match kind {
             TaskKind::Compile => &self.compile,
-            TaskKind::Lint    => &self.lint,
-            TaskKind::Focus   => &self.focus,
-            TaskKind::Fix     => &self.fix,
+            TaskKind::Lint => &self.lint,
+            TaskKind::Focus => &self.focus,
+            TaskKind::Fix => &self.fix,
         }
     }
 

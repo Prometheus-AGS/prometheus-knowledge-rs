@@ -31,8 +31,15 @@ const MAX_KEYWORDS: usize = 12;
 /// used. Keywords from earlier turns decay per DECAY; keywords from later turns
 /// can reinforce or override earlier focus. Returns a compact query string.
 pub fn extract_query_multi_turn(turns_text: &str, n_turns: usize) -> String {
-    let turns: Vec<&str> = turns_text.lines().filter(|l| !l.trim().is_empty()).collect();
-    let start = if turns.len() > n_turns { turns.len() - n_turns } else { 0 };
+    let turns: Vec<&str> = turns_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let start = if turns.len() > n_turns {
+        turns.len() - n_turns
+    } else {
+        0
+    };
     let active_turns = &turns[start..];
 
     if active_turns.is_empty() {
@@ -62,10 +69,18 @@ pub fn extract_query_multi_turn(turns_text: &str, n_turns: usize) -> String {
     ranked.truncate(MAX_KEYWORDS);
 
     if ranked.is_empty() {
-        return active_turns.last().copied().unwrap_or(turns_text).to_owned();
+        return active_turns
+            .last()
+            .copied()
+            .unwrap_or(turns_text)
+            .to_owned();
     }
 
-    ranked.into_iter().map(|(kw, _)| kw).collect::<Vec<_>>().join(" ")
+    ranked
+        .into_iter()
+        .map(|(kw, _)| kw)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Extract keywords from a potentially long prompt using a sliding window.
@@ -127,7 +142,11 @@ pub fn extract_query(prompt: &str) -> String {
         return prompt[..LONG_PROMPT_THRESHOLD.min(prompt.len())].to_owned();
     }
 
-    ranked.into_iter().map(|(kw, _)| kw).collect::<Vec<_>>().join(" ")
+    ranked
+        .into_iter()
+        .map(|(kw, _)| kw)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Simple heuristic keyword extraction from a single window.
@@ -143,7 +162,10 @@ fn extract_from_window(window: &str) -> Vec<(String, f32)> {
 
     for raw_token in window.split_whitespace() {
         // Strip punctuation
-        let token: String = raw_token.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+        let token: String = raw_token
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
         if token.len() < 3 {
             continue;
         }
@@ -156,12 +178,19 @@ fn extract_from_window(window: &str) -> Vec<(String, f32)> {
 
     let total_tokens = counts.values().sum::<usize>().max(1) as f32;
 
-    counts.into_iter().map(|(kw, count)| {
-        let tf = count as f32 / total_tokens;
-        let length_bonus = if kw.len() >= 6 { 1.5 } else { 1.0 };
-        let identifier_bonus = if kw.contains('_') || kw.contains('-') || is_camel_case(&kw) { 1.3 } else { 1.0 };
-        (kw, tf * length_bonus * identifier_bonus)
-    }).collect()
+    counts
+        .into_iter()
+        .map(|(kw, count)| {
+            let tf = count as f32 / total_tokens;
+            let length_bonus = if kw.len() >= 6 { 1.5 } else { 1.0 };
+            let identifier_bonus = if kw.contains('_') || kw.contains('-') || is_camel_case(&kw) {
+                1.3
+            } else {
+                1.0
+            };
+            (kw, tf * length_bonus * identifier_bonus)
+        })
+        .collect()
 }
 
 fn is_camel_case(s: &str) -> bool {
@@ -176,20 +205,21 @@ fn stop_word_set() -> &'static std::collections::HashSet<&'static str> {
     static SET: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
     SET.get_or_init(|| {
         [
-            "the", "and", "for", "are", "but", "not", "you", "all", "can",
-            "had", "her", "was", "one", "our", "out", "day", "get", "has",
-            "him", "his", "how", "man", "new", "now", "old", "see", "two",
-            "way", "who", "boy", "did", "its", "let", "put", "say", "she",
-            "too", "use", "that", "this", "with", "have", "from", "they",
-            "will", "been", "when", "what", "your", "each", "which", "their",
-            "time", "more", "very", "then", "than", "some", "would", "make",
-            "into", "like", "over", "such", "also", "back", "after", "just",
-            "where", "most", "know", "take", "year", "good", "much", "before",
-            "right", "look", "think", "even", "through", "work", "long", "here",
-            "well", "down", "were", "same", "about", "these", "should", "being",
-            "used", "using", "returns", "return", "param", "params", "type", "types",
-            "true", "false", "null", "none", "error", "result", "value", "values",
-        ].iter().cloned().collect()
+            "the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "her", "was",
+            "one", "our", "out", "day", "get", "has", "him", "his", "how", "man", "new", "now",
+            "old", "see", "two", "way", "who", "boy", "did", "its", "let", "put", "say", "she",
+            "too", "use", "that", "this", "with", "have", "from", "they", "will", "been", "when",
+            "what", "your", "each", "which", "their", "time", "more", "very", "then", "than",
+            "some", "would", "make", "into", "like", "over", "such", "also", "back", "after",
+            "just", "where", "most", "know", "take", "year", "good", "much", "before", "right",
+            "look", "think", "even", "through", "work", "long", "here", "well", "down", "were",
+            "same", "about", "these", "should", "being", "used", "using", "returns", "return",
+            "param", "params", "type", "types", "true", "false", "null", "none", "error", "result",
+            "value", "values",
+        ]
+        .iter()
+        .cloned()
+        .collect()
     })
 }
 
@@ -207,8 +237,14 @@ mod tests {
     fn long_prompt_extracts_keywords() {
         let long = "user_authentication ".repeat(300);
         let result = extract_query(&long);
-        assert!(result.contains("user_authentication"), "expected keyword in: {result}");
-        assert!(result.len() < long.len(), "expected shorter output than input");
+        assert!(
+            result.contains("user_authentication"),
+            "expected keyword in: {result}"
+        );
+        assert!(
+            result.len() < long.len(),
+            "expected shorter output than input"
+        );
     }
 
     #[test]
@@ -216,13 +252,18 @@ mod tests {
         // Repeated technical term should score high
         let repeated = "SurrealDB ".repeat(200) + &" PostgreSQL ".repeat(100);
         let result = extract_query(&(repeated + &"x".repeat(500)));
-        assert!(result.contains("SurrealDB") || result.contains("surrealdb") || result.to_lowercase().contains("surrealdb"));
+        assert!(
+            result.contains("SurrealDB")
+                || result.contains("surrealdb")
+                || result.to_lowercase().contains("surrealdb")
+        );
     }
 
     #[test]
     fn multi_turn_latest_turn_dominates() {
         // First turn about Rust, last turn about SurrealDB — SurrealDB should win
-        let turns = "rust ownership borrowing lifetimes\nSurrealDB SurrealDB SurrealDB schema tables";
+        let turns =
+            "rust ownership borrowing lifetimes\nSurrealDB SurrealDB SurrealDB schema tables";
         let result = extract_query_multi_turn(turns, 10);
         assert!(
             result.to_lowercase().contains("surrealdb"),
@@ -245,10 +286,16 @@ mod tests {
     fn max_keywords_respected() {
         // 500 unique tokens * ~14 chars each = ~7000 chars, well above threshold
         let varied: String = (0..500).map(|i| format!("uniqueKeyword{i:03} ")).collect();
-        assert!(varied.len() > LONG_PROMPT_THRESHOLD, "test setup: prompt must be long");
+        assert!(
+            varied.len() > LONG_PROMPT_THRESHOLD,
+            "test setup: prompt must be long"
+        );
         let result = extract_query(&varied);
         // Result is space-joined keywords; each keyword is a single token
         let count = result.split_whitespace().count();
-        assert!(count <= MAX_KEYWORDS, "expected ≤ {MAX_KEYWORDS} keywords, got {count}: '{result}'");
+        assert!(
+            count <= MAX_KEYWORDS,
+            "expected ≤ {MAX_KEYWORDS} keywords, got {count}: '{result}'"
+        );
     }
 }

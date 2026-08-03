@@ -10,20 +10,19 @@ use clap::{Parser, Subcommand, ValueEnum};
 use pk_core::types::RawDoc;
 use pk_event_store::EventStore;
 use pk_librarian::{Librarian, ModelRouter};
-use pk_store::MarkdownStore;
+use pk_store::{commit_prompt_snapshot, read_prompt_snapshot, MarkdownStore};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
 };
 use tokio::sync::broadcast;
 
 /// KB scope: project-local (default) or globally shared across projects.
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum KbScope {
     /// Write to <project_root>/.prometheus/knowledge/ (default)
     Project,
@@ -52,6 +51,15 @@ impl ContextScope {
             Self::Project => 0,
             Self::Shared => 1,
             Self::Global => 2,
+        }
+    }
+}
+
+impl KbScope {
+    fn snapshot_label(&self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Shared => "shared",
         }
     }
 }
@@ -135,10 +143,20 @@ enum Cmd {
         scopes: Vec<ContextScope>,
         #[arg(long, default_value_t = 8)]
         limit: usize,
-        #[arg(long, default_value_t = 2_000)]
-        timeout_ms: u64,
+        /// Maximum immutable snapshot candidates inspected across all scopes.
+        #[arg(long, default_value_t = 128)]
+        max_candidates: usize,
+        /// Maximum bytes emitted in hook format.
+        #[arg(long, default_value_t = 6_000)]
+        max_bytes: usize,
         #[arg(long, value_enum, default_value = "hook")]
         format: ContextFormat,
+    },
+    /// Publish immutable prompt-snapshot generations from local knowledge stores.
+    Snapshot {
+        /// Knowledge scopes to publish. Repeat for multiple scopes; defaults to all three.
+        #[arg(long = "scope", value_enum)]
+        scopes: Vec<ContextScope>,
     },
     /// Full-text search the knowledge base
     Search {
@@ -263,7 +281,8 @@ async fn main() -> Result<()> {
         query,
         scopes,
         limit,
-        timeout_ms,
+        max_candidates,
+        max_bytes,
         format,
     } = &cli.command
     {
@@ -271,11 +290,15 @@ async fn main() -> Result<()> {
             query,
             scopes,
             *limit,
-            *timeout_ms,
+            *max_candidates,
+            *max_bytes,
             *format,
             cli.kb_dir.as_deref(),
         )
         .await;
+    }
+    if let Cmd::Snapshot { scopes } = &cli.command {
+        return run_snapshot(scopes, cli.kb_dir.as_deref()).await;
     }
 
     let store = Arc::new(MarkdownStore::open(&kb_dir).await?);
@@ -346,6 +369,7 @@ async fn main() -> Result<()> {
             };
             let doc = RawDoc::from_path(source_label, content);
             let entry = librarian.compile(doc).await?;
+            commit_prompt_snapshot(&kb_dir, scope.snapshot_label(), store.snapshot().await?)?;
             println!("✓ compiled → {} [{}]", entry.title, entry.id);
         }
 
@@ -474,7 +498,9 @@ async fn main() -> Result<()> {
             }
         }
 
-        Cmd::Context { .. } => unreachable!("handled before opening the default store"),
+        Cmd::Context { .. } | Cmd::Snapshot { .. } => {
+            unreachable!("handled before opening the default store")
+        }
 
         Cmd::Search { query, k } => {
             let results = store.search(&query, k).await?;
@@ -629,8 +655,9 @@ struct ContextCandidate {
 #[derive(Debug, Serialize)]
 struct ContextOutput {
     query: String,
-    duration_ms: u128,
-    timed_out: bool,
+    snapshot_generations: BTreeMap<String, String>,
+    candidate_count: usize,
+    byte_count: usize,
     failures: Vec<ContextFailure>,
     results: Vec<ContextItem>,
 }
@@ -654,15 +681,11 @@ async fn run_context(
     query: &str,
     requested_scopes: &[ContextScope],
     limit: usize,
-    timeout_ms: u64,
+    max_candidates: usize,
+    max_bytes: usize,
     format: ContextFormat,
     explicit_project_kb: Option<&str>,
 ) -> Result<()> {
-    let started = Instant::now();
-    let timeout_ms = timeout_ms.clamp(1, 2_000);
-    let deadline = Duration::from_millis(timeout_ms);
-    let per_scope_limit = limit.max(1).min(32);
-
     let scopes = if requested_scopes.is_empty() {
         vec![
             ContextScope::Project,
@@ -677,84 +700,55 @@ async fn run_context(
             .filter(|scope| seen.insert(*scope))
             .collect()
     };
-
-    let global = global_kb_dir();
-    let project = explicit_project_kb
-        .map(expand_tilde)
-        .or_else(|| find_project_root().map(|root| root.join(".prometheus").join("knowledge")));
-
-    let mut tasks = tokio::task::JoinSet::new();
+    let max_candidates = max_candidates.clamp(1, 512);
+    let max_bytes = max_bytes.clamp(256, 65_536);
+    let candidates_per_scope = max_candidates.div_ceil(scopes.len().max(1));
     let mut failures = Vec::new();
+    let mut candidates = Vec::new();
+    let mut inspected_candidates = 0usize;
+    let mut generations = BTreeMap::new();
     for scope in scopes {
-        let path = match scope {
-            ContextScope::Project => match project.clone() {
-                Some(path) => path,
-                None => {
-                    failures.push(ContextFailure {
-                        scope: scope.label().to_owned(),
-                        error: "no project root detected".to_owned(),
-                    });
-                    continue;
-                }
-            },
-            ContextScope::Shared => global.join("shared"),
-            ContextScope::Global => global.clone(),
-        };
-
-        if !path.join("wiki").is_dir() {
+        let Some(path) = knowledge_root_for_scope(scope, explicit_project_kb) else {
             failures.push(ContextFailure {
                 scope: scope.label().to_owned(),
-                error: format!("wiki store missing at {}", path.display()),
+                error: "no project root detected".to_owned(),
             });
             continue;
-        }
-
-        let query = query.to_owned();
-        tasks.spawn(async move {
-            let store = MarkdownStore::open(&path)
-                .await
-                .map_err(|error| error.to_string())?;
-            let results = store
-                .search_scored(&query, per_scope_limit)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok::<_, String>((scope, results))
-        });
-    }
-
-    let mut candidates = Vec::new();
-    let mut timed_out = false;
-    while !tasks.is_empty() {
-        let elapsed = started.elapsed();
-        let Some(remaining) = deadline.checked_sub(elapsed) else {
-            timed_out = true;
-            break;
         };
-        match tokio::time::timeout(remaining, tasks.join_next()).await {
-            Ok(Some(Ok(Ok((scope, results))))) => {
-                candidates.extend(results.into_iter().map(|(entry, score)| ContextCandidate {
-                    scope,
-                    entry,
-                    score,
-                }));
+        let snapshot = match read_prompt_snapshot(&path, scope.label()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                failures.push(ContextFailure {
+                    scope: scope.label().to_owned(),
+                    error: format!(
+                        "no valid committed prompt snapshot at {}: {error}",
+                        path.display()
+                    ),
+                });
+                continue;
             }
-            Ok(Some(Ok(Err(error)))) => failures.push(ContextFailure {
-                scope: "unknown".to_owned(),
-                error,
-            }),
-            Ok(Some(Err(error))) => failures.push(ContextFailure {
-                scope: "unknown".to_owned(),
-                error: format!("context task failed: {error}"),
-            }),
-            Ok(None) => break,
-            Err(_) => {
-                timed_out = true;
-                break;
-            }
+        };
+        generations.insert(scope.label().to_owned(), snapshot.generation);
+        let remaining = max_candidates
+            .saturating_sub(inspected_candidates)
+            .min(candidates_per_scope);
+        let bounded_entries = snapshot
+            .entries
+            .into_iter()
+            .take(remaining)
+            .collect::<Vec<_>>();
+        inspected_candidates += bounded_entries.len();
+        candidates.extend(bounded_entries.into_iter().filter_map(|entry| {
+            let score = snapshot_score(query, &entry);
+            (score > 0.0 || query.trim().is_empty()).then_some(ContextCandidate {
+                scope,
+                entry,
+                score,
+            })
+        }));
+        if inspected_candidates == max_candidates {
+            break;
         }
-    }
-    if timed_out {
-        tasks.abort_all();
     }
 
     // Select a canonical copy of duplicate IDs or duplicate content. Scope
@@ -796,7 +790,7 @@ async fn run_context(
             .then_with(|| left.scope.priority().cmp(&right.scope.priority()))
             .then_with(|| left.entry.id.as_str().cmp(right.entry.id.as_str()))
     });
-    selected.truncate(limit.max(1).min(32));
+    selected.truncate(limit.clamp(1, 32));
 
     let results = selected
         .into_iter()
@@ -811,19 +805,111 @@ async fn run_context(
             score: candidate.score,
         })
         .collect();
-    let output = ContextOutput {
+    let mut output = ContextOutput {
         query: query.to_owned(),
-        duration_ms: started.elapsed().as_millis(),
-        timed_out,
+        snapshot_generations: generations,
+        candidate_count: inspected_candidates,
+        byte_count: 0,
         failures,
         results,
     };
+    output.byte_count = rendered_context(&output).len().min(max_bytes);
 
     match format {
         ContextFormat::Json => println!("{}", serde_json::to_string_pretty(&output)?),
-        ContextFormat::Hook => print_context_hook(&output),
+        ContextFormat::Hook => print_context_hook(&output, max_bytes),
     }
     Ok(())
+}
+
+fn snapshot_score(query: &str, entry: &pk_core::types::WikiEntry) -> f32 {
+    let terms = query
+        .split(|character: char| {
+            !character.is_alphanumeric() && character != '_' && character != '-'
+        })
+        .filter(|term| term.len() >= 2)
+        .map(str::to_lowercase)
+        .collect::<HashSet<_>>();
+    if terms.is_empty() {
+        return 1.0;
+    }
+    let title = entry.title.to_lowercase();
+    let description = entry.description.as_deref().unwrap_or("").to_lowercase();
+    let content = entry.content.to_lowercase();
+    terms
+        .iter()
+        .map(|term| {
+            (title.matches(term).count() as f32 * 4.0)
+                + (description.matches(term).count() as f32 * 2.0)
+                + content.matches(term).count() as f32
+        })
+        .sum()
+}
+
+async fn run_snapshot(
+    requested_scopes: &[ContextScope],
+    explicit_project_kb: Option<&str>,
+) -> Result<()> {
+    let scopes = if requested_scopes.is_empty() {
+        vec![
+            ContextScope::Project,
+            ContextScope::Shared,
+            ContextScope::Global,
+        ]
+    } else {
+        requested_scopes.to_vec()
+    };
+    let mut published = 0usize;
+    for scope in scopes {
+        let Some(path) = knowledge_root_for_scope(scope, explicit_project_kb) else {
+            eprintln!("{}: no project root detected", scope.label());
+            continue;
+        };
+        if !path.join("wiki").is_dir() {
+            eprintln!(
+                "{}: wiki store missing at {}",
+                scope.label(),
+                path.display()
+            );
+            continue;
+        }
+        let store = MarkdownStore::open(&path).await?;
+        let report = store.readiness_report().await;
+        if report.parse_failures > 0 {
+            eprintln!(
+                "{}: refused snapshot because {} wiki files failed parsing",
+                scope.label(),
+                report.parse_failures
+            );
+            continue;
+        }
+        let snapshot = commit_prompt_snapshot(&path, scope.label(), store.snapshot().await?)?;
+        println!(
+            "{} {} candidates {} bytes {}",
+            scope.label(),
+            snapshot.candidate_count,
+            snapshot.byte_count,
+            snapshot.generation
+        );
+        published += 1;
+    }
+    if published == 0 {
+        anyhow::bail!("no prompt snapshots were published");
+    }
+    Ok(())
+}
+
+fn knowledge_root_for_scope(
+    scope: ContextScope,
+    explicit_project_kb: Option<&str>,
+) -> Option<PathBuf> {
+    match scope {
+        ContextScope::Project => explicit_project_kb
+            .map(expand_tilde)
+            .or_else(|| find_project_root().map(|root| root.join(".prometheus/knowledge"))),
+        ContextScope::Shared => Some(global_kb_dir().join("shared")),
+        ContextScope::Global => Some(global_kb_dir()),
+    }
 }
 
 fn context_snippet(description: Option<&str>, content: &str) -> String {
@@ -834,9 +920,9 @@ fn context_snippet(description: Option<&str>, content: &str) -> String {
     truncate_utf8(&normalized, 360).to_owned()
 }
 
-fn print_context_hook(output: &ContextOutput) {
+fn rendered_context(output: &ContextOutput) -> String {
     if output.results.is_empty() {
-        return;
+        return String::new();
     }
     let mut rendered = String::from("--- prometheus-knowledge context ---\n");
     for result in &output.results {
@@ -845,16 +931,20 @@ fn print_context_hook(output: &ContextOutput) {
             result.scope, result.id, result.title, result.snippet
         ));
     }
-    if output.timed_out || !output.failures.is_empty() {
+    if !output.failures.is_empty() {
         rendered.push_str(&format!(
-            "[context-status] partial={} failed_scopes={} duration_ms={}\n",
-            output.timed_out,
+            "[context-status] failed_scopes={} candidates={}\n",
             output.failures.len(),
-            output.duration_ms
+            output.candidate_count
         ));
     }
     rendered.push_str("--- end pk context ---\n");
-    print!("{}", truncate_utf8(&rendered, 6_000));
+    rendered
+}
+
+fn print_context_hook(output: &ContextOutput, max_bytes: usize) {
+    let rendered = rendered_context(output);
+    print!("{}", truncate_utf8(&rendered, max_bytes));
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
@@ -964,10 +1054,7 @@ fn find_project_root() -> Option<PathBuf> {
                 return Some(dir.to_path_buf());
             }
         }
-        match dir.parent() {
-            Some(parent) => dir = parent,
-            None => return None,
-        }
+        dir = dir.parent()?;
     }
 }
 
@@ -1082,21 +1169,19 @@ fn resolve_project_kb_for_hint(hint: &str) -> Option<PathBuf> {
         Some(PathBuf::from("/Users")),
     ];
 
-    for parent_opt in &search_parents {
-        if let Some(parent) = parent_opt {
-            let candidate = parent.join(hint).join(".prometheus").join("knowledge");
-            if parent.join(hint).exists() {
-                return Some(candidate);
-            }
-            // Also try nested: Projects/prometheus/<hint>
-            let nested = parent
-                .join("prometheus")
-                .join(hint)
-                .join(".prometheus")
-                .join("knowledge");
-            if parent.join("prometheus").join(hint).exists() {
-                return Some(nested);
-            }
+    for parent in search_parents.iter().flatten() {
+        let candidate = parent.join(hint).join(".prometheus").join("knowledge");
+        if parent.join(hint).exists() {
+            return Some(candidate);
+        }
+        // Also try nested: Projects/prometheus/<hint>
+        let nested = parent
+            .join("prometheus")
+            .join(hint)
+            .join(".prometheus")
+            .join("knowledge");
+        if parent.join("prometheus").join(hint).exists() {
+            return Some(nested);
         }
     }
     None
@@ -1130,7 +1215,7 @@ fn run_doctor(json_output: bool) {
         checks.push(DoctorCheck {
             name: "hooks-log-writable",
             status: if writable { "PASS" } else { "FAIL" },
-            detail: format!("{log_path}"),
+            detail: log_path.to_string(),
         });
     }
 
@@ -1169,9 +1254,13 @@ fn run_doctor(json_output: bool) {
             let phys_exists = std::path::Path::new(&phys).exists();
             let link_exists = std::path::Path::new(&link).exists();
             if phys_exists && link_exists {
-                ("PASS", format!("hooks.json present; symlink resolves"))
+                ("PASS", "hooks.json present; symlink resolves".to_string())
             } else if phys_exists {
-                ("WARN", format!("hooks.json present but .claude-plugin symlink missing — run: npm run build"))
+                (
+                    "WARN",
+                    "hooks.json present but .claude-plugin symlink missing — run: npm run build"
+                        .to_string(),
+                )
             } else {
                 ("FAIL", format!("hooks.json missing at {phys}"))
             }

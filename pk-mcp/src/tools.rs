@@ -46,7 +46,10 @@ impl McpResponse {
         Self {
             jsonrpc: "2.0",
             result: None,
-            error: Some(McpError { code, message: msg.to_string() }),
+            error: Some(McpError {
+                code,
+                message: msg.to_string(),
+            }),
             id,
         }
     }
@@ -129,25 +132,38 @@ pub async fn dispatch(librarian: &Arc<Librarian>, req: McpRequest) -> McpRespons
 
         // Standard MCP tool invocation: params = { name, arguments }.
         "tools/call" => {
-            let name = req.params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let arguments = req.params.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
-            let sub = McpRequest { method: name.clone(), params: arguments, id: req.id.clone() };
+            let name = req
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let arguments = req
+                .params
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let sub = McpRequest {
+                method: name.clone(),
+                params: arguments,
+                id: req.id.clone(),
+            };
             match name.as_str() {
                 "knowledge_ingest" => handle_ingest(librarian, sub).await,
-                "knowledge_lint"   => handle_lint(librarian, sub).await,
-                "knowledge_focus"  => handle_focus(librarian, sub).await,
+                "knowledge_lint" => handle_lint(librarian, sub).await,
+                "knowledge_focus" => handle_focus(librarian, sub).await,
                 "knowledge_search" => handle_search(librarian, sub).await,
-                "knowledge_get"    => handle_get(librarian, sub).await,
+                "knowledge_get" => handle_get(librarian, sub).await,
                 other => McpResponse::err(req.id, -32601, format!("unknown tool: {other}")),
             }
         }
 
         // Back-compat: bare method names still work for existing callers.
         "knowledge_ingest" => handle_ingest(librarian, req).await,
-        "knowledge_lint"   => handle_lint(librarian, req).await,
-        "knowledge_focus"  => handle_focus(librarian, req).await,
+        "knowledge_lint" => handle_lint(librarian, req).await,
+        "knowledge_focus" => handle_focus(librarian, req).await,
         "knowledge_search" => handle_search(librarian, req).await,
-        "knowledge_get"    => handle_get(librarian, req).await,
+        "knowledge_get" => handle_get(librarian, req).await,
         method => McpResponse::err(req.id, -32601, format!("unknown method: {method}")),
     }
 }
@@ -156,8 +172,10 @@ async fn handle_ingest(librarian: &Arc<Librarian>, req: McpRequest) -> McpRespon
     #[derive(Deserialize)]
     struct Params {
         content: String,
-        #[serde(default)] source: Option<String>,
-        #[serde(default)] session_id: Option<String>,
+        #[serde(default)]
+        source: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
     }
 
     let params: Params = match serde_json::from_value(req.params) {
@@ -165,26 +183,38 @@ async fn handle_ingest(librarian: &Arc<Librarian>, req: McpRequest) -> McpRespon
         Err(e) => return McpResponse::err(req.id, -32602, format!("invalid params: {e}")),
     };
 
-    let mut doc = RawDoc::from_path(params.source.unwrap_or_else(|| "mcp:ingest".into()), params.content);
+    let mut doc = RawDoc::from_path(
+        params.source.unwrap_or_else(|| "mcp:ingest".into()),
+        params.content,
+    );
     doc.session_id = params.session_id;
 
     match librarian.compile(doc).await {
         Ok(entry) => McpResponse::ok(req.id, entry_summary(&entry)),
-        Err(e)    => McpResponse::err(req.id, -32000, e.to_string()),
+        Err(e) => McpResponse::err(req.id, -32000, e.to_string()),
     }
 }
 
 async fn handle_lint(librarian: &Arc<Librarian>, req: McpRequest) -> McpResponse {
     match librarian.lint().await {
-        Ok(reports) => McpResponse::ok(req.id, serde_json::json!({ "report_count": reports.len(), "reports": reports })),
-        Err(e)      => McpResponse::err(req.id, -32000, e.to_string()),
+        Ok(reports) => McpResponse::ok(
+            req.id,
+            serde_json::json!({ "report_count": reports.len(), "reports": reports }),
+        ),
+        Err(e) => McpResponse::err(req.id, -32000, e.to_string()),
     }
 }
 
 async fn handle_focus(librarian: &Arc<Librarian>, req: McpRequest) -> McpResponse {
     #[derive(Deserialize)]
-    struct Params { topic: String, #[serde(default = "default_k")] k: usize }
-    fn default_k() -> usize { 10 }
+    struct Params {
+        topic: String,
+        #[serde(default = "default_k")]
+        k: usize,
+    }
+    fn default_k() -> usize {
+        10
+    }
 
     let params: Params = match serde_json::from_value(req.params) {
         Ok(p) => p,
@@ -192,15 +222,24 @@ async fn handle_focus(librarian: &Arc<Librarian>, req: McpRequest) -> McpRespons
     };
 
     match librarian.focus(&params.topic, params.k).await {
-        Ok(mini_kb) => McpResponse::ok(req.id, serde_json::json!({ "topic": params.topic, "content": mini_kb })),
-        Err(e)      => McpResponse::err(req.id, -32000, e.to_string()),
+        Ok(mini_kb) => McpResponse::ok(
+            req.id,
+            serde_json::json!({ "topic": params.topic, "content": mini_kb }),
+        ),
+        Err(e) => McpResponse::err(req.id, -32000, e.to_string()),
     }
 }
 
 async fn handle_search(librarian: &Arc<Librarian>, req: McpRequest) -> McpResponse {
     #[derive(Deserialize)]
-    struct Params { query: String, #[serde(default = "default_k")] k: usize }
-    fn default_k() -> usize { 5 }
+    struct Params {
+        query: String,
+        #[serde(default = "default_k")]
+        k: usize,
+    }
+    fn default_k() -> usize {
+        5
+    }
 
     let params: Params = match serde_json::from_value(req.params) {
         Ok(p) => p,
@@ -208,17 +247,22 @@ async fn handle_search(librarian: &Arc<Librarian>, req: McpRequest) -> McpRespon
     };
 
     match librarian.store.search(&params.query, params.k).await {
-        Ok(entries) => McpResponse::ok(req.id, serde_json::json!({
-            "query": params.query,
-            "results": entries.iter().map(entry_summary).collect::<Vec<_>>()
-        })),
+        Ok(entries) => McpResponse::ok(
+            req.id,
+            serde_json::json!({
+                "query": params.query,
+                "results": entries.iter().map(entry_summary).collect::<Vec<_>>()
+            }),
+        ),
         Err(e) => McpResponse::err(req.id, -32000, e.to_string()),
     }
 }
 
 async fn handle_get(librarian: &Arc<Librarian>, req: McpRequest) -> McpResponse {
     #[derive(Deserialize)]
-    struct Params { id: String }
+    struct Params {
+        id: String,
+    }
 
     let params: Params = match serde_json::from_value(req.params) {
         Ok(p) => p,
@@ -227,7 +271,7 @@ async fn handle_get(librarian: &Arc<Librarian>, req: McpRequest) -> McpResponse 
 
     match librarian.store.get(&ArticleId::from(params.id)).await {
         Ok(entry) => McpResponse::ok(req.id, entry),
-        Err(e)    => McpResponse::err(req.id, -32000, e.to_string()),
+        Err(e) => McpResponse::err(req.id, -32000, e.to_string()),
     }
 }
 

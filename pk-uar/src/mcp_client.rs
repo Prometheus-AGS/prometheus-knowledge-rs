@@ -1,7 +1,7 @@
 use crate::registry::{AgentTool, KnowledgeTool, ToolCall, ToolResult};
 use serde_json::json;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tracing::warn;
 
 // ---------------------------------------------------------------------------
@@ -34,7 +34,11 @@ impl UarMcpClient {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    async fn call(&self, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    async fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
         let id = self.next_id();
         let body = json!({ "method": method, "params": params, "id": id });
 
@@ -42,30 +46,46 @@ impl UarMcpClient {
             .http
             .post(format!("{}/mcp", self.base_url))
             .json(&body)
-            .send().await?
+            .send()
+            .await?
             .error_for_status()?
-            .json().await?;
+            .json()
+            .await?;
 
         if let Some(err) = resp.get("error") {
             return Err(anyhow::anyhow!("MCP error: {err}"));
         }
 
-        Ok(resp.get("result").cloned().unwrap_or(serde_json::Value::Null))
+        Ok(resp
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
     }
 
     pub fn tools(self: Arc<Self>) -> Vec<Box<dyn AgentTool>> {
         KnowledgeTool::all()
             .iter()
             .map(|&kind| {
-                Box::new(RemoteTool { kind, client: Arc::clone(&self) }) as Box<dyn AgentTool>
+                Box::new(RemoteTool {
+                    kind,
+                    client: Arc::clone(&self),
+                }) as Box<dyn AgentTool>
             })
             .collect()
     }
 
     pub async fn health_check(&self) -> bool {
-        match self.http.get(format!("{}/health", self.base_url)).send().await {
+        match self
+            .http
+            .get(format!("{}/health", self.base_url))
+            .send()
+            .await
+        {
             Ok(r) => r.status().is_success(),
-            Err(e) => { warn!(err = %e, "pk-cherry health check failed"); false }
+            Err(e) => {
+                warn!(err = %e, "pk-cherry health check failed");
+                false
+            }
         }
     }
 }
@@ -77,9 +97,15 @@ struct RemoteTool {
 
 #[async_trait::async_trait]
 impl AgentTool for RemoteTool {
-    fn name(&self) -> &str { self.kind.name() }
-    fn description(&self) -> &str { self.kind.description() }
-    fn input_schema(&self) -> serde_json::Value { self.kind.input_schema() }
+    fn name(&self) -> &str {
+        self.kind.name()
+    }
+    fn description(&self) -> &str {
+        self.kind.description()
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        self.kind.input_schema()
+    }
 
     async fn execute(&self, call: ToolCall) -> ToolResult {
         match self.client.call(self.kind.name(), call.input).await {
@@ -98,6 +124,8 @@ impl AgentTool for RemoteTool {
 
 pub fn anthropic_tool_definitions() -> serde_json::Value {
     let tools: Vec<serde_json::Value> = KnowledgeTool::all()
-        .iter().map(|t| t.anthropic_tool_def()).collect();
+        .iter()
+        .map(|t| t.anthropic_tool_def())
+        .collect();
     json!({ "tools": tools })
 }

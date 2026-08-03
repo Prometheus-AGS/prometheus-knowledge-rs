@@ -139,13 +139,22 @@ impl LlmClient {
         temperature: f32,
     ) -> Result<String> {
         let model = model_override.unwrap_or(&self.config.default_model);
-        let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/chat/completions",
+            self.config.base_url.trim_end_matches('/')
+        );
 
         let req = ChatRequest {
             model,
             messages: vec![
-                ChatMessage { role: "system", content: system },
-                ChatMessage { role: "user", content: user },
+                ChatMessage {
+                    role: "system",
+                    content: system,
+                },
+                ChatMessage {
+                    role: "user",
+                    content: user,
+                },
             ],
             max_tokens: self.config.max_tokens,
             temperature,
@@ -181,7 +190,12 @@ impl LlmClient {
             let dump_path = dump_body_for_forensics(&body);
             let len_mismatch = content_length_header
                 .filter(|&expected| expected != body.len())
-                .map(|expected| format!(", content-length header {expected} != body bytes read {}", body.len()))
+                .map(|expected| {
+                    format!(
+                        ", content-length header {expected} != body bytes read {}",
+                        body.len()
+                    )
+                })
                 .unwrap_or_default();
             format!(
                 "failed to parse LLM response (status {status}, body: {}{len_mismatch}{})",

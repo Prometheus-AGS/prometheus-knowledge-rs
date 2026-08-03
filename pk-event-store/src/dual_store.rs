@@ -66,7 +66,10 @@ pub async fn write_to_target(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("SurrealDB POST {url} (db={}) returned {status}: {body}", target.surreal_db());
+        anyhow::bail!(
+            "SurrealDB POST {url} (db={}) returned {status}: {body}",
+            target.surreal_db()
+        );
     }
     Ok(())
 }
