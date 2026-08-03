@@ -13,3 +13,6 @@ tokio-stream = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

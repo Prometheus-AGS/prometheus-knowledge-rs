@@ -73,7 +73,7 @@ pub fn render_index(entries: &[WikiEntry]) -> String {
     }
 
     for (group, mut items) in groups {
-        items.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+        items.sort_by_key(|item| item.title.to_lowercase());
         out.push_str("## ");
         out.push_str(&group);
         out.push_str("\n\n");
@@ -205,7 +205,13 @@ pub fn okf_document_reports(
     };
 
     // §9.2: a non-empty `type` is the format's one required field.
-    if entry.entry_type.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if entry
+        .entry_type
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         reports.push(report(
             Some(concept_id),
             LintSeverity::Error,
@@ -216,7 +222,13 @@ pub fn okf_document_reports(
     }
 
     // Recommended field (§4.1): advisory only.
-    if entry.description.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if entry
+        .description
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         reports.push(report(
             Some(concept_id),
             LintSeverity::Warning,
@@ -232,7 +244,10 @@ pub fn okf_document_reports(
             reports.push(report(
                 Some(concept_id),
                 LintSeverity::Warning,
-                format!("body links to /{}.md, which is not in the bundle", link.as_str()),
+                format!(
+                    "body links to /{}.md, which is not in the bundle",
+                    link.as_str()
+                ),
                 "create the target page or fix the link (OKF §5 tolerates broken links)",
                 false,
             ));
@@ -364,9 +379,19 @@ mod tests {
     #[test]
     fn index_groups_by_type_with_descriptions() {
         let entries = vec![
-            entry("orders", "Orders", Some("Table"), Some("One row per order.")),
+            entry(
+                "orders",
+                "Orders",
+                Some("Table"),
+                Some("One row per order."),
+            ),
             entry("triage", "Triage", Some("Playbook"), None),
-            entry("customers", "Customers", Some("Table"), Some("One row per customer.")),
+            entry(
+                "customers",
+                "Customers",
+                Some("Table"),
+                Some("One row per customer."),
+            ),
         ];
         let idx = render_index(&entries);
         assert!(idx.starts_with("# Wiki Index"));
@@ -423,7 +448,10 @@ mod tests {
     fn conformant_document_produces_no_errors() {
         let raw = "---\ntype: Reference\ntitle: Foo\ndescription: A thing.\n---\n\nBody with [Bar](/bar.md).";
         let reports = okf_document_reports("foo", raw, &ids(&["foo", "bar"]));
-        assert!(reports.iter().all(|r| r.severity != LintSeverity::Error), "{reports:?}");
+        assert!(
+            reports.iter().all(|r| r.severity != LintSeverity::Error),
+            "{reports:?}"
+        );
     }
 
     #[test]
@@ -452,14 +480,20 @@ mod tests {
         let raw = "---\ntype: Reference\ntitle: Foo\n---\n\nBody.";
         let reports = okf_document_reports("foo", raw, &ids(&["foo"]));
         assert!(reports.iter().all(|r| r.severity != LintSeverity::Error));
-        assert!(reports.iter().any(|r| r.issue.contains("description") && r.severity == LintSeverity::Warning));
+        assert!(reports
+            .iter()
+            .any(|r| r.issue.contains("description") && r.severity == LintSeverity::Warning));
     }
 
     #[test]
     fn broken_body_link_is_a_warning() {
-        let raw = "---\ntype: Reference\ntitle: Foo\ndescription: x\n---\n\nSee [Gone](/missing.md).";
+        let raw =
+            "---\ntype: Reference\ntitle: Foo\ndescription: x\n---\n\nSee [Gone](/missing.md).";
         let reports = okf_document_reports("foo", raw, &ids(&["foo"]));
-        let broken = reports.iter().find(|r| r.issue.contains("missing.md")).expect("broken link");
+        let broken = reports
+            .iter()
+            .find(|r| r.issue.contains("missing.md"))
+            .expect("broken link");
         assert_eq!(broken.severity, LintSeverity::Warning);
     }
 
@@ -470,9 +504,15 @@ mod tests {
         let b = entry("b", "B", Some("Reference"), Some("d")); // no inbound? a links to b
         let c = entry("c", "C", Some("Reference"), Some("d")); // orphan
         let reports = okf_orphan_reports(&[a, b, c]);
-        let orphans: Vec<_> = reports.iter().filter_map(|r| r.entry_id.as_ref().map(|i| i.as_str())).collect();
+        let orphans: Vec<_> = reports
+            .iter()
+            .filter_map(|r| r.entry_id.as_ref().map(|i| i.as_str()))
+            .collect();
         assert!(orphans.contains(&"c"), "c should be an orphan: {orphans:?}");
-        assert!(orphans.contains(&"a"), "a has no inbound link either: {orphans:?}");
+        assert!(
+            orphans.contains(&"a"),
+            "a has no inbound link either: {orphans:?}"
+        );
         assert!(!orphans.contains(&"b"), "b is linked from a: {orphans:?}");
     }
 

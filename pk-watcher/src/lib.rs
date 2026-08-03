@@ -4,6 +4,65 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 
+#[derive(Debug, Clone)]
+pub enum WikiWatchEvent {
+    Started,
+    Changed,
+    Failed(String),
+}
+
+/// Watch the compiled wiki tree and emit coalescible reconciliation signals.
+/// File parsing remains in `pk-store`; the notify callback never mutates the
+/// index directly.
+pub fn spawn_wiki_watcher(
+    wiki_dir: PathBuf,
+    event_tx: mpsc::Sender<WikiWatchEvent>,
+) -> PkResult<WatcherHandle> {
+    std::thread::Builder::new()
+        .name("pk-wiki-watcher".to_string())
+        .spawn(move || {
+            let callback_tx = event_tx.clone();
+            let handler = move |result: Result<Event, notify::Error>| match result {
+                Ok(event)
+                    if matches!(
+                        event.kind,
+                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                    ) =>
+                {
+                    if event
+                        .paths
+                        .iter()
+                        .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+                    {
+                        let _ = callback_tx.blocking_send(WikiWatchEvent::Changed);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = callback_tx.blocking_send(WikiWatchEvent::Failed(error.to_string()));
+                }
+            };
+            let config = Config::default().with_poll_interval(Duration::from_millis(300));
+            match RecommendedWatcher::new(handler, config) {
+                Ok(mut watcher) => {
+                    if let Err(error) = watcher.watch(&wiki_dir, RecursiveMode::Recursive) {
+                        let _ = event_tx.blocking_send(WikiWatchEvent::Failed(error.to_string()));
+                        return;
+                    }
+                    let _ = event_tx.blocking_send(WikiWatchEvent::Started);
+                    info!(dir = %wiki_dir.display(), "wiki watcher active");
+                    std::thread::park();
+                }
+                Err(error) => {
+                    let _ = event_tx.blocking_send(WikiWatchEvent::Failed(error.to_string()));
+                }
+            }
+        })?;
+    Ok(WatcherHandle {
+        _marker: std::marker::PhantomData,
+    })
+}
+
 /// Watch a directory for new/modified files and emit RawDoc values.
 /// Internally uses `notify`'s platform-native backend (FSEvents on macOS,
 /// inotify on Linux) with a debounce window to avoid duplicate events.
@@ -19,7 +78,11 @@ impl InboxWatcher {
         event_tx: broadcast::Sender<LibrarianEvent>,
         raw_doc_tx: mpsc::Sender<RawDoc>,
     ) -> Self {
-        Self { raw_dir, event_tx, raw_doc_tx }
+        Self {
+            raw_dir,
+            event_tx,
+            raw_doc_tx,
+        }
     }
 
     /// Spawn the watcher on a dedicated blocking thread (notify requires it).
@@ -31,10 +94,7 @@ impl InboxWatcher {
         let _watcher_thread = std::thread::spawn(move || {
             let handler = move |res: Result<Event, notify::Error>| match res {
                 Ok(event) => {
-                    if matches!(
-                        event.kind,
-                        EventKind::Create(_) | EventKind::Modify(_)
-                    ) {
+                    if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
                         for path in event.paths {
                             if path.extension().and_then(|e| e.to_str()) != Some("tmp") {
                                 let _ = notify_tx.blocking_send(path);
@@ -87,7 +147,9 @@ impl InboxWatcher {
             }
         });
 
-        Ok(WatcherHandle { _marker: std::marker::PhantomData })
+        Ok(WatcherHandle {
+            _marker: std::marker::PhantomData,
+        })
     }
 }
 

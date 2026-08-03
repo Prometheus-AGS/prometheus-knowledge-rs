@@ -34,12 +34,7 @@ impl TextIndex {
     pub fn upsert(&mut self, entry: &WikiEntry) {
         self.remove(&entry.id);
 
-        let text = format!(
-            "{} {} {}",
-            entry.title,
-            entry.tags.join(" "),
-            entry.content
-        );
+        let text = format!("{} {} {}", entry.title, entry.tags.join(" "), entry.content);
 
         let terms = tokenize(&text);
         let total = terms.len();
@@ -126,9 +121,9 @@ fn tokenize(text: &str) -> Vec<String> {
 }
 
 static STOPWORDS: &[&str] = &[
-    "the", "and", "for", "are", "was", "with", "this", "that", "from", "have",
-    "not", "but", "they", "their", "been", "more", "also", "its", "can", "will",
-    "one", "all", "any", "has", "had", "his", "her", "our", "your", "when",
+    "the", "and", "for", "are", "was", "with", "this", "that", "from", "have", "not", "but",
+    "they", "their", "been", "more", "also", "its", "can", "will", "one", "all", "any", "has",
+    "had", "his", "her", "our", "your", "when",
 ];
 
 #[cfg(test)]
@@ -139,10 +134,16 @@ mod tests {
     fn basic_search() {
         let mut idx = TextIndex::new();
 
-        let mut e1 = WikiEntry::new("Universal Agent Runtime", "Rust async agent execution engine");
+        let mut e1 = WikiEntry::new(
+            "Universal Agent Runtime",
+            "Rust async agent execution engine",
+        );
         e1.tags = vec!["rust".into(), "agent".into()];
 
-        let mut e2 = WikiEntry::new("mempalace memory system", "Episodic memory for agents in Rust");
+        let mut e2 = WikiEntry::new(
+            "mempalace memory system",
+            "Episodic memory for agents in Rust",
+        );
         e2.tags = vec!["rust".into(), "memory".into()];
 
         idx.upsert(&e1);

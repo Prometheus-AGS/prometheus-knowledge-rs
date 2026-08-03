@@ -4,11 +4,7 @@ use std::sync::Arc;
 
 async fn temp_store() -> (Arc<MarkdownStore>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = Arc::new(
-        MarkdownStore::open(dir.path())
-            .await
-            .expect("store open"),
-    );
+    let store = Arc::new(MarkdownStore::open(dir.path()).await.expect("store open"));
     (store, dir)
 }
 
@@ -49,13 +45,14 @@ async fn okf_conformance_lint_and_autofix() {
         .filter(|r| r.severity == LintSeverity::Error && r.issue.contains("`type`"))
         .collect();
     assert_eq!(type_errors.len(), 1, "one type error expected: {reports:?}");
-    assert_eq!(type_errors[0].entry_id.as_ref().unwrap().as_str(), "no-type");
+    assert_eq!(
+        type_errors[0].entry_id.as_ref().unwrap().as_str(),
+        "no-type"
+    );
     assert!(type_errors[0].auto_fixable);
     assert!(
-        !reports
-            .iter()
-            .any(|r| r.severity == LintSeverity::Error
-                && r.entry_id.as_ref().map(|i| i.as_str()) == Some("good")),
+        !reports.iter().any(|r| r.severity == LintSeverity::Error
+            && r.entry_id.as_ref().map(|i| i.as_str()) == Some("good")),
         "good.md must produce no error: {reports:?}"
     );
 
@@ -101,12 +98,22 @@ async fn index_and_log_are_written_and_survive_reopen() {
         store.append_log("Creation", &b.title, &b.id).await.unwrap();
     }
 
-    let index = tokio::fs::read_to_string(wiki.join("index.md")).await.unwrap();
-    assert!(index.contains("[Axum](/axum.md)"), "index missing Axum: {index}");
-    assert!(index.contains("[Tower](/tower.md)"), "index missing Tower: {index}");
+    let index = tokio::fs::read_to_string(wiki.join("index.md"))
+        .await
+        .unwrap();
+    assert!(
+        index.contains("[Axum](/axum.md)"),
+        "index missing Axum: {index}"
+    );
+    assert!(
+        index.contains("[Tower](/tower.md)"),
+        "index missing Tower: {index}"
+    );
     assert!(index.contains("Async Rust web framework."));
 
-    let log = tokio::fs::read_to_string(wiki.join("log.md")).await.unwrap();
+    let log = tokio::fs::read_to_string(wiki.join("log.md"))
+        .await
+        .unwrap();
     assert!(log.contains("## "), "log missing a date heading: {log}");
     // Newest entry (Tower) appended most recently → leads within the day.
     let tower = log.find("[Tower]").unwrap();
@@ -122,9 +129,12 @@ async fn index_and_log_are_written_and_survive_reopen() {
 async fn upsert_and_get_roundtrip() {
     let (store, _dir) = temp_store().await;
 
-    let entry = WikiEntry::new("Universal Agent Runtime", "Core Prometheus execution substrate.")
-        .with_tags(["rust", "uar"])
-        .with_sources(["test"]);
+    let entry = WikiEntry::new(
+        "Universal Agent Runtime",
+        "Core Prometheus execution substrate.",
+    )
+    .with_tags(["rust", "uar"])
+    .with_sources(["test"]);
 
     let saved = store.upsert(entry.clone()).await.unwrap();
     assert_eq!(saved.id, entry.id);
@@ -190,24 +200,45 @@ async fn snapshot_returns_all_entries() {
 async fn search_returns_relevant_results() {
     let (store, _dir) = temp_store().await;
 
-    store.upsert(
-        WikiEntry::new("Universal Agent Runtime", "Rust async agent execution engine with liter-llm routing.")
-            .with_tags(["rust", "agent", "uar"])
-    ).await.unwrap();
+    store
+        .upsert(
+            WikiEntry::new(
+                "Universal Agent Runtime",
+                "Rust async agent execution engine with liter-llm routing.",
+            )
+            .with_tags(["rust", "agent", "uar"]),
+        )
+        .await
+        .unwrap();
 
-    store.upsert(
-        WikiEntry::new("TurboQuant KV Cache", "3-bit FWHT compression for KV cache in Rust.")
-            .with_tags(["rust", "compression", "kv-cache"])
-    ).await.unwrap();
+    store
+        .upsert(
+            WikiEntry::new(
+                "TurboQuant KV Cache",
+                "3-bit FWHT compression for KV cache in Rust.",
+            )
+            .with_tags(["rust", "compression", "kv-cache"]),
+        )
+        .await
+        .unwrap();
 
-    store.upsert(
-        WikiEntry::new("Kaia Agent Certification", "W3C Verifiable Credentials issued for agent behavior.")
-            .with_tags(["kaia", "vc", "agent"])
-    ).await.unwrap();
+    store
+        .upsert(
+            WikiEntry::new(
+                "Kaia Agent Certification",
+                "W3C Verifiable Credentials issued for agent behavior.",
+            )
+            .with_tags(["kaia", "vc", "agent"]),
+        )
+        .await
+        .unwrap();
 
     let results = store.search("agent runtime execution", 3).await.unwrap();
     assert!(!results.is_empty());
-    assert_eq!(results[0].id, ArticleId::from_slug("Universal Agent Runtime"));
+    assert_eq!(
+        results[0].id,
+        ArticleId::from_slug("Universal Agent Runtime")
+    );
 }
 
 #[tokio::test]
@@ -278,12 +309,18 @@ async fn reserved_filenames_are_skipped_on_load() {
     let wiki_dir = dir.path().join("wiki");
     tokio::fs::create_dir_all(&wiki_dir).await.unwrap();
 
-    tokio::fs::write(wiki_dir.join("index.md"), "# Index\n\n* [Foo](foo.md) - a concept\n")
-        .await
-        .unwrap();
-    tokio::fs::write(wiki_dir.join("log.md"), "# Log\n\n## 2026-07-02\n* **Creation**: seeded\n")
-        .await
-        .unwrap();
+    tokio::fs::write(
+        wiki_dir.join("index.md"),
+        "# Index\n\n* [Foo](foo.md) - a concept\n",
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        wiki_dir.join("log.md"),
+        "# Log\n\n## 2026-07-02\n* **Creation**: seeded\n",
+    )
+    .await
+    .unwrap();
 
     let store = MarkdownStore::open(dir.path()).await.unwrap();
     assert_eq!(store.entry_count().await, 0);
@@ -301,15 +338,27 @@ async fn reserved_filenames_are_skipped_on_load() {
 async fn related_entries_finds_overlapping_content() {
     let (store, _dir) = temp_store().await;
 
-    store.upsert(
-        WikiEntry::new("Axum Web Framework", "Async Rust web framework built on Tower.")
-            .with_tags(["rust", "axum", "web"])
-    ).await.unwrap();
+    store
+        .upsert(
+            WikiEntry::new(
+                "Axum Web Framework",
+                "Async Rust web framework built on Tower.",
+            )
+            .with_tags(["rust", "axum", "web"]),
+        )
+        .await
+        .unwrap();
 
-    store.upsert(
-        WikiEntry::new("Tower Middleware", "Composable middleware layers for async Rust services.")
-            .with_tags(["rust", "tower", "middleware"])
-    ).await.unwrap();
+    store
+        .upsert(
+            WikiEntry::new(
+                "Tower Middleware",
+                "Composable middleware layers for async Rust services.",
+            )
+            .with_tags(["rust", "tower", "middleware"]),
+        )
+        .await
+        .unwrap();
 
     let raw = RawDoc::from_path(
         "test.md",
@@ -317,4 +366,40 @@ async fn related_entries_finds_overlapping_content() {
     );
     let related = store.related_entries(&raw, 5).await.unwrap();
     assert!(!related.is_empty());
+}
+
+#[tokio::test]
+async fn reconciliation_adds_changes_and_removes_direct_disk_edits() {
+    let (store, dir) = temp_store().await;
+    let wiki = dir.path().join("wiki");
+    let path = wiki.join("direct.md");
+    tokio::fs::write(
+        &path,
+        "---\ntype: Reference\ntitle: Direct\ndescription: First version.\n---\n\nalpha token\n",
+    )
+    .await
+    .unwrap();
+
+    let added = store.reconcile_from_disk().await.unwrap();
+    assert!(added.changed);
+    assert_eq!(added.indexed_count, 1);
+    assert_eq!(added.on_disk_count, 1);
+    assert_eq!(added.parse_failures, 0);
+    assert_eq!(store.search("alpha", 5).await.unwrap().len(), 1);
+
+    tokio::fs::write(
+        &path,
+        "---\ntype: Reference\ntitle: Direct\ndescription: Second version.\n---\n\nbeta token\n",
+    )
+    .await
+    .unwrap();
+    let changed = store.reconcile_from_disk().await.unwrap();
+    assert!(changed.changed);
+    assert!(store.search("beta", 5).await.unwrap().len() == 1);
+
+    tokio::fs::remove_file(&path).await.unwrap();
+    let removed = store.reconcile_from_disk().await.unwrap();
+    assert!(removed.changed);
+    assert_eq!(removed.indexed_count, 0);
+    assert_eq!(removed.on_disk_count, 0);
 }

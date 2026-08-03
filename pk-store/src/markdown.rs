@@ -74,8 +74,7 @@ pub fn entry_to_markdown(entry: &WikiEntry) -> PkResult<String> {
         extra: entry.extra.clone(),
     };
 
-    let yaml = serde_yaml::to_string(&fm)
-        .map_err(|e| PkError::frontmatter(e.to_string()))?;
+    let yaml = serde_yaml::to_string(&fm).map_err(|e| PkError::frontmatter(e.to_string()))?;
 
     Ok(format!("---\n{}---\n\n{}", yaml, entry.content))
 }
@@ -167,9 +166,12 @@ mod tests {
 
     #[test]
     fn roundtrip_entry() {
-        let entry = WikiEntry::new("Universal Agent Runtime", "The UAR is the core of Prometheus.")
-            .with_tags(["rust", "uar", "prometheus"])
-            .with_sources(["session:abc-123"]);
+        let entry = WikiEntry::new(
+            "Universal Agent Runtime",
+            "The UAR is the core of Prometheus.",
+        )
+        .with_tags(["rust", "uar", "prometheus"])
+        .with_sources(["session:abc-123"]);
 
         let md = entry_to_markdown(&entry).unwrap();
         assert!(md.contains("---"));
