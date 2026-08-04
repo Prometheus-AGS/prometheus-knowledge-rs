@@ -14,7 +14,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "1.7.0"
 edition = "2021"
 authors = ["Travis James <travis@prometheusags.com>"]
 license = "MIT"
@@ -50,7 +50,7 @@ chrono = { version = "0.4", features = ["serde"] }
 pulldown-cmark = "0.12"
 
 # File watching
-notify = { version = "7", features = ["macos_fsevent"] }
+notify = { version = "8.2", features = ["macos_fsevent"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -73,9 +73,9 @@ dirs = "5"
 fs2 = "0.4"
 
 # Internal crates
-pk-core        = { path = "pk-core" }
-pk-store       = { path = "pk-store" }
-pk-watcher     = { path = "pk-watcher" }
-pk-librarian   = { path = "pk-librarian" }
-pk-mcp         = { path = "pk-mcp" }
-pk-event-store = { path = "pk-event-store" }
+pk-core        = { version = "1.7.0", path = "pk-core" }
+pk-store       = { version = "1.7.0", path = "pk-store" }
+pk-watcher     = { version = "1.7.0", path = "pk-watcher" }
+pk-librarian   = { version = "1.7.0", path = "pk-librarian" }
+pk-mcp         = { version = "1.7.0", path = "pk-mcp" }
+pk-event-store = { version = "1.7.0", path = "pk-event-store" }

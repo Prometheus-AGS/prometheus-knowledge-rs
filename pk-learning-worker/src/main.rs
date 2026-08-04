@@ -12,7 +12,10 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Parser)]
 #[command(name = "prometheus-learning-worker", version)]
@@ -52,7 +55,18 @@ struct LearningJob {
     transcript_path: Option<PathBuf>,
     captured_at: String,
     payload_digest: String,
+    #[serde(default)]
+    scope: LearningScope,
+    #[serde(default)]
     attempt: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LearningScope {
+    #[default]
+    Project,
+    Shared,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,8 +117,7 @@ struct RunSummary {
     started_at: String,
     completed_at: String,
     jobs_completed: usize,
-    jobs_retried: usize,
-    jobs_dead_lettered: usize,
+    jobs_rejected: usize,
     memory_delivered: usize,
     memory_awaiting_reconciliation: usize,
     last_error: Option<String>,
@@ -116,6 +129,8 @@ struct QueueStatus {
     queue_root: String,
     pending: usize,
     processing: usize,
+    rejected: usize,
+    /// Undrained records created by the legacy retry-count worker.
     retry: usize,
     completed: usize,
     dead_letter: usize,
@@ -158,6 +173,7 @@ fn ensure_layout(root: &Path) -> Result<()> {
         "pending",
         "processing",
         "retry",
+        "rejected",
         "completed",
         "dead-letter",
         "memory/pending",
@@ -188,6 +204,7 @@ async fn run_once(root: &Path, memory_url: &str) -> Result<()> {
     }
 
     recover_processing(root)?;
+    migrate_legacy_job_retry(root)?;
     recover_memory_submitting(root)?;
     migrate_legacy_memory_retry(root)?;
 
@@ -200,11 +217,18 @@ async fn run_once(root: &Path, memory_url: &str) -> Result<()> {
             Ok(()) => summary.jobs_completed += 1,
             Err(error) => {
                 summary.last_error = Some(error.to_string());
-                if retry_job(root, &path, &error.to_string())? {
-                    summary.jobs_retried += 1;
-                } else {
-                    summary.jobs_dead_lettered += 1;
+                let completed = root
+                    .join("completed")
+                    .join(path.file_name().context("job has no filename")?);
+                if completed.exists() {
+                    summary.jobs_completed += 1;
+                    continue;
                 }
+                let processing = root
+                    .join("processing")
+                    .join(path.file_name().context("job has no filename")?);
+                reject_job(root, &processing, &error.to_string())?;
+                summary.jobs_rejected += 1;
             }
         }
     }
@@ -237,7 +261,22 @@ fn recover_processing(root: &Path) -> Result<()> {
         if target.exists() {
             preserve_duplicate(root, &path, "recovered-processing")?;
         } else {
-            fs::rename(path, target)?;
+            durable_rename(&path, &target)?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_legacy_job_retry(root: &Path) -> Result<()> {
+    for path in json_files(&root.join("retry"))? {
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let target = root.join("pending").join(name);
+        if target.exists() {
+            preserve_duplicate(root, &path, "legacy-job-retry")?;
+        } else {
+            durable_rename(&path, &target)?;
         }
     }
     Ok(())
@@ -262,13 +301,13 @@ fn migrate_legacy_memory_retry(root: &Path) -> Result<()> {
         };
         let target = root.join("memory/pending").join(name);
         if target.exists() {
-            preserve_duplicate(root, &path, "legacy-memory-retry")?;
+            preserve_duplicate_in(&root.join("memory/completed"), &path, "legacy-memory-retry")?;
         } else {
             let mut operation = read_operation(&path)?;
             operation.state = "pending".to_owned();
             operation.last_error = None;
             atomic_json(&path, &operation)?;
-            fs::rename(path, target)?;
+            durable_rename(&path, &target)?;
         }
     }
     Ok(())
@@ -279,7 +318,7 @@ async fn process_job(root: &Path, pending_path: &Path) -> Result<()> {
         .file_name()
         .context("job path has no filename")?;
     let processing = root.join("processing").join(name);
-    fs::rename(pending_path, &processing)?;
+    durable_rename(pending_path, &processing)?;
     let raw = fs::read_to_string(&processing)?;
     let job: LearningJob = serde_json::from_str(&raw)?;
     if job.schema_version != 2 {
@@ -292,12 +331,11 @@ async fn process_job(root: &Path, pending_path: &Path) -> Result<()> {
     }
 
     let packet = build_session_packet(&job)?;
-    let target_kb = if packet.contains("[GLOBAL]") {
-        dirs::home_dir()
+    let target_kb = match job.scope {
+        LearningScope::Project => job.project_root.join(".prometheus/knowledge"),
+        LearningScope::Shared => dirs::home_dir()
             .context("HOME unavailable")?
-            .join(".prometheus/knowledge/shared")
-    } else {
-        job.project_root.join(".prometheus/knowledge")
+            .join(".prometheus/knowledge/shared"),
     };
     let store = MarkdownStore::open(&target_kb).await?;
     let entry_id = format!(
@@ -332,7 +370,7 @@ async fn process_job(root: &Path, pending_path: &Path) -> Result<()> {
     }
     append_learning_log(&job, &packet)?;
     enqueue_memory(root, &job, &packet)?;
-    fs::rename(processing, completed)?;
+    durable_rename(&processing, &completed)?;
     Ok(())
 }
 
@@ -456,10 +494,9 @@ fn append_learning_log(job: &LearningJob, packet: &str) -> Result<()> {
 fn enqueue_memory(root: &Path, job: &LearningJob, packet: &str) -> Result<()> {
     let arguments = json!({
         "content": packet,
-        "user_id": if packet.contains("[GLOBAL]") {
-            "global".to_owned()
-        } else {
-            project_scope(&job.project_root)
+        "user_id": match job.scope {
+            LearningScope::Project => project_scope(&job.project_root),
+            LearningScope::Shared => "global".to_owned(),
         },
         "agent_id": null,
         "session_id": job.session_id,
@@ -477,15 +514,9 @@ fn enqueue_memory(root: &Path, job: &LearningJob, packet: &str) -> Result<()> {
         last_error: None,
         receipt: None,
     };
-    let path = root
-        .join("memory/pending")
-        .join(format!("{}.json", operation.operation_id));
-    if !path.exists()
-        && !root
-            .join("memory/completed")
-            .join(path.file_name().unwrap())
-            .exists()
-    {
+    let filename = format!("{}.json", operation.operation_id);
+    let path = root.join("memory/pending").join(&filename);
+    if !path.exists() && !root.join("memory/completed").join(&filename).exists() {
         atomic_json(&path, &operation)?;
     }
     Ok(())
@@ -508,7 +539,7 @@ async fn reconcile_memory(
         operation.state = "submitting".to_owned();
         operation.last_error = None;
         atomic_json(&current_path, &operation)?;
-        fs::rename(&current_path, &target)?;
+        durable_rename(&current_path, &target)?;
         current_path = target;
     }
     let endpoint = format!(
@@ -595,8 +626,13 @@ fn apply_receipt(
         .payload_hash
         .as_deref()
         .context("normalized operation is missing payload_hash")?;
-    if receipt.operation_id != operation.operation_id || receipt.payload_hash != expected_hash {
-        anyhow::bail!("receipt identity or payload hash does not match local operation");
+    if receipt.schema_version != 2
+        || receipt.operation_id != operation.operation_id
+        || receipt.kind != operation.method
+        || receipt.payload_hash != expected_hash
+        || receipt.dependencies != operation.dependencies
+    {
+        anyhow::bail!("receipt contract, identity, or payload hash does not match local operation");
     }
     operation.receipt = Some(receipt.clone());
     operation.last_error = receipt.error.clone();
@@ -609,10 +645,11 @@ fn apply_receipt(
             operation.state = "rejected".to_owned();
             root.join("memory/rejected")
         }
-        _ => {
+        "accepted" | "validated" | "blocked" | "planned" | "processing" | "indexed" => {
             operation.state = "accepted".to_owned();
             root.join("memory/accepted")
         }
+        state => anyhow::bail!("operation receipt has unknown state {state}"),
     };
     atomic_json(path, operation)?;
     let target = destination.join(
@@ -621,9 +658,13 @@ fn apply_receipt(
     );
     if path != target {
         if target.exists() {
-            preserve_duplicate(root, path, "receipt-reconciliation")?;
+            preserve_duplicate_in(
+                &root.join("memory/completed"),
+                path,
+                "receipt-reconciliation",
+            )?;
         } else {
-            fs::rename(path, target)?;
+            durable_rename(path, &target)?;
         }
     }
     Ok(())
@@ -633,7 +674,15 @@ fn read_operation(path: &Path) -> Result<MemoryOperation> {
     let mut operation: MemoryOperation = serde_json::from_slice(&fs::read(path)?)?;
     operation.arguments = normalize_payload(&operation.method, &operation.arguments)?;
     operation.schema_version = 2;
-    operation.payload_hash = Some(canonical_payload_hash(&operation.arguments)?);
+    let computed_hash = canonical_payload_hash(&operation.arguments)?;
+    if operation
+        .payload_hash
+        .as_deref()
+        .is_some_and(|stored_hash| stored_hash != computed_hash)
+    {
+        anyhow::bail!("stored payload hash does not match normalized operation payload");
+    }
+    operation.payload_hash = Some(computed_hash);
     if operation.state.trim().is_empty() {
         operation.state = "pending".to_owned();
     }
@@ -687,32 +736,27 @@ fn bounded_error(detail: &str) -> String {
     detail.chars().take(500).collect()
 }
 
-fn retry_job(root: &Path, path: &Path, error: &str) -> Result<bool> {
-    let processing = if path.starts_with(root.join("processing")) {
-        path.to_path_buf()
-    } else {
-        root.join("processing")
-            .join(path.file_name().context("job has no filename")?)
-    };
-    let mut job: LearningJob = serde_json::from_slice(&fs::read(&processing)?)?;
-    job.attempt += 1;
-    if job.attempt >= 5 {
-        let target = root
-            .join("dead-letter")
-            .join(processing.file_name().context("job has no filename")?);
-        atomic_json(
-            &target,
-            &json!({"job":job,"error":error,"failedAt":Utc::now()}),
-        )?;
-        fs::rename(processing, target.with_extension("source.json"))?;
-        return Ok(false);
-    }
-    atomic_json(&processing, &job)?;
-    let target = root
-        .join("retry")
-        .join(processing.file_name().context("job has no filename")?);
-    fs::rename(processing, target)?;
-    Ok(true)
+fn reject_job(root: &Path, processing: &Path, error: &str) -> Result<()> {
+    let name = processing.file_name().context("job has no filename")?;
+    let rejected = root.join("rejected").join(name);
+    let source = rejected.with_extension("source.json");
+    let failure = rejected.with_extension("failure.json");
+    let original = fs::read(processing)?;
+    let source_hash = Sha256::digest(&original)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    atomic_json(
+        &failure,
+        &json!({
+            "schemaVersion": 2,
+            "state": "rejected",
+            "sourceHash": source_hash,
+            "error": bounded_error(error),
+            "rejectedAt": Utc::now().to_rfc3339()
+        }),
+    )?;
+    durable_rename(processing, &source)
 }
 
 fn record_memory_error(root: &Path, original_path: &Path, error: &str) -> Result<()> {
@@ -742,14 +786,18 @@ fn locate_memory_operation(root: &Path, original_path: &Path) -> Result<PathBuf>
 }
 
 fn preserve_duplicate(root: &Path, path: &Path, label: &str) -> Result<()> {
+    preserve_duplicate_in(&root.join("completed"), path, label)
+}
+
+fn preserve_duplicate_in(directory: &Path, path: &Path, label: &str) -> Result<()> {
     let name = path.file_name().context("duplicate path has no filename")?;
-    let target = root.join("completed").join(format!(
+    let target = directory.join(format!(
         "{}.{}.{}",
         name.to_string_lossy(),
         label,
         Utc::now().timestamp_millis()
     ));
-    fs::rename(path, target)?;
+    durable_rename(path, &target)?;
     Ok(())
 }
 
@@ -767,11 +815,12 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path.parent().context("output path has no parent")?;
     fs::create_dir_all(parent)?;
     let temporary = parent.join(format!(
-        ".{}.{}.tmp",
+        ".{}.{}.{}.tmp",
         path.file_name()
             .context("output path has no filename")?
             .to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     let mut file = OpenOptions::new()
         .create_new(true)
@@ -782,6 +831,23 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     writeln!(file)?;
     file.sync_all()?;
     fs::rename(temporary, path)?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+fn durable_rename(source: &Path, target: &Path) -> Result<()> {
+    let source_parent = source.parent().context("source path has no parent")?;
+    let target_parent = target.parent().context("target path has no parent")?;
+    fs::rename(source, target)?;
+    sync_directory(target_parent)?;
+    if source_parent != target_parent {
+        sync_directory(source_parent)?;
+    }
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)?.sync_all()?;
     Ok(())
 }
 
@@ -790,6 +856,7 @@ fn print_status(root: &Path, json_output: bool) -> Result<()> {
         queue_root: root.display().to_string(),
         pending: json_files(&root.join("pending"))?.len(),
         processing: json_files(&root.join("processing"))?.len(),
+        rejected: json_files(&root.join("rejected"))?.len(),
         retry: json_files(&root.join("retry"))?.len(),
         completed: json_files(&root.join("completed"))?.len(),
         dead_letter: json_files(&root.join("dead-letter"))?.len(),
@@ -810,6 +877,7 @@ fn print_status(root: &Path, json_output: bool) -> Result<()> {
     } else {
         println!("pending: {}", status.pending);
         println!("processing: {}", status.processing);
+        println!("rejected: {}", status.rejected);
         println!("retry: {}", status.retry);
         println!("completed: {}", status.completed);
         println!("dead-letter: {}", status.dead_letter);
@@ -841,11 +909,17 @@ fn project_scope(project_root: &Path) -> String {
             }
         }
     }
-    project_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("project")
-        .to_owned()
+    let stable_path = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let digest = Sha256::digest(stable_path.to_string_lossy().as_bytes());
+    format!(
+        "project:{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 #[cfg(unix)]
@@ -875,7 +949,30 @@ fn harden_file(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        extract::{Path as AxumPath, State},
+        http::StatusCode,
+        routing::{get, post},
+        Json, Router,
+    };
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    fn learning_job(project_root: PathBuf) -> LearningJob {
+        LearningJob {
+            schema_version: 2,
+            event_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            event_type: "stop".to_owned(),
+            harness: "fixture".to_owned(),
+            session_id: "fixture-session".to_owned(),
+            project_root,
+            transcript_path: None,
+            captured_at: "2026-08-03T00:00:00Z".to_owned(),
+            payload_digest: "fixture".to_owned(),
+            scope: LearningScope::Project,
+            attempt: 0,
+        }
+    }
 
     fn operation(method: &str, arguments: Value) -> MemoryOperation {
         MemoryOperation {
@@ -890,6 +987,65 @@ mod tests {
             last_error: None,
             receipt: None,
         }
+    }
+
+    fn receipt(operation: &MemoryOperation, state: &str) -> OperationReceipt {
+        OperationReceipt {
+            operation_id: operation.operation_id.clone(),
+            schema_version: 2,
+            kind: operation.method.clone(),
+            payload_hash: operation.payload_hash.clone().unwrap(),
+            dependencies: Vec::new(),
+            state: state.to_owned(),
+            blocked_by: Vec::new(),
+            result: (state == "committed").then(|| json!({"id":"memory:operation-1"})),
+            error: None,
+            executor_generation: 1,
+            progress_seq: 6,
+            created_at: "2026-08-03T00:00:00Z".to_owned(),
+            updated_at: "2026-08-03T00:00:01Z".to_owned(),
+        }
+    }
+
+    #[derive(Clone)]
+    struct LedgerFixture {
+        lookup: Option<OperationReceipt>,
+        submission: OperationReceipt,
+        ready: bool,
+        posts: Arc<Mutex<usize>>,
+    }
+
+    async fn ledger_lookup(
+        State(state): State<LedgerFixture>,
+        AxumPath(_operation_id): AxumPath<String>,
+    ) -> Result<Json<OperationReceipt>, StatusCode> {
+        state.lookup.map(Json).ok_or(StatusCode::NOT_FOUND)
+    }
+
+    async fn ledger_ready(State(state): State<LedgerFixture>) -> Json<Value> {
+        Json(json!({"capabilities":{"ledger":state.ready}}))
+    }
+
+    async fn ledger_submit(
+        State(state): State<LedgerFixture>,
+        Json(_body): Json<Value>,
+    ) -> Json<OperationReceipt> {
+        *state.posts.lock().unwrap() += 1;
+        Json(state.submission)
+    }
+
+    async fn serve_ledger(state: LedgerFixture) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/ready", get(ledger_ready))
+            .route("/api/v2/operations", post(ledger_submit))
+            .route("/api/v2/operations/{operation_id}", get(ledger_lookup))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), server)
     }
 
     #[test]
@@ -928,21 +1084,7 @@ mod tests {
         operation.payload_hash = Some(canonical_payload_hash(&operation.arguments).unwrap());
         let path = temp.path().join("memory/submitting/operation-1.json");
         atomic_json(&path, &operation).unwrap();
-        let receipt = OperationReceipt {
-            operation_id: operation.operation_id.clone(),
-            schema_version: 2,
-            kind: operation.method.clone(),
-            payload_hash: operation.payload_hash.clone().unwrap(),
-            dependencies: Vec::new(),
-            state: "committed".to_owned(),
-            blocked_by: Vec::new(),
-            result: Some(json!({"id":"memory:operation-1"})),
-            error: None,
-            executor_generation: 1,
-            progress_seq: 6,
-            created_at: "2026-08-03T00:00:00Z".to_owned(),
-            updated_at: "2026-08-03T00:00:01Z".to_owned(),
-        };
+        let receipt = receipt(&operation, "committed");
         apply_receipt(temp.path(), &path, &mut operation, receipt).unwrap();
         assert!(!path.exists());
         let completed = temp.path().join("memory/completed/operation-1.json");
@@ -950,5 +1092,222 @@ mod tests {
         let stored = read_operation(&completed).unwrap();
         assert_eq!(stored.state, "completed");
         assert_eq!(stored.receipt.unwrap().state, "committed");
+    }
+
+    #[test]
+    fn local_payload_hash_mismatch_is_rejected_before_transport() {
+        let temp = TempDir::new().unwrap();
+        ensure_layout(temp.path()).unwrap();
+        let mut operation = operation("add_memory", json!({"content":"delta"}));
+        operation.payload_hash = Some("0".repeat(64));
+        let path = temp.path().join("memory/pending/operation-1.json");
+        atomic_json(&path, &operation).unwrap();
+
+        let error = read_operation(&path).unwrap_err().to_string();
+
+        assert!(error.contains("stored payload hash"), "{error}");
+    }
+
+    #[test]
+    fn receipt_dependencies_must_match_the_local_operation() {
+        let temp = TempDir::new().unwrap();
+        ensure_layout(temp.path()).unwrap();
+        let mut operation = operation("add_memory", json!({"content":"delta"}));
+        operation.payload_hash = Some(canonical_payload_hash(&operation.arguments).unwrap());
+        let path = temp.path().join("memory/submitting/operation-1.json");
+        atomic_json(&path, &operation).unwrap();
+        let mut mismatched = receipt(&operation, "accepted");
+        mismatched.dependencies = vec!["unexpected".to_owned()];
+
+        let error = apply_receipt(temp.path(), &path, &mut operation, mismatched)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("receipt contract"), "{error}");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn scope_fallback_distinguishes_same_named_checkouts() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("one/project");
+        let second = temp.path().join("two/project");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+
+        assert_ne!(project_scope(&first), project_scope(&second));
+        assert_eq!(project_scope(&first), project_scope(&first));
+    }
+
+    #[test]
+    fn transcript_text_cannot_promote_memory_to_global_scope() {
+        let temp = TempDir::new().unwrap();
+        ensure_layout(temp.path()).unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let job = learning_job(project.clone());
+
+        enqueue_memory(
+            temp.path(),
+            &job,
+            "ordinary assistant prose containing the untrusted marker [GLOBAL]",
+        )
+        .unwrap();
+
+        let operation = read_operation(
+            &temp
+                .path()
+                .join("memory/pending/0123456789abcdef0123456789abcdef.json"),
+        )
+        .unwrap();
+        assert_eq!(operation.arguments["user_id"], project_scope(&project));
+    }
+
+    #[test]
+    fn legacy_job_retry_is_migrated_without_changing_identity() {
+        let temp = TempDir::new().unwrap();
+        ensure_layout(temp.path()).unwrap();
+        let job = learning_job(temp.path().join("project"));
+        let retry = temp.path().join("retry/job.json");
+        atomic_json(&retry, &job).unwrap();
+
+        migrate_legacy_job_retry(temp.path()).unwrap();
+
+        assert!(!retry.exists());
+        let pending = temp.path().join("pending/job.json");
+        assert!(pending.exists());
+        let migrated: LearningJob = serde_json::from_slice(&fs::read(pending).unwrap()).unwrap();
+        assert_eq!(migrated.event_id, job.event_id);
+        assert_eq!(migrated.attempt, job.attempt);
+    }
+
+    #[test]
+    fn legacy_memory_retry_is_migrated_under_the_same_operation_id() {
+        let temp = TempDir::new().unwrap();
+        ensure_layout(temp.path()).unwrap();
+        let mut operation = operation("add_memory", json!({"content":"existing record"}));
+        operation.operation_id = "existing-operation-id".to_owned();
+        operation.state = "retry".to_owned();
+        operation.last_error = Some("legacy transport failure".to_owned());
+        let retry = temp.path().join("memory/retry/existing-operation-id.json");
+        atomic_json(&retry, &operation).unwrap();
+
+        migrate_legacy_memory_retry(temp.path()).unwrap();
+
+        assert!(!retry.exists());
+        let pending = temp
+            .path()
+            .join("memory/pending/existing-operation-id.json");
+        let migrated = read_operation(&pending).unwrap();
+        assert_eq!(migrated.operation_id, "existing-operation-id");
+        assert_eq!(migrated.state, "pending");
+        assert!(migrated.last_error.is_none());
+    }
+
+    #[test]
+    fn malformed_job_is_rejected_with_its_original_bytes() {
+        let temp = TempDir::new().unwrap();
+        ensure_layout(temp.path()).unwrap();
+        let processing = temp.path().join("processing/broken.json");
+        let original = br#"{"schemaVersion":2,"eventId":"unterminated"#;
+        fs::write(&processing, original).unwrap();
+
+        reject_job(temp.path(), &processing, "malformed fixture").unwrap();
+
+        assert!(!processing.exists());
+        assert_eq!(
+            fs::read(temp.path().join("rejected/broken.source.json")).unwrap(),
+            original
+        );
+        let failure: Value = serde_json::from_slice(
+            &fs::read(temp.path().join("rejected/broken.failure.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(failure["error"], "malformed fixture");
+    }
+
+    #[tokio::test]
+    async fn existing_ledger_receipt_is_never_resubmitted() {
+        let temp = TempDir::new().unwrap();
+        ensure_layout(temp.path()).unwrap();
+        let mut operation = operation("add_memory", json!({"content":"delta"}));
+        operation.payload_hash = Some(canonical_payload_hash(&operation.arguments).unwrap());
+        let path = temp.path().join("memory/submitting/operation-1.json");
+        operation.state = "submitting".to_owned();
+        atomic_json(&path, &operation).unwrap();
+        let posts = Arc::new(Mutex::new(0));
+        let fixture = LedgerFixture {
+            lookup: Some(receipt(&operation, "committed")),
+            submission: receipt(&operation, "accepted"),
+            ready: true,
+            posts: Arc::clone(&posts),
+        };
+        let (url, server) = serve_ledger(fixture).await;
+
+        reconcile_memory(temp.path(), &path, &url, &reqwest::Client::new())
+            .await
+            .unwrap();
+
+        assert_eq!(*posts.lock().unwrap(), 0);
+        assert!(temp
+            .path()
+            .join("memory/completed/operation-1.json")
+            .exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn absent_operation_is_not_submitted_until_ledger_is_ready() {
+        let temp = TempDir::new().unwrap();
+        ensure_layout(temp.path()).unwrap();
+        let mut operation = operation("add_memory", json!({"content":"delta"}));
+        operation.payload_hash = Some(canonical_payload_hash(&operation.arguments).unwrap());
+        let path = temp.path().join("memory/submitting/operation-1.json");
+        operation.state = "submitting".to_owned();
+        atomic_json(&path, &operation).unwrap();
+        let posts = Arc::new(Mutex::new(0));
+        let fixture = LedgerFixture {
+            lookup: None,
+            submission: receipt(&operation, "accepted"),
+            ready: false,
+            posts: Arc::clone(&posts),
+        };
+        let (url, server) = serve_ledger(fixture).await;
+
+        let result = reconcile_memory(temp.path(), &path, &url, &reqwest::Client::new()).await;
+
+        assert!(result.is_err());
+        assert_eq!(*posts.lock().unwrap(), 0);
+        assert!(path.exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn authoritative_absence_submits_once_and_persists_acceptance() {
+        let temp = TempDir::new().unwrap();
+        ensure_layout(temp.path()).unwrap();
+        let mut operation = operation("add_memory", json!({"content":"delta"}));
+        operation.payload_hash = Some(canonical_payload_hash(&operation.arguments).unwrap());
+        let path = temp.path().join("memory/submitting/operation-1.json");
+        operation.state = "submitting".to_owned();
+        atomic_json(&path, &operation).unwrap();
+        let posts = Arc::new(Mutex::new(0));
+        let fixture = LedgerFixture {
+            lookup: None,
+            submission: receipt(&operation, "accepted"),
+            ready: true,
+            posts: Arc::clone(&posts),
+        };
+        let (url, server) = serve_ledger(fixture).await;
+
+        reconcile_memory(temp.path(), &path, &url, &reqwest::Client::new())
+            .await
+            .unwrap();
+
+        assert_eq!(*posts.lock().unwrap(), 1);
+        let accepted = temp.path().join("memory/accepted/operation-1.json");
+        assert!(accepted.exists());
+        assert_eq!(read_operation(&accepted).unwrap().state, "accepted");
+        server.abort();
     }
 }

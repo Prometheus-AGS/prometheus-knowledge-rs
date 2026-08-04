@@ -43,15 +43,17 @@ pub enum LibrarianEvent {
     },
 
     /// General error that did not crash the librarian
-    Error {
-        message: String,
-        ts: DateTime<Utc>,
-    },
+    Error { message: String, ts: DateTime<Utc> },
 }
 
 impl LibrarianEvent {
     pub fn compiled(entry_id: ArticleId, title: String, tags: Vec<String>) -> Self {
-        Self::Compiled { entry_id, title, tags, ts: chrono::Utc::now() }
+        Self::Compiled {
+            entry_id,
+            title,
+            tags,
+            ts: chrono::Utc::now(),
+        }
     }
 
     pub fn lint_completed(reports: Vec<LintReport>, scanned: usize) -> Self {
@@ -63,6 +65,9 @@ impl LibrarianEvent {
     }
 
     pub fn error(msg: impl std::fmt::Display) -> Self {
-        Self::Error { message: msg.to_string(), ts: chrono::Utc::now() }
+        Self::Error {
+            message: msg.to_string(),
+            ts: chrono::Utc::now(),
+        }
     }
 }

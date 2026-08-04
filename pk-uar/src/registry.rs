@@ -18,13 +18,21 @@ pub struct ToolResult {
 
 impl ToolResult {
     pub fn ok(id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { tool_use_id: id.into(), content: content.into(), is_error: false }
+        Self {
+            tool_use_id: id.into(),
+            content: content.into(),
+            is_error: false,
+        }
     }
 
     #[cold]
     #[inline(never)]
     pub fn err(id: impl Into<String>, msg: impl std::fmt::Display) -> Self {
-        Self { tool_use_id: id.into(), content: msg.to_string(), is_error: true }
+        Self {
+            tool_use_id: id.into(),
+            content: msg.to_string(),
+            is_error: true,
+        }
     }
 }
 
@@ -60,10 +68,10 @@ impl KnowledgeTool {
     pub fn name(&self) -> &'static str {
         match self {
             Self::Ingest => "knowledge_ingest",
-            Self::Lint   => "knowledge_lint",
-            Self::Focus  => "knowledge_focus",
+            Self::Lint => "knowledge_lint",
+            Self::Focus => "knowledge_focus",
             Self::Search => "knowledge_search",
-            Self::Get    => "knowledge_get",
+            Self::Get => "knowledge_get",
         }
     }
 

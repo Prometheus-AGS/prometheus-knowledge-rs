@@ -28,8 +28,8 @@ impl EventStore {
     ///   SURREAL_DB   — default "librarian"
     ///   SESSION_ID   — human-readable session identifier (optional)
     pub fn for_project(project_root: &Path, scope: &str) -> Self {
-        let session_id = std::env::var("SESSION_ID")
-            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+        let session_id =
+            std::env::var("SESSION_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
         let surreal_url = std::env::var("SURREAL_URL").ok();
         let surreal_ns = std::env::var("SURREAL_NS").unwrap_or_else(|_| "prometheus".into());
         let surreal_db = std::env::var("SURREAL_DB").unwrap_or_else(|_| "librarian".into());
@@ -80,11 +80,13 @@ impl EventStore {
 
     /// List recent events for this project.
     pub fn list(&self, kind: Option<&str>, limit: usize) -> Result<Vec<EventRecord>> {
-        self.fallback.list(&self.project_root.to_string_lossy(), kind, limit)
+        self.fallback
+            .list(&self.project_root.to_string_lossy(), kind, limit)
     }
 
     /// Return derivation history for a specific entry ID.
     pub fn for_entry(&self, entry_id: &str) -> Result<Vec<EventRecord>> {
-        self.fallback.for_entry(entry_id, &self.project_root.to_string_lossy())
+        self.fallback
+            .for_entry(entry_id, &self.project_root.to_string_lossy())
     }
 }

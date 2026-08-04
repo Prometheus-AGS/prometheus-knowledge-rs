@@ -95,6 +95,16 @@ impl MarkdownStore {
     pub async fn reconcile_from_disk(&self) -> PkResult<StoreReconcileReport> {
         let scan = scan_wiki_tree(&self.wiki_dir).await?;
         let mut inner = self.inner.write().await;
+        if scan.parse_failures > 0 {
+            inner.report = StoreReconcileReport {
+                indexed_count: inner.entries.len(),
+                on_disk_count: scan.on_disk_count,
+                parse_failures: scan.parse_failures,
+                changed: false,
+                last_reload: inner.report.last_reload,
+            };
+            return Ok(inner.report.clone());
+        }
         let changed = inner.source_hashes != scan.source_hashes;
         let last_reload = if changed {
             chrono::Utc::now()

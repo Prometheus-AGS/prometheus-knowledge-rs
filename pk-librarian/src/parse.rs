@@ -23,7 +23,11 @@ impl fmt::Display for ParseError {
                 write!(f, "LLM returned an empty response after stripping fences")
             }
             ParseError::InvalidJson { message, raw } => {
-                write!(f, "JSON parse failed: {message}\nRaw (first 500 chars): {}", &raw[..raw.len().min(500)])
+                write!(
+                    f,
+                    "JSON parse failed: {message}\nRaw (first 500 chars): {}",
+                    &raw[..raw.len().min(500)]
+                )
             }
             ParseError::MissingField { field, raw } => {
                 write!(
@@ -110,6 +114,9 @@ mod tests {
     fn missing_required_field_surfaces_error() {
         // title is not optional — serde will return an error
         let result: Result<Sample, _> = parse_json(r#"{"tags": ["a"]}"#);
-        assert!(matches!(result, Err(ParseError::InvalidJson { .. })), "missing required field should fail");
+        assert!(
+            matches!(result, Err(ParseError::InvalidJson { .. })),
+            "missing required field should fail"
+        );
     }
 }

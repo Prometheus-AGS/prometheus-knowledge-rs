@@ -111,7 +111,5 @@ pub fn focus_user_prompt(topic: &str, candidates_md: &str) -> String {
 }
 
 pub fn fix_user_prompt(entry_content: &str, issue: &str, suggestion: &str) -> String {
-    format!(
-        "LINT ISSUE: {issue}\nSUGGESTED FIX: {suggestion}\n\nARTICLE CONTENT:\n{entry_content}"
-    )
+    format!("LINT ISSUE: {issue}\nSUGGESTED FIX: {suggestion}\n\nARTICLE CONTENT:\n{entry_content}")
 }

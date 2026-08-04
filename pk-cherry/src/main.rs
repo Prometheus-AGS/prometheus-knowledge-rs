@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::Parser;
 use pk_librarian::{Librarian, ModelRouter};
 use pk_mcp::{McpServer, ReadinessHandle};
-use pk_store::MarkdownStore;
+use pk_store::{commit_prompt_snapshot, MarkdownStore};
 use pk_watcher::{spawn_wiki_watcher, InboxWatcher, WikiWatchEvent};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, mpsc};
@@ -34,6 +34,10 @@ struct Args {
 
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     log_level: String,
+
+    /// Immutable prompt-snapshot scope published by this knowledge store.
+    #[arg(long, env = "PK_SNAPSHOT_SCOPE", default_value = "global")]
+    snapshot_scope: String,
 }
 
 #[tokio::main]
@@ -51,6 +55,16 @@ async fn main() -> Result<()> {
     info!(kb_dir = %kb_dir.display(), "knowledge base directory");
 
     let store = Arc::new(MarkdownStore::open(&kb_dir).await?);
+    if !matches!(
+        args.snapshot_scope.as_str(),
+        "project" | "shared" | "global"
+    ) {
+        anyhow::bail!("snapshot scope must be project, shared, or global");
+    }
+    let initial_report = store.readiness_report().await;
+    if initial_report.parse_failures == 0 {
+        commit_prompt_snapshot(&kb_dir, &args.snapshot_scope, store.snapshot().await?)?;
+    }
     info!(entries = store.entry_count().await, "store opened");
     let readiness = ReadinessHandle::new(&kb_dir);
     readiness
@@ -76,6 +90,8 @@ async fn main() -> Result<()> {
     {
         let store = Arc::clone(&store);
         let readiness = readiness.clone();
+        let kb_dir = kb_dir.clone();
+        let snapshot_scope = args.snapshot_scope.clone();
         tokio::spawn(async move {
             while let Some(event) = wiki_watch_rx.recv().await {
                 match event {
@@ -88,6 +104,21 @@ async fn main() -> Result<()> {
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         while matches!(wiki_watch_rx.try_recv(), Ok(WikiWatchEvent::Changed)) {}
                         match store.reconcile_from_disk().await {
+                            Ok(report) if report.parse_failures == 0 => {
+                                match store.snapshot().await.and_then(|entries| {
+                                    commit_prompt_snapshot(&kb_dir, &snapshot_scope, entries)
+                                        .map(|_| ())
+                                }) {
+                                    Ok(()) => readiness.update_store(&report).await,
+                                    Err(error) => {
+                                        readiness
+                                            .set_watcher(format!(
+                                                "snapshot_publish_failed: {error}"
+                                            ))
+                                            .await;
+                                    }
+                                }
+                            }
                             Ok(report) => readiness.update_store(&report).await,
                             Err(error) => {
                                 readiness
