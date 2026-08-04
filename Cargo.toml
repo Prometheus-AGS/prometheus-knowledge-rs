@@ -14,7 +14,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "1.7.0"
 edition = "2021"
 authors = ["Travis James <travis@prometheusags.com>"]
 license = "MIT"
@@ -73,9 +73,9 @@ dirs = "5"
 fs2 = "0.4"
 
 # Internal crates
-pk-core        = { version = "0.1.0", path = "pk-core" }
-pk-store       = { version = "0.1.0", path = "pk-store" }
-pk-watcher     = { version = "0.1.0", path = "pk-watcher" }
-pk-librarian   = { version = "0.1.0", path = "pk-librarian" }
-pk-mcp         = { version = "0.1.0", path = "pk-mcp" }
-pk-event-store = { version = "0.1.0", path = "pk-event-store" }
+pk-core        = { version = "1.7.0", path = "pk-core" }
+pk-store       = { version = "1.7.0", path = "pk-store" }
+pk-watcher     = { version = "1.7.0", path = "pk-watcher" }
+pk-librarian   = { version = "1.7.0", path = "pk-librarian" }
+pk-mcp         = { version = "1.7.0", path = "pk-mcp" }
+pk-event-store = { version = "1.7.0", path = "pk-event-store" }
