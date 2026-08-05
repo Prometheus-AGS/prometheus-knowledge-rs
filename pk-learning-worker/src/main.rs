@@ -9,10 +9,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -447,14 +449,43 @@ fn extract_text(value: &Value) -> Option<String> {
 }
 
 fn git_changed_paths(project_root: &Path) -> Vec<String> {
-    let output = Command::new("git")
+    let mut child = match Command::new("git")
         .args(["status", "--short"])
         .current_dir(project_root)
-        .output();
-    let Ok(output) = output else {
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Vec::new(),
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Vec::new();
+            }
+        }
+    };
+    if !status.success() {
+        return Vec::new();
+    }
+
+    let mut stdout = Vec::new();
+    let Some(mut pipe) = child.stdout.take() else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&output.stdout)
+    if pipe.read_to_end(&mut stdout).is_err() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&stdout)
         .lines()
         .take(40)
         .map(|line| line.get(3..).unwrap_or(line).to_owned())
