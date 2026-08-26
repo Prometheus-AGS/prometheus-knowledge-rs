@@ -487,8 +487,24 @@ fn git_changed_paths(project_root: &Path) -> Vec<String> {
     }
     String::from_utf8_lossy(&stdout)
         .lines()
-        .take(40)
         .map(|line| line.get(3..).unwrap_or(line).to_owned())
+        // ~keep Drop the collector's own output. Session records are written
+        // into `.prometheus/knowledge` (see `target_kb`), so an unfiltered
+        // `git status` reports them as the *next* turn's changed work. That fed
+        // back on itself: consecutive records were identical except for a
+        // growing list of previously-generated karpathy files. Filtering here
+        // rather than via .gitignore keeps the wiki reviewable in git for
+        // projects that commit it, while still excluding it from "what changed
+        // this turn".
+        // Untracked output collapses to a bare `.prometheus/` entry, while a
+        // project that commits its wiki reports full paths — exclude both forms.
+        .filter(|path| {
+            let path = path.trim_end_matches('/');
+            path != ".prometheus"
+                && path != ".prometheus/knowledge"
+                && !path.starts_with(".prometheus/knowledge/")
+        })
+        .take(40)
         .collect()
 }
 
@@ -1340,5 +1356,64 @@ mod tests {
         assert!(accepted.exists());
         assert_eq!(read_operation(&accepted).unwrap().state, "accepted");
         server.abort();
+    }
+
+    /// Revert line: delete the `.filter(|path| !path.starts_with(...))` call in
+    /// `git_changed_paths` to make this test fail.
+    #[test]
+    fn git_changed_paths_excludes_the_collectors_own_wiki_writes() {
+        // ~keep The worker writes session records into `.prometheus/knowledge`,
+        // so an unfiltered `git status` reported them as the next turn's changed
+        // work — records differed only by a growing list of previously-generated
+        // karpathy files.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            Command::new("git")
+                .args(&args)
+                .current_dir(root)
+                .status()
+                .expect("git setup");
+        }
+        fs::create_dir_all(root.join(".prometheus/knowledge/wiki")).expect("mkdir wiki");
+        fs::write(
+            root.join(".prometheus/knowledge/wiki/karpathy-session-x.md"),
+            "x",
+        )
+        .expect("w1");
+        fs::write(root.join("real_change.rs"), "fn main() {}").expect("w2");
+        // Commit-then-modify so git reports the wiki as a full tracked path.
+        // (Left untracked, git collapses the whole tree to a bare `.prometheus/`
+        // entry, which is the other form the filter must also exclude.)
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(root)
+            .status()
+            .expect("git add");
+        Command::new("git")
+            .args(["commit", "--quiet", "-m", "seed"])
+            .current_dir(root)
+            .status()
+            .expect("git commit");
+        fs::write(
+            root.join(".prometheus/knowledge/wiki/karpathy-session-x.md"),
+            "y",
+        )
+        .expect("w3");
+        fs::write(root.join("real_change.rs"), "fn main() { }").expect("w4");
+
+        let paths = git_changed_paths(root);
+        assert!(
+            paths.iter().any(|p| p.contains("real_change.rs")),
+            "genuine work must still be reported, got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains(".prometheus/knowledge/")),
+            "the collector must not report its own writes, got {paths:?}"
+        );
     }
 }
