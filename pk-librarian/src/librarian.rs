@@ -50,12 +50,33 @@ impl Librarian {
             .await
             .map_err(|e| PkError::llm(e.to_string()))?;
 
-        let entry = parse_compile_response(&response)?;
-        // revision 0 means this id did not exist before upsert (WikiEntry::new
-        // starts at 0; upsert bumps it only for an existing id) — so it drives
-        // the Creation vs Update distinction in the OKF log.
-        let is_new = entry.revision == 0;
+        let mut entry = parse_compile_response(&response)?;
+
+        // Ingest-time duplicate detection: the LLM synthesizes a fresh title
+        // (and therefore a fresh ArticleId) on every call, even over content
+        // that repeats — so identity has to be anchored to content, not the
+        // title wording (GitHub issue #7). Exact repeats are caught by a
+        // normalized content hash; near-duplicates fall back to a
+        // word-overlap check against the related-entries candidates already
+        // fetched above.
+        let content_hash = pk_store::normalized_content_hash(&raw.content);
+        let duplicate_of = match self.store.find_by_content_hash(&content_hash).await {
+            Some(id) => Some(id),
+            None => pk_store::find_near_duplicate(&raw.content, &related),
+        };
+        if let Some(existing_id) = duplicate_of {
+            entry.id = existing_id;
+        }
+        pk_store::stamp_content_hash(&mut entry, &content_hash);
+
         let entry = self.store.upsert(entry).await?;
+        // upsert() bumps revision only when the id already existed in the
+        // store, so checking the *returned* entry's revision (not the
+        // pre-upsert value, which WikiEntry::new always sets to 0) correctly
+        // drives the Creation vs Update distinction in the OKF log — including
+        // when the id was reused via duplicate-content detection above rather
+        // than an incidental title-slug collision.
+        let is_new = entry.revision == 0;
 
         // Maintain the two OKF reserved bundle files (§6 index, §7 log) after
         // every ingest. Best-effort: a bookkeeping failure must not lose the

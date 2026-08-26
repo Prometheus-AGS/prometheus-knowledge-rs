@@ -2,6 +2,37 @@ use pk_core::types::{ArticleId, RawDoc, WikiEntry};
 use pk_store::MarkdownStore;
 use std::sync::Arc;
 
+/// Simulates the exact sequence `Librarian::compile()` runs around
+/// duplicate detection (GitHub issue #7): hash the raw content, look up an
+/// existing entry by that hash (falling back to a near-duplicate check
+/// against related-entries candidates), reuse its id when found, stamp the
+/// hash, then upsert — all without needing an LLM call, since the LLM's
+/// synthesized title/content is the one part of `compile()` this fix does
+/// not touch.
+async fn compile_like_ingest(
+    store: &MarkdownStore,
+    synthesized_title: &str,
+    raw_content: &str,
+) -> WikiEntry {
+    let related = store
+        .related_entries(&RawDoc::from_path("test.md", raw_content), 5)
+        .await
+        .unwrap();
+
+    let mut entry = WikiEntry::new(synthesized_title, raw_content);
+    let content_hash = pk_store::normalized_content_hash(raw_content);
+    let duplicate_of = match store.find_by_content_hash(&content_hash).await {
+        Some(id) => Some(id),
+        None => pk_store::find_near_duplicate(raw_content, &related),
+    };
+    if let Some(existing_id) = duplicate_of {
+        entry.id = existing_id;
+    }
+    pk_store::stamp_content_hash(&mut entry, &content_hash);
+
+    store.upsert(entry).await.unwrap()
+}
+
 async fn temp_store() -> (Arc<MarkdownStore>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Arc::new(MarkdownStore::open(dir.path()).await.expect("store open"));
@@ -425,4 +456,58 @@ async fn reconciliation_adds_changes_and_removes_direct_disk_edits() {
     assert!(removed.changed);
     assert_eq!(removed.indexed_count, 0);
     assert_eq!(removed.on_disk_count, 0);
+}
+
+/// Regression for GitHub issue #7: identical raw content ingested twice,
+/// each time with a differently-worded LLM-synthesized title, must produce
+/// one wiki entry whose revision increments — not two separate entries.
+#[tokio::test]
+async fn duplicate_content_updates_existing_entry_instead_of_creating_new() {
+    let (store, _dir) = temp_store().await;
+    let status_line =
+        "executor session complete | phase: adversarial-review-for-creation | change: unknown";
+
+    let first = compile_like_ingest(
+        &store,
+        "Adversarial Review Creation Completion Record",
+        status_line,
+    )
+    .await;
+    assert_eq!(first.revision, 0);
+
+    let second = compile_like_ingest(
+        &store,
+        "Adversarial Review for Creation Completion Record",
+        status_line,
+    )
+    .await;
+
+    assert_eq!(store.entry_count().await, 1);
+    assert_eq!(second.id, first.id);
+    assert_eq!(second.revision, 1);
+}
+
+/// Genuinely distinct content must still create a separate new entry —
+/// duplicate detection must never suppress legitimately new knowledge.
+#[tokio::test]
+async fn distinct_content_still_creates_a_new_entry() {
+    let (store, _dir) = temp_store().await;
+
+    let first = compile_like_ingest(
+        &store,
+        "Axum Router JWT Validation",
+        "The axum router now validates JWT bearer tokens on every request.",
+    )
+    .await;
+
+    let second = compile_like_ingest(
+        &store,
+        "Postgres Connection Pool Tuning",
+        "Increasing the Postgres connection pool size reduced p99 latency under load.",
+    )
+    .await;
+
+    assert_eq!(store.entry_count().await, 2);
+    assert_ne!(second.id, first.id);
+    assert_eq!(second.revision, 0);
 }

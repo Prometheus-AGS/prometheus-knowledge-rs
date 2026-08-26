@@ -35,6 +35,7 @@ struct StoreInner {
     entries: HashMap<ArticleId, WikiEntry>,
     index: TextIndex,
     source_hashes: HashMap<PathBuf, String>,
+    content_hash_index: HashMap<String, ArticleId>,
     report: StoreReconcileReport,
 }
 
@@ -42,8 +43,19 @@ struct ScanOutcome {
     entries: HashMap<ArticleId, WikiEntry>,
     index: TextIndex,
     source_hashes: HashMap<PathBuf, String>,
+    content_hash_index: HashMap<String, ArticleId>,
     on_disk_count: usize,
     parse_failures: usize,
+}
+
+/// Read the ingest content-hash stamped on an entry's `extra` frontmatter
+/// (see `crate::dedup::CONTENT_HASH_KEY`), if present.
+fn entry_content_hash(entry: &WikiEntry) -> Option<String> {
+    entry
+        .extra
+        .get(crate::dedup::CONTENT_HASH_KEY)
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
 }
 
 impl MarkdownStore {
@@ -72,6 +84,7 @@ impl MarkdownStore {
             entries: scan.entries,
             index: scan.index,
             source_hashes: scan.source_hashes,
+            content_hash_index: scan.content_hash_index,
         };
 
         info!(
@@ -115,6 +128,7 @@ impl MarkdownStore {
             inner.entries = scan.entries;
             inner.index = scan.index;
             inner.source_hashes = scan.source_hashes;
+            inner.content_hash_index = scan.content_hash_index;
         }
         inner.report = StoreReconcileReport {
             indexed_count: inner.entries.len(),
@@ -145,6 +159,17 @@ impl MarkdownStore {
                 entry.bump_revision();
             }
 
+            if let Some(previous) = inner.entries.get(&entry.id) {
+                if let Some(stale_hash) = entry_content_hash(previous) {
+                    if entry_content_hash(&entry).as_deref() != Some(stale_hash.as_str()) {
+                        inner.content_hash_index.remove(&stale_hash);
+                    }
+                }
+            }
+            if let Some(hash) = entry_content_hash(&entry) {
+                inner.content_hash_index.insert(hash, entry.id.clone());
+            }
+
             inner.index.upsert(&entry);
             let id = entry.id.clone();
             inner.entries.insert(id, entry.clone());
@@ -164,8 +189,11 @@ impl MarkdownStore {
     pub async fn delete(&self, id: &ArticleId) -> PkResult<()> {
         {
             let mut inner = self.inner.write().await;
-            if inner.entries.remove(id).is_none() {
+            let Some(removed) = inner.entries.remove(id) else {
                 return Err(PkError::not_found(id));
+            };
+            if let Some(hash) = entry_content_hash(&removed) {
+                inner.content_hash_index.remove(&hash);
             }
             inner.index.remove(id);
         }
@@ -305,6 +333,20 @@ impl MarkdownStore {
         Ok(None)
     }
 
+    /// Look up an existing entry by its stamped ingest content hash (see
+    /// `crate::dedup::normalized_content_hash`). Used to detect that
+    /// incoming raw content is a byte-for-byte (post-normalization) repeat
+    /// of content already compiled, independent of any title the compiler
+    /// synthesizes for it this time around.
+    pub async fn find_by_content_hash(&self, hash: &str) -> Option<ArticleId> {
+        self.inner
+            .read()
+            .await
+            .content_hash_index
+            .get(hash)
+            .cloned()
+    }
+
     pub async fn related_entries(&self, doc: &RawDoc, k: usize) -> PkResult<Vec<WikiEntry>> {
         let query: &str = &doc.content[..doc.content.len().min(500)];
         self.search(query, k).await
@@ -351,6 +393,7 @@ async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
         entries: HashMap::new(),
         index: TextIndex::new(),
         source_hashes: HashMap::new(),
+        content_hash_index: HashMap::new(),
         on_disk_count: 0,
         parse_failures: 0,
     };
@@ -404,6 +447,11 @@ async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
                 Ok(wiki_entry) => {
                     debug!(id = %wiki_entry.id, "loaded entry");
                     outcome.index.upsert(&wiki_entry);
+                    if let Some(hash) = entry_content_hash(&wiki_entry) {
+                        outcome
+                            .content_hash_index
+                            .insert(hash, wiki_entry.id.clone());
+                    }
                     outcome.entries.insert(wiki_entry.id.clone(), wiki_entry);
                 }
                 Err(error) => {
