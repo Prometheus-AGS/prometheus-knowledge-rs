@@ -18,6 +18,10 @@ The learning worker SHALL apply a finite timeout to memory-ledger requests, pres
 - **WHEN** the memory ledger accepts an operation lookup but does not return a response within the configured request timeout
 - **THEN** the worker records the error, retains the operation for a later reconciliation pass, releases the queue lock, and completes the run
 
+#### Scenario: Submitting operation is already normalized
+- **WHEN** restart recovery reads a schema-v2 submitting operation whose normalized payload, hash, and delivery state are unchanged
+- **THEN** the worker preserves the existing durable file without rewriting or synchronizing it again
+
 ### Requirement: Learning jobs progress independently of memory availability
 The learning worker SHALL finish available learning jobs before reconciling memory operations so a memory-ledger outage does not prevent local learning artifacts from reaching their durable completed state.
 

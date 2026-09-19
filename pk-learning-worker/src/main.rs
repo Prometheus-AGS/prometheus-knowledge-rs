@@ -72,7 +72,7 @@ enum LearningScope {
     Shared,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MemoryOperation {
     schema_version: u32,
@@ -96,7 +96,7 @@ fn default_delivery_state() -> String {
     "pending".to_owned()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct OperationReceipt {
     operation_id: String,
@@ -307,9 +307,12 @@ fn recover_memory_submitting(root: &Path) -> Result<()> {
     // outcome. It stays in place and is reconciled by operation id; it is
     // never blindly moved back to pending.
     for path in json_files(&root.join("memory/submitting"))? {
-        let mut operation = read_operation(&path)?;
+        let stored: MemoryOperation = serde_json::from_slice(&fs::read(&path)?)?;
+        let mut operation = normalize_operation(stored.clone())?;
         operation.state = "submitting".to_owned();
-        atomic_json(&path, &operation)?;
+        if operation != stored {
+            atomic_json(&path, &operation)?;
+        }
     }
     Ok(())
 }
@@ -736,7 +739,11 @@ fn apply_receipt(
 }
 
 fn read_operation(path: &Path) -> Result<MemoryOperation> {
-    let mut operation: MemoryOperation = serde_json::from_slice(&fs::read(path)?)?;
+    let operation: MemoryOperation = serde_json::from_slice(&fs::read(path)?)?;
+    normalize_operation(operation)
+}
+
+fn normalize_operation(mut operation: MemoryOperation) -> Result<MemoryOperation> {
     operation.arguments = normalize_payload(&operation.method, &operation.arguments)?;
     operation.schema_version = 2;
     let computed_hash = canonical_payload_hash(&operation.arguments)?;
@@ -1267,6 +1274,26 @@ mod tests {
         assert_eq!(migrated.operation_id, "existing-operation-id");
         assert_eq!(migrated.state, "pending");
         assert!(migrated.last_error.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalized_submitting_operation_is_not_rewritten_during_recovery() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().unwrap();
+        ensure_layout(temp.path()).unwrap();
+        let mut operation = operation("add_memory", json!({"content":"existing record"}));
+        operation.payload_hash = Some(canonical_payload_hash(&operation.arguments).unwrap());
+        operation.state = "submitting".to_owned();
+        let path = temp.path().join("memory/submitting/operation-1.json");
+        atomic_json(&path, &operation).unwrap();
+        let inode_before = fs::metadata(&path).unwrap().ino();
+
+        recover_memory_submitting(temp.path()).unwrap();
+
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode_before);
+        assert_eq!(read_operation(&path).unwrap(), operation);
     }
 
     #[test]

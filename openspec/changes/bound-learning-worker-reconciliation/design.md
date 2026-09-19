@@ -24,6 +24,10 @@ Build the production HTTP client with a ten-second request timeout. On a reqwest
 
 Resolve the wiki root once per scan and combine it with each path relative to that root. This preserves a stable key when the store root itself is a symlink and prevents two logical aliases to the same target from collapsing into one source-hash key.
 
+### Persist recovery normalization only when it changes data
+
+Restart recovery still normalizes legacy operations and persists any schema, payload, hash, or state change. When a submitting operation already equals that normalized form, recovery keeps the existing file rather than replacing and synchronizing identical bytes.
+
 ## Risks
 
 A healthy but unusually slow ledger request can cross the ten-second ceiling and be retried on a later run. Operation IDs and the authoritative lookup-before-submit protocol keep that retry idempotent.
@@ -31,5 +35,6 @@ A healthy but unusually slow ledger request can cross the ten-second ceiling and
 ## Verification
 
 - A delayed ledger fixture must time out promptly and leave the submitting file in place.
+- A normalized submitting operation must retain its inode through restart recovery.
 - Removing one of two Markdown aliases to a shared target must remove only that fallback-ID entry.
 - Existing store and worker integration suites must remain green.
