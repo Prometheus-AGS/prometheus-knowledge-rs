@@ -397,6 +397,13 @@ async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
         on_disk_count: 0,
         parse_failures: 0,
     };
+    // Canonicalizing every article schedules one blocking filesystem task per
+    // file. Large project stores made the learning worker spend minutes in
+    // allocator and filesystem pressure before it could process one event.
+    // Resolve the stable root once and preserve each relative article path.
+    let canonical_wiki_dir = tokio::fs::canonicalize(wiki_dir)
+        .await
+        .unwrap_or_else(|_| wiki_dir.to_path_buf());
     let mut dirs_to_visit = vec![wiki_dir.to_path_buf()];
 
     while let Some(dir_path) = dirs_to_visit.pop() {
@@ -420,9 +427,8 @@ async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
             }
 
             outcome.on_disk_count += 1;
-            let canonical_path = tokio::fs::canonicalize(&path)
-                .await
-                .unwrap_or_else(|_| path.clone());
+            let relative = path.strip_prefix(wiki_dir).unwrap_or(&path);
+            let canonical_path = canonical_wiki_dir.join(relative);
             let content = match tokio::fs::read_to_string(&path).await {
                 Ok(content) => content,
                 Err(error) => {
@@ -436,7 +442,6 @@ async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
                 format!("{:x}", Sha256::digest(content.as_bytes())),
             );
 
-            let relative = path.strip_prefix(wiki_dir).unwrap_or(&path);
             let fallback_id: String = relative
                 .components()
                 .map(|component| component.as_os_str().to_string_lossy())

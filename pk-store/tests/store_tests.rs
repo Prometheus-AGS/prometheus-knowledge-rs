@@ -39,6 +39,37 @@ async fn temp_store() -> (Arc<MarkdownStore>, tempfile::TempDir) {
     (store, dir)
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn reconcile_removes_one_of_two_aliases_to_the_same_article() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wiki = dir.path().join("wiki");
+    tokio::fs::create_dir_all(&wiki).await.unwrap();
+    let target = dir.path().join("shared.md");
+    tokio::fs::write(
+        &target,
+        "---\ntype: Reference\ntitle: Shared\n---\n\nShared body.\n",
+    )
+    .await
+    .unwrap();
+    symlink(&target, wiki.join("first.md")).unwrap();
+    symlink(&target, wiki.join("second.md")).unwrap();
+
+    let store = MarkdownStore::open(dir.path()).await.unwrap();
+    assert!(store.get(&ArticleId::from("first")).await.is_ok());
+    assert!(store.get(&ArticleId::from("second")).await.is_ok());
+    tokio::fs::remove_file(wiki.join("first.md")).await.unwrap();
+
+    let report = store.reconcile_from_disk().await.unwrap();
+    assert!(report.changed);
+    assert_eq!(report.indexed_count, 1);
+    assert_eq!(report.on_disk_count, 1);
+    assert!(store.get(&ArticleId::from("first")).await.is_err());
+    assert!(store.get(&ArticleId::from("second")).await.is_ok());
+}
+
 /// OKF §9: pk lint scans raw files (so it catches documents the store skips
 /// on load) and classifies violations by the permissive-consumption split —
 /// a missing `type` is an auto-fixable error; a healthy page is clean.
