@@ -5,6 +5,7 @@ The asynchronous learning worker can hold its queue lock indefinitely when a mem
 ## What Changes
 
 - Bound every memory-ledger request and end the current reconciliation pass after a transport timeout or connection failure while preserving queued operations.
+- Preserve normalized submitting operations without rewriting and synchronizing unchanged files during restart recovery.
 - Identify wiki scan sources by one canonical store root plus each article's relative path, avoiding per-article canonicalization and keeping aliases independently reconcilable.
 - Add regressions for an unresponsive ledger and two article aliases that share one target.
 
