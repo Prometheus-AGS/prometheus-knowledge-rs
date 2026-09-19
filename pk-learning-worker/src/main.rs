@@ -18,6 +18,7 @@ use std::{
 };
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const MEMORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Parser)]
 #[command(name = "prometheus-learning-worker", version)]
@@ -235,8 +236,10 @@ async fn run_once(root: &Path, memory_url: &str) -> Result<()> {
         }
     }
 
-    let client = reqwest::Client::builder().build()?;
-    for directory in ["memory/submitting", "memory/accepted", "memory/pending"] {
+    let client = memory_client(MEMORY_REQUEST_TIMEOUT)?;
+    'memory_reconciliation: for directory in
+        ["memory/submitting", "memory/accepted", "memory/pending"]
+    {
         for path in json_files(&root.join(directory))? {
             match reconcile_memory(root, &path, memory_url, &client).await {
                 Ok(()) => summary.memory_delivered += 1,
@@ -244,6 +247,9 @@ async fn run_once(root: &Path, memory_url: &str) -> Result<()> {
                     summary.last_error = Some(error.to_string());
                     record_memory_error(root, &path, &error.to_string())?;
                     summary.memory_awaiting_reconciliation += 1;
+                    if memory_transport_unavailable(&error) {
+                        break 'memory_reconciliation;
+                    }
                 }
             }
         }
@@ -252,6 +258,18 @@ async fn run_once(root: &Path, memory_url: &str) -> Result<()> {
     atomic_json(&root.join("status.json"), &summary)?;
     lock.unlock()?;
     Ok(())
+}
+
+fn memory_client(request_timeout: Duration) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(request_timeout)
+        .build()?)
+}
+
+fn memory_transport_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(|error| error.is_timeout() || error.is_connect())
 }
 
 fn recover_processing(root: &Path) -> Result<()> {
@@ -1300,6 +1318,41 @@ mod tests {
             .path()
             .join("memory/completed/operation-1.json")
             .exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ledger_lookup_timeout_keeps_the_operation_durable() {
+        let temp = TempDir::new().unwrap();
+        ensure_layout(temp.path()).unwrap();
+        let mut operation = operation("add_memory", json!({"content":"delta"}));
+        operation.payload_hash = Some(canonical_payload_hash(&operation.arguments).unwrap());
+        operation.state = "submitting".to_owned();
+        let path = temp.path().join("memory/submitting/operation-1.json");
+        atomic_json(&path, &operation).unwrap();
+
+        let app = Router::new().route(
+            "/api/v2/operations/{operation_id}",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                StatusCode::NOT_FOUND
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = memory_client(Duration::from_millis(25)).unwrap();
+        let started = Instant::now();
+
+        let error = reconcile_memory(temp.path(), &path, &format!("http://{address}"), &client)
+            .await
+            .unwrap_err();
+
+        assert!(memory_transport_unavailable(&error));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(path.exists());
         server.abort();
     }
 
