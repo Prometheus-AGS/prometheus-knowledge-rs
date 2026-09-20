@@ -5,4 +5,4 @@
 
 ## 2. Deployment
 
-- [ ] 2.1 Install the worker and prove durable backlog progress
+- [x] 2.1 Install the worker and prove durable backlog progress
