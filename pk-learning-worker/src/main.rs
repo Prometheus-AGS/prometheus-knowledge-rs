@@ -18,7 +18,7 @@ use std::{
 };
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-const MEMORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MEMORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Parser)]
 #[command(name = "prometheus-learning-worker", version)]
