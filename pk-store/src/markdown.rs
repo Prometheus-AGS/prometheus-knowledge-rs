@@ -15,6 +15,21 @@ pub fn is_reserved_filename(name: &str) -> bool {
     RESERVED_FILENAMES.contains(&name)
 }
 
+/// OKF v0.2 §5.2 `generated`: how the current content was produced. `by` is
+/// an actor (§7) and is required within the mapping; `at` marks the last
+/// meaningful change. The spec defines only these two keys; pk carries `by` on the
+/// entry and derives `at`, so any other key inside `generated` is not preserved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Generated {
+    by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    at: Option<String>,
+}
+
+/// The actor pk names when a document carried no `generated.by` of its own:
+/// `<producer>/<version>`, the §7 form for agents and tools.
+const PK_ACTOR: &str = concat!("pk/", env!("CARGO_PKG_VERSION"));
+
 // ---------------------------------------------------------------------------
 // Frontmatter — permissive per OKF v0.1 §4.1 and §9. `type` is OKF's one
 // required key; every pk-native field is optional so both a minimal OKF
@@ -42,8 +57,13 @@ struct Frontmatter {
     links: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     sources: Vec<Source>,
-    /// OKF §4.1 `timestamp` — mirrors pk's `updated_at` when present.
+    /// OKF v0.2 §5.2. Typed rather than left to `extra`, so it is never written
+    /// twice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    generated: Option<Generated>,
+    /// OKF v0.1 §4.1 `timestamp`, superseded by `generated.at` (v0.2 §13.1).
+    /// Read as a fallback for v0.1 documents; never written.
+    #[serde(default, skip_serializing)]
     timestamp: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     created_at: Option<String>,
@@ -66,9 +86,17 @@ pub fn entry_to_markdown(entry: &WikiEntry) -> PkResult<String> {
         tags: entry.tags.clone(),
         links: entry.links.iter().map(|l| l.as_str().to_owned()).collect(),
         sources: entry.sources.clone(),
-        // OKF §4.1 `timestamp` mirrors pk's `updated_at`, which is also
-        // written below as a pk extension key for full round-trip fidelity.
-        timestamp: Some(entry.updated_at.to_rfc3339()),
+        // `by` is only defaulted: a model or a person may be the author, and
+        // stamping pk over them would erase that. `at` always tracks
+        // `updated_at`, which is also written below as a pk extension key.
+        generated: Some(Generated {
+            by: entry
+                .generated_by
+                .clone()
+                .unwrap_or_else(|| PK_ACTOR.to_owned()),
+            at: Some(entry.updated_at.to_rfc3339()),
+        }),
+        timestamp: None,
         created_at: Some(entry.created_at.to_rfc3339()),
         updated_at: Some(entry.updated_at.to_rfc3339()),
         revision: Some(entry.revision),
@@ -135,11 +163,17 @@ pub fn markdown_to_entry(raw: &str, fallback_id: Option<&str>) -> PkResult<WikiE
             .with_timezone(&chrono::Utc),
         None => now,
     };
-    // OKF's `timestamp` is the closest equivalent to pk's `updated_at`;
-    // prefer an explicit `updated_at` (pk-native) over `timestamp` (OKF).
-    let updated_at = match fm.updated_at.as_ref().or(fm.timestamp.as_ref()) {
+    // An explicit `updated_at` (pk-native) wins, then v0.2's `generated.at`,
+    // then v0.1's `timestamp` (§13.1 allows the fallback).
+    let generated_at = fm.generated.as_ref().and_then(|g| g.at.as_ref());
+    let updated_at = match fm
+        .updated_at
+        .as_ref()
+        .or(generated_at)
+        .or(fm.timestamp.as_ref())
+    {
         Some(s) => chrono::DateTime::parse_from_rfc3339(s)
-            .map_err(|e| PkError::frontmatter(format!("updated_at/timestamp: {e}")))?
+            .map_err(|e| PkError::frontmatter(format!("updated_at/generated.at/timestamp: {e}")))?
             .with_timezone(&chrono::Utc),
         None => now,
     };
@@ -156,7 +190,7 @@ pub fn markdown_to_entry(raw: &str, fallback_id: Option<&str>) -> PkResult<WikiE
         revision: fm.revision.unwrap_or(1),
         entry_type: fm.entry_type,
         description: fm.description,
-        generated_by: None,
+        generated_by: fm.generated.map(|g| g.by),
         extra: fm.extra,
     })
 }

@@ -8,9 +8,9 @@ Test-first throughout. Cheap checks while implementing (`cargo check -p <crate>`
 
 ## 2. Frontmatter
 
-- [ ] 2.1 In `pk-store/src/markdown.rs` tests: a written entry has `generated.by` starting `pk/`, `generated.at` equal to `updated_at`, and no `timestamp`; a read `generated.by` survives a write; `timestamp` alone still sets `updated_at`; `generated.at` outranks an older `timestamp`; a document that already carries `generated` does not emit it twice; a CRLF v0.2 document equals its LF twin in `sources` and `updated_at`.
-- [ ] 2.2 Implement in `pk-store/src/markdown.rs`: a typed `generated`, `sources` as `Vec<Source>`, `timestamp` read-only.
-- [ ] 2.3 Mutation: restore the `timestamp` write and confirm 2.1 fails.
+- [x] 2.1 In `pk-store/src/markdown.rs` tests: a written entry has `generated.by` starting `pk/`, `generated.at` equal to `updated_at`, and no `timestamp`; a read `generated.by` survives a write; `timestamp` alone still sets `updated_at`; `generated.at` outranks an older `timestamp`; a document that already carries `generated` does not emit it twice; a CRLF v0.2 document equals its LF twin in `sources` and `updated_at`.
+- [x] 2.2 Implement in `pk-store/src/markdown.rs`: a typed `generated`, `sources` as `Vec<Source>`, `timestamp` read-only.
+- [x] 2.3 Mutation: restore the `timestamp` write and confirm 2.1 fails.
 
 ## 3. Citations
 
