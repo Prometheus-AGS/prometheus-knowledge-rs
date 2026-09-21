@@ -1256,7 +1256,6 @@ version = "1.8.0"
 dependencies = [
  "anyhow",
  "clap",
- "dirs",
  "pk-core",
  "pk-event-store",
  "pk-librarian",
@@ -1277,6 +1276,7 @@ name = "pk-core"
 version = "1.8.0"
 dependencies = [
  "chrono",
+ "dirs",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1308,7 +1308,6 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
- "dirs",
  "fs2",
  "pk-core",
  "pk-store",

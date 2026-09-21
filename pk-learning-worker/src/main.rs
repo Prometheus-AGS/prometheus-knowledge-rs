@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
 }
 
 fn default_queue_root() -> PathBuf {
-    dirs::home_dir()
+    pk_core::paths::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".prometheus")
         .join("learning-queue")
@@ -356,7 +356,7 @@ async fn process_job(root: &Path, pending_path: &Path) -> Result<()> {
     let packet = build_session_packet(&job)?;
     let target_kb = match job.scope {
         LearningScope::Project => job.project_root.join(".prometheus/knowledge"),
-        LearningScope::Shared => dirs::home_dir()
+        LearningScope::Shared => pk_core::paths::home_dir()
             .context("HOME unavailable")?
             .join(".prometheus/knowledge/shared"),
     };
@@ -530,7 +530,7 @@ fn git_changed_paths(project_root: &Path) -> Vec<String> {
 }
 
 fn append_learning_log(job: &LearningJob, packet: &str) -> Result<()> {
-    let home = dirs::home_dir().context("HOME unavailable")?;
+    let home = pk_core::paths::home_dir().context("HOME unavailable")?;
     let directory = home.join(".prometheus/learning-log");
     fs::create_dir_all(&directory)?;
     let date = Utc::now().format("%Y-%m-%d").to_string();

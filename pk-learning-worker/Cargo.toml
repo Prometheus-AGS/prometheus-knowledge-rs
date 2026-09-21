@@ -13,7 +13,6 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
-dirs = { workspace = true }
 fs2 = { workspace = true }
 pk-core = { workspace = true }
 pk-store = { workspace = true }

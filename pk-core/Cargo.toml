@@ -12,3 +12,4 @@ serde_yaml = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
+dirs = { workspace = true }
