@@ -546,6 +546,45 @@ mod tests {
         assert_eq!(entry.sources[0].id.as_deref(), Some("x-2"));
     }
 
+    // The first fix protected a model's label from a DERIVED one. A suffix pk
+    // hands out itself is the same threat: with x, x, x-2 the second x took
+    // "x-2", and the body's [^x-2] - which meant the third source - resolved
+    // to the second.
+    #[test]
+    fn a_deduplication_suffix_never_displaces_a_label_the_model_cited_with() {
+        let response = r#"{"title":"T","content":"Claim.[^x-2]\n\n[^x-2]: the cited one","sources":[{"id":"x","resource":"A"},{"id":"x","resource":"B"},{"id":"x-2","resource":"the-cited-source"}]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+        let ids: Vec<_> = entry
+            .sources
+            .iter()
+            .map(|s| s.id.clone().unwrap())
+            .collect();
+        let cited = entry
+            .sources
+            .iter()
+            .find(|s| s.id.as_deref() == Some("x-2"))
+            .unwrap();
+
+        assert_eq!(cited.resource, "the-cited-source");
+        assert_eq!(ids, vec!["x", "x-3", "x-2"]);
+    }
+
+    // Markdown footnote labels are case-insensitive: [^Doc] resolves [^doc]:.
+    #[test]
+    fn labels_that_differ_only_by_case_are_the_same_label() {
+        let response = r#"{"title":"T","content":"body","sources":[{"id":"Doc","resource":"A"},{"id":"doc","resource":"B"}]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+        let ids: Vec<_> = entry
+            .sources
+            .iter()
+            .map(|s| s.id.clone().unwrap())
+            .collect();
+
+        assert_eq!(ids, vec!["Doc", "doc-2"]);
+    }
+
     #[test]
     fn a_source_with_nothing_to_derive_a_label_from_still_gets_one() {
         let response = r#"{"title":"T","content":"body","sources":["///"]}"#;
