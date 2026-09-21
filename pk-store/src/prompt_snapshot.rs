@@ -68,23 +68,75 @@ pub fn read_prompt_snapshot(knowledge_root: &Path, scope: &str) -> PkResult<Prom
             "prompt snapshot pointer is not a SHA-256 generation".to_owned(),
         ));
     }
-    let snapshot: PromptSnapshot = serde_json::from_slice(&fs::read(
+    let stored: StoredSnapshot = serde_json::from_slice(&fs::read(
         root.join("generations").join(format!("{generation}.json")),
     )?)?;
-    let entries_bytes = serde_json::to_vec(&snapshot.entries)?;
-    let expected = snapshot_generation(scope, &entries_bytes);
-    if snapshot.schema_version != 1
-        || snapshot.scope != scope
-        || snapshot.generation != generation
+    // Identity is checked against the entries AS STORED, never against a
+    // re-serialisation of them: re-serialising ties every existing snapshot to
+    // the exact shape of today's `WikiEntry`, and a changed field then
+    // invalidates them all. The generation was taken over compact JSON and the
+    // file is pretty-printed, so the stored text is compacted first.
+    let entries_bytes = compact_json(stored.entries.get());
+    let expected = snapshot_generation(scope, entries_bytes.as_bytes());
+    let entries: Vec<WikiEntry> = serde_json::from_str(stored.entries.get())?;
+    if stored.schema_version != 1
+        || stored.scope != scope
+        || stored.generation != generation
         || expected != generation
-        || snapshot.candidate_count != snapshot.entries.len()
-        || snapshot.byte_count != entries_bytes.len()
+        || stored.candidate_count != entries.len()
+        || stored.byte_count != entries_bytes.len()
     {
         return Err(pk_core::error::PkError::Other(
             "prompt snapshot failed identity or count validation".to_owned(),
         ));
     }
-    Ok(snapshot)
+    Ok(PromptSnapshot {
+        schema_version: stored.schema_version,
+        scope: stored.scope,
+        generation: stored.generation,
+        candidate_count: stored.candidate_count,
+        byte_count: stored.byte_count,
+        entries,
+    })
+}
+
+/// A snapshot file with its entries left as the text that was written.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredSnapshot {
+    schema_version: u32,
+    scope: String,
+    generation: String,
+    candidate_count: usize,
+    byte_count: usize,
+    entries: Box<serde_json::value::RawValue>,
+}
+
+/// Remove the whitespace a JSON pretty-printer adds, leaving string contents
+/// alone. `serde_json` formats scalars identically in both modes and only adds
+/// whitespace between tokens, so this reproduces its compact output exactly.
+fn compact_json(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in text.chars() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if !matches!(c, ' ' | '\t' | '\n' | '\r') {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn snapshot_generation(scope: &str, entries_bytes: &[u8]) -> String {
@@ -188,6 +240,118 @@ fn sync_directory(_path: &Path) -> PkResult<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// One entry exactly as pk 1.8.0 serialised it: `sources` is a list of
+    /// strings and there is no `generated_by` key. Compact, as it was hashed.
+    const ENTRIES_FROM_1_8_0: &str = r#"[{"id":"orders","title":"Orders","content":"One row per order: \"id\", {total}.","tags":["sql"],"links":[],"sources":["session:abc-123"],"created_at":"2026-08-03T10:00:00Z","updated_at":"2026-08-03T10:00:00Z","revision":1,"entry_type":"Table","description":null,"extra":{}}]"#;
+
+    /// The same entry as it sat in the 1.8.0 file: pretty-printed, keys in struct
+    /// order. Fixed text, NOT derived from the constant above by the code under
+    /// test — otherwise a broken `compact_json` would agree with itself.
+    const ENTRIES_FROM_1_8_0_AS_STORED: &str = r#"[
+    {
+      "id": "orders",
+      "title": "Orders",
+      "content": "One row per order: \"id\", {total}.",
+      "tags": [
+        "sql"
+      ],
+      "links": [],
+      "sources": [
+        "session:abc-123"
+      ],
+      "created_at": "2026-08-03T10:00:00Z",
+      "updated_at": "2026-08-03T10:00:00Z",
+      "revision": 1,
+      "entry_type": "Table",
+      "description": null,
+      "extra": {}
+    }
+  ]"#;
+
+    /// Write a snapshot file as pk 1.8.0 left it: generation and byte count over
+    /// the compact entries, the entries themselves stored pretty-printed.
+    fn write_1_8_0_snapshot(root: &Path, scope: &str) -> String {
+        let generation = snapshot_generation(scope, ENTRIES_FROM_1_8_0.as_bytes());
+        let file = format!(
+            "{{\n  \"schemaVersion\": 1,\n  \"scope\": \"{scope}\",\n  \"generation\": \"{generation}\",\n  \"candidateCount\": 1,\n  \"byteCount\": {},\n  \"entries\": {ENTRIES_FROM_1_8_0_AS_STORED}\n}}",
+            ENTRIES_FROM_1_8_0.len()
+        );
+        let dir = snapshot_root(root, scope).join("generations");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{generation}.json")), file).unwrap();
+        fs::write(
+            snapshot_root(root, scope).join("current"),
+            format!("{generation}\n"),
+        )
+        .unwrap();
+        generation
+    }
+
+    // A snapshot is identified by a hash of its entries. Checking that hash by
+    // re-serialising the entries ties every existing snapshot to the exact
+    // shape of today's struct: 1.9.0 changed `sources` and added a field, and
+    // every non-empty 1.8.0 snapshot stopped validating, so `pk context`
+    // returned nothing until something re-committed.
+    #[test]
+    fn a_snapshot_written_by_1_8_0_still_validates() {
+        let temp = TempDir::new().unwrap();
+        let generation = write_1_8_0_snapshot(temp.path(), "global");
+
+        let snapshot = read_prompt_snapshot(temp.path(), "global").unwrap();
+
+        assert_eq!(snapshot.generation, generation);
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].sources[0].resource, "session:abc-123");
+        assert_eq!(snapshot.entries[0].generated_by, None);
+    }
+
+    // Validating the stored text must stay an integrity check, not become a
+    // formality: entries that differ from what was hashed are still refused.
+    #[test]
+    fn entries_that_differ_from_what_was_hashed_are_refused() {
+        let temp = TempDir::new().unwrap();
+        let generation = write_1_8_0_snapshot(temp.path(), "global");
+        let path = snapshot_root(temp.path(), "global")
+            .join("generations")
+            .join(format!("{generation}.json"));
+        let tampered = fs::read_to_string(&path)
+            .unwrap()
+            .replace("One row per order", "One row per 0rder");
+        fs::write(&path, tampered).unwrap();
+
+        assert!(read_prompt_snapshot(temp.path(), "global").is_err());
+    }
+
+    // The file is pretty-printed but the hash was taken over compact JSON.
+    // Whitespace inside a string is content and must survive; whitespace
+    // between tokens is formatting and must not.
+    #[test]
+    fn compacting_pretty_json_reproduces_the_compact_bytes() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"a":"two  spaces, a \" quote, a \\ and a \n newline","b":[1,2.5,true,null],"c":{}}"#,
+        )
+        .unwrap();
+        let pretty = serde_json::to_string_pretty(&value).unwrap();
+
+        assert_eq!(
+            compact_json(&pretty),
+            serde_json::to_string(&value).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_snapshot_committed_today_still_reads_back() {
+        let temp = TempDir::new().unwrap();
+        let entry =
+            WikiEntry::new("Orders", "body with \"quotes\"\n and  spaces").with_sources(["s:1"]);
+        let committed = commit_prompt_snapshot(temp.path(), "project", vec![entry]).unwrap();
+
+        let read = read_prompt_snapshot(temp.path(), "project").unwrap();
+
+        assert_eq!(read.generation, committed.generation);
+        assert_eq!(read.entries[0].sources, committed.entries[0].sources);
+    }
 
     #[test]
     fn failed_generation_does_not_replace_last_committed_pointer() {

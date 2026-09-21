@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
 /// Frontmatter key under which the normalized content hash is stored in
-/// `WikiEntry.extra` — an OKF producer-extension field (OKF §9's permissive
-/// consumption rule preserves unknown keys verbatim), not part of the
+/// `WikiEntry.extra` — an OKF producer-extension field (OKF v0.2 §4.1:
+/// consumers preserve unknown keys verbatim), not part of the
 /// OKF-required schema.
 pub const CONTENT_HASH_KEY: &str = "content_hash";
 

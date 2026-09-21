@@ -1,15 +1,15 @@
-//! OKF bundle-level artifacts: the reserved `index.md` (§6) and `log.md`
-//! (§7) files, plus body-link extraction (§5) used to derive the link graph
+//! OKF bundle-level artifacts: the reserved `index.md` (§8) and `log.md`
+//! (§9) files, plus body-link extraction (§6) used to derive the link graph
 //! from markdown bodies rather than a frontmatter array.
 //!
 //! Everything here is a pure function of its inputs so it can be unit-tested
 //! without a store or an LLM; `MarkdownStore` wires these to disk.
 
 use pk_core::types::{ArticleId, LintReport, LintSeverity, WikiEntry};
-use pulldown_cmark::{Event, Parser, Tag};
+use pulldown_cmark::{Event, Options, Parser, Tag};
 use std::collections::HashSet;
 
-/// OKF §5.1: a bundle-relative link begins with `/` (interpreted from the
+/// OKF v0.2 §6.1: a bundle-relative link begins with `/` (interpreted from the
 /// bundle root) and, for a concept link, ends in `.md`. Converts such a link
 /// destination to its concept ID (path minus leading `/` and `.md` suffix).
 /// Returns `None` for external URLs, anchors, and non-`.md` targets.
@@ -26,12 +26,15 @@ fn bundle_link_to_concept_id(dest: &str) -> Option<ArticleId> {
 }
 
 /// Extract the concept IDs a markdown body links to via bundle-relative
-/// links (OKF §5). This is the source of truth for the link graph; the
+/// links (OKF v0.2 §6). This is the source of truth for the link graph; the
 /// frontmatter `links` array is retained only for back-compat on read.
 /// Order-preserving and deduplicated.
 pub fn extract_body_links(content: &str) -> Vec<ArticleId> {
     let mut links: Vec<ArticleId> = Vec::new();
-    for event in Parser::new(content) {
+    // Footnotes must be on: without them `[^id]: /some/file.md` is read as a link
+    // reference definition labelled `^id`, and every citation of it becomes a
+    // link to that path. Entries cite this way since OKF v0.2 (§5.1).
+    for event in Parser::new_ext(content, Options::ENABLE_FOOTNOTES) {
         if let Event::Start(Tag::Link { dest_url, .. }) = event {
             if let Some(id) = bundle_link_to_concept_id(&dest_url) {
                 if !links.contains(&id) {
@@ -44,13 +47,17 @@ pub fn extract_body_links(content: &str) -> Vec<ArticleId> {
 }
 
 const INDEX_TITLE: &str = "# Wiki Index";
+/// OKF v0.2 §12: the one frontmatter block an `index.md` may carry, and only
+/// at the bundle root. pk renders no other index, so every index it writes is
+/// the root one.
+const INDEX_VERSION_BLOCK: &str = "---\nokf_version: \"0.2\"\n---\n\n";
 const LOG_TITLE: &str = "# Update Log";
 
-/// Render OKF §6 `index.md` from the current entries, grouped by concept
+/// Render OKF v0.2 §8 `index.md` from the current entries, grouped by concept
 /// `type`. Each entry is listed as `* [Title](/id.md) - description`, with
 /// the description taken from frontmatter when present. Groups and entries
-/// are sorted for deterministic output (stable diffs). Contains no
-/// frontmatter, per §6.
+/// are sorted for deterministic output (stable diffs). Opens with the
+/// `okf_version` declaration and carries no other frontmatter (§8, §12).
 pub fn render_index(entries: &[WikiEntry]) -> String {
     use std::collections::BTreeMap;
 
@@ -64,6 +71,7 @@ pub fn render_index(entries: &[WikiEntry]) -> String {
     }
 
     let mut out = String::new();
+    out.push_str(INDEX_VERSION_BLOCK);
     out.push_str(INDEX_TITLE);
     out.push_str("\n\n");
 
@@ -99,7 +107,7 @@ pub fn render_index(entries: &[WikiEntry]) -> String {
     out
 }
 
-/// Insert `line` under the `date` group in an existing OKF §7 `log.md` body,
+/// Insert `line` under the `date` group in an existing OKF v0.2 §9 `log.md` body,
 /// newest date first. Creates the log title and/or the date group when
 /// absent; prepends within an existing date group so the most recent entry
 /// leads. `date` must be ISO 8601 `YYYY-MM-DD`.
@@ -153,9 +161,9 @@ fn finish_log(lines: Vec<String>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// OKF v0.1 §9 conformance lint (deterministic; no LLM).
+// OKF v0.2 §11 conformance lint (deterministic; no LLM).
 //
-// Permissive consumption (§9) shapes the severity split: the ONLY hard
+// Permissive consumption (§11) shapes the severity split: the ONLY hard
 // requirements are a parseable frontmatter block and a non-empty `type` —
 // those are errors. Everything else (missing recommended fields, unknown
 // types, broken cross-links, orphans, reserved-file shape) is advisory and
@@ -178,7 +186,7 @@ fn report(
     }
 }
 
-/// OKF §9 conformance checks for one concept document. `raw` is the file's
+/// OKF v0.2 §11 conformance checks for one concept document. `raw` is the file's
 /// full content; `concept_id` is its wiki-relative id (used as the parse
 /// fallback and the report subject); `known_ids` is every concept ID in the
 /// bundle, for broken-link detection.
@@ -189,7 +197,7 @@ pub fn okf_document_reports(
 ) -> Vec<LintReport> {
     let mut reports = Vec::new();
 
-    // §9.1: parseable frontmatter is a hard requirement.
+    // §11 (1): parseable frontmatter is a hard requirement.
     let entry = match crate::markdown::markdown_to_entry(raw, Some(concept_id)) {
         Ok(entry) => entry,
         Err(e) => {
@@ -204,7 +212,7 @@ pub fn okf_document_reports(
         }
     };
 
-    // §9.2: a non-empty `type` is the format's one required field.
+    // §11 (2): a non-empty `type` is the format's one required field.
     if entry
         .entry_type
         .as_deref()
@@ -238,7 +246,7 @@ pub fn okf_document_reports(
         ));
     }
 
-    // Broken cross-links (§5): tolerated, so warn — never error.
+    // Broken cross-links (§6): tolerated, so warn — never error.
     for link in extract_body_links(&entry.content) {
         if !known_ids.contains(link.as_str()) {
             reports.push(report(
@@ -248,7 +256,7 @@ pub fn okf_document_reports(
                     "body links to /{}.md, which is not in the bundle",
                     link.as_str()
                 ),
-                "create the target page or fix the link (OKF §5 tolerates broken links)",
+                "create the target page or fix the link (OKF v0.2 §6 tolerates broken links)",
                 false,
             ));
         }
@@ -295,9 +303,9 @@ fn is_iso_date(s: &str) -> bool {
         && b[8..].iter().all(u8::is_ascii_digit)
 }
 
-/// OKF §6 structure check for a root `index.md`: it carries no frontmatter,
+/// OKF v0.2 §8 structure check for a root `index.md`: it carries no frontmatter,
 /// except that the bundle-root index MAY carry a block declaring only
-/// `okf_version` (§11). Any other leading `---` block is a warning.
+/// `okf_version` (§12). Any other leading `---` block is a warning.
 pub fn okf_index_reports(raw: &str) -> Vec<LintReport> {
     let mut reports = Vec::new();
     let trimmed = raw.trim_start();
@@ -313,7 +321,7 @@ pub fn okf_index_reports(raw: &str) -> Vec<LintReport> {
                     Some("index.md"),
                     LintSeverity::Warning,
                     "index.md carries frontmatter beyond an okf_version declaration",
-                    "remove the frontmatter (OKF §6: index.md has none; only the root MAY declare okf_version)",
+                    "remove the frontmatter (OKF v0.2 §8: index.md has none; only the root MAY declare okf_version)",
                     false,
                 ));
             }
@@ -322,7 +330,7 @@ pub fn okf_index_reports(raw: &str) -> Vec<LintReport> {
     reports
 }
 
-/// OKF §7 structure check for `log.md`: every `## ` heading is an ISO
+/// OKF v0.2 §9 structure check for `log.md`: every `## ` heading is an ISO
 /// `YYYY-MM-DD` date.
 pub fn okf_log_reports(raw: &str) -> Vec<LintReport> {
     let mut reports = Vec::new();
@@ -333,7 +341,7 @@ pub fn okf_log_reports(raw: &str) -> Vec<LintReport> {
                     Some("log.md"),
                     LintSeverity::Warning,
                     format!("log.md date heading {heading:?} is not ISO YYYY-MM-DD"),
-                    "use `## YYYY-MM-DD` date headings (OKF §7)",
+                    "use `## YYYY-MM-DD` date headings (OKF v0.2 §9)",
                     false,
                 ));
             }
@@ -394,7 +402,7 @@ mod tests {
             ),
         ];
         let idx = render_index(&entries);
-        assert!(idx.starts_with("# Wiki Index"));
+        assert!(idx.contains("\n# Wiki Index\n"));
         assert!(idx.contains("## Table"));
         assert!(idx.contains("## Playbook"));
         // Within a group, entries are alphabetical by title.
@@ -404,6 +412,74 @@ mod tests {
         assert!(idx.contains("* [Orders](/orders.md) - One row per order."));
         // No description → no trailing " - ".
         assert!(idx.contains("* [Triage](/triage.md)\n"));
+    }
+
+    // The v0.2 prompt makes entries cite with `[^label]` and end with a definition
+    // line. Parsed without footnote support, `[^notes]: /abs/path/file.md` is a
+    // LINK REFERENCE DEFINITION labelled `^notes`, so the citation in the body
+    // becomes a link to that path and lands in the link graph as a bogus concept.
+    #[test]
+    fn a_footnote_definition_naming_a_md_path_is_not_a_link() {
+        let body = "Verified.[^notes]\n\n[^notes]: /private/tmp/session/results.md\n";
+
+        assert!(
+            extract_body_links(body).is_empty(),
+            "{:?}",
+            extract_body_links(body)
+        );
+    }
+
+    #[test]
+    fn a_real_link_inside_a_footnote_definition_still_counts() {
+        let body = "Verified.[^n]\n\n[^n]: see [Orders](/tables/orders.md)\n";
+
+        assert_eq!(
+            extract_body_links(body),
+            vec![ArticleId::from("tables/orders")]
+        );
+    }
+
+    // OKF v0.2 §12: a bundle MAY declare the version it targets, in the
+    // bundle-root index.md and nowhere else. pk renders only that index.
+    #[test]
+    fn the_root_index_declares_okf_0_2_and_nothing_else() {
+        for entries in [vec![], vec![entry("orders", "Orders", Some("Table"), None)]] {
+            let idx = render_index(&entries);
+
+            let rest = idx
+                .strip_prefix("---\n")
+                .expect("opens with a frontmatter fence");
+            let end = rest.find("\n---\n").expect("closes the fence");
+            let block: serde_yaml::Mapping = serde_yaml::from_str(&rest[..end]).unwrap();
+
+            assert_eq!(block.len(), 1, "{idx}");
+            assert_eq!(
+                block.get("okf_version").and_then(|v| v.as_str()),
+                Some("0.2")
+            );
+            assert!(rest[end..].starts_with("\n---\n\n# Wiki Index\n"), "{idx}");
+        }
+    }
+
+    #[test]
+    fn regenerating_the_index_is_stable() {
+        let entries = vec![entry(
+            "orders",
+            "Orders",
+            Some("Table"),
+            Some("One row per order."),
+        )];
+
+        assert_eq!(render_index(&entries), render_index(&entries));
+    }
+
+    // The writer and the linter must agree: pk may not write an index its own
+    // lint then warns about.
+    #[test]
+    fn the_index_pk_writes_passes_its_own_structure_check() {
+        for entries in [vec![], vec![entry("orders", "Orders", Some("Table"), None)]] {
+            assert!(okf_index_reports(&render_index(&entries)).is_empty());
+        }
     }
 
     #[test]

@@ -16,29 +16,33 @@ Return ONLY a valid JSON object matching this exact schema — no markdown fence
   "title": "<concise descriptive title, max 80 chars>",
   "content": "<clean markdown body — facts, decisions, rationale, code snippets; preserve important detail>",
   "tags": ["<tag1>", "<tag2>"],
-  "sources": ["<source identifier from input>"]
+  "sources": [{"id": "<short-label>", "resource": "<source identifier from input>"}]
 }
 
 Rules:
 - title: specific and searchable, not generic
 - content: dense markdown — headers, bullets, code blocks where appropriate
 - tags: 3-8 lowercase hyphenated terms (e.g. "axum", "memory-system", "uar")
-- sources: preserve any source identifiers from the input (file paths, session IDs, URLs)
+- sources: one object per source. resource preserves the identifier from the input
+  (file path, session ID, URL). id is a short label you choose for it: lowercase letters,
+  digits and hyphens only, unique within this entry.
 - content must NOT repeat the title as a heading at the top
 - omit fluff, speculation, and filler — engineering knowledge only
 
-Cross-links (Open Knowledge Format section 5):
+Cross-links (Open Knowledge Format v0.2 section 6):
 - When the body references another article from the RELATED ARTICLES context,
   link it INLINE as a bundle-relative markdown link: [That Title](/that-article-id.md)
   where the id is that article's slug. Do NOT emit a separate links array —
   links live in the prose so the relationship carries its meaning.
 - Use the exact slug shown for each related article; begin the path with a slash.
 
-Citations (Open Knowledge Format section 8):
-- If sources are present, end the body with a top-level Citations heading
-  (a markdown line: hash space Citations) followed by a numbered markdown
-  list, one entry per source, e.g. [1] <source identifier>.
-- Omit the Citations section entirely when there are no sources.
+Attribution (Open Knowledge Format v0.2 section 5.1):
+- Attribute a claim to its source with a markdown footnote whose label is that
+  source's id: write the claim, then [^the-id], and at the end of the body one
+  definition line per label used: [^the-id]: <a few words naming the source>.
+- Every label you use MUST be the id of exactly one entry in sources.
+- Do not add a heading or a numbered list of sources to the body: sources live
+  in the JSON, not in the prose. With no sources, use no footnotes.
 "#;
 
 pub const LINT_SYSTEM: &str = r#"

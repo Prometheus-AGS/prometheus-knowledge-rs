@@ -14,7 +14,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.8.0"
+version = "1.9.0"
 edition = "2021"
 authors = ["Travis James <travis@prometheusags.com>"]
 license = "MIT"
@@ -32,7 +32,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml = "0.9"
 
 # Errors
@@ -73,9 +73,9 @@ dirs = "5"
 fs2 = "0.4"
 
 # Internal crates
-pk-core        = { version = "1.8.0", path = "pk-core" }
-pk-store       = { version = "1.8.0", path = "pk-store" }
-pk-watcher     = { version = "1.8.0", path = "pk-watcher" }
-pk-librarian   = { version = "1.8.0", path = "pk-librarian" }
-pk-mcp         = { version = "1.8.0", path = "pk-mcp" }
-pk-event-store = { version = "1.8.0", path = "pk-event-store" }
+pk-core        = { version = "1.9.0", path = "pk-core" }
+pk-store       = { version = "1.9.0", path = "pk-store" }
+pk-watcher     = { version = "1.9.0", path = "pk-watcher" }
+pk-librarian   = { version = "1.9.0", path = "pk-librarian" }
+pk-mcp         = { version = "1.9.0", path = "pk-mcp" }
+pk-event-store = { version = "1.9.0", path = "pk-event-store" }

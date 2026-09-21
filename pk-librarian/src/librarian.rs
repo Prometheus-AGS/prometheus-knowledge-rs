@@ -9,7 +9,7 @@ use crate::{
 };
 use pk_core::{
     error::{PkError, PkResult},
-    types::{ArticleId, LintReport, LintSeverity, RawDoc, WikiEntry},
+    types::{ArticleId, LintReport, LintSeverity, RawDoc, Source, WikiEntry},
     LibrarianEvent,
 };
 use pk_store::MarkdownStore;
@@ -78,7 +78,7 @@ impl Librarian {
         // than an incidental title-slug collision.
         let is_new = entry.revision == 0;
 
-        // Maintain the two OKF reserved bundle files (§6 index, §7 log) after
+        // Maintain the two OKF reserved bundle files (§8 index, §9 log) after
         // every ingest. Best-effort: a bookkeeping failure must not lose the
         // compiled entry, which is already persisted.
         if let Err(e) = self.store.regenerate_index().await {
@@ -116,7 +116,7 @@ impl Librarian {
         let count = snapshot.len();
         info!(entries = count, "starting lint pass");
 
-        // Deterministic OKF §9 conformance always runs first — it needs no
+        // Deterministic OKF v0.2 §11 conformance always runs first — it needs no
         // model, so it stays reliable even when the lint LLM is unavailable.
         let mut reports = self.store.okf_conformance_reports().await?;
         let okf_count = reports.len();
@@ -283,6 +283,97 @@ fn semantic_batch_failure(batch_index: usize, error: &PkError) -> LintReport {
     }
 }
 
+/// Whether `label` can be written as a markdown footnote label, `[^label]`.
+///
+/// Only what would break the syntax is refused: whitespace, `[`, `]` and `^`.
+/// `notes.md`, `session:abc` and `a/b` are valid labels, and refusing them made
+/// pk rewrite an id the body had already cited with — pk breaking a citation the
+/// model had got right.
+fn is_footnote_label(label: &str) -> bool {
+    !label.is_empty()
+        && !label
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '[' | ']' | '^'))
+}
+
+/// Give every source an id that is unique within the entry (OKF v0.2 §5.1: the
+/// footnote join is by label, so a duplicate misattributes silently).
+///
+/// The model discovers the sources and cites with labels of its own choosing,
+/// so a usable label is kept exactly as given — re-deriving it would leave the
+/// footnote in the body matching nothing. Labels are claimed in three ordered
+/// passes, because anything pk invents must never take a label the model
+/// chose, wherever in the list that label appears:
+///
+/// 1. the first occurrence of every distinct label the model chose;
+/// 2. repeats of a label, which get `-2`, `-3`…;
+/// 3. labels derived from `resource`, for a source with none or an unusable one.
+///
+/// Doing 1 and 2 together let a suffix take a label cited further down (`x`,
+/// `x`, `x-2`: the second `x` became `x-2`), and doing 3 before 1 let a
+/// derived label do the same. Labels compare case-folded: markdown resolves
+/// `[^Doc]` against `[^doc]:`.
+fn with_unique_ids(sources: Vec<Source>) -> Vec<Source> {
+    use std::collections::HashSet;
+
+    fn claim_free(base: &str, taken: &mut HashSet<String>) -> String {
+        let mut n = 1_u32;
+        loop {
+            let candidate = if n == 1 {
+                base.to_owned()
+            } else {
+                format!("{base}-{n}")
+            };
+            if taken.insert(candidate.to_lowercase()) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    let chosen: Vec<Option<&str>> = sources
+        .iter()
+        .map(|source| {
+            source
+                .id
+                .as_deref()
+                .filter(|label| is_footnote_label(label))
+        })
+        .collect();
+    let mut taken: HashSet<String> = HashSet::new();
+    let mut ids: Vec<Option<String>> = vec![None; sources.len()];
+
+    for (slot, label) in ids.iter_mut().zip(&chosen) {
+        if let Some(label) = label {
+            if taken.insert(label.to_lowercase()) {
+                *slot = Some((*label).to_owned());
+            }
+        }
+    }
+    for (slot, label) in ids.iter_mut().zip(&chosen) {
+        if let (None, Some(label)) = (&slot, label) {
+            *slot = Some(claim_free(label, &mut taken));
+        }
+    }
+    for (slot, source) in ids.iter_mut().zip(&sources) {
+        if slot.is_none() {
+            let derived = ArticleId::from_slug(&source.resource).0;
+            let base = if is_footnote_label(&derived) {
+                derived.as_str()
+            } else {
+                "source"
+            };
+            *slot = Some(claim_free(base, &mut taken));
+        }
+    }
+
+    sources
+        .into_iter()
+        .zip(ids)
+        .map(|(source, id)| Source { id, ..source })
+        .collect()
+}
+
 fn parse_compile_response(raw: &str) -> PkResult<WikiEntry> {
     #[derive(serde::Deserialize)]
     struct CompileOutput {
@@ -292,19 +383,21 @@ fn parse_compile_response(raw: &str) -> PkResult<WikiEntry> {
         tags: Vec<String>,
         #[serde(default)]
         links: Vec<String>,
+        // A mapping `{id, resource}` as the prompt asks, or a bare string from a
+        // model that ignored it: `Source` reads both.
         #[serde(default)]
-        sources: Vec<String>,
+        sources: Vec<Source>,
     }
 
     let out: CompileOutput = parse_json(raw).map_err(|e| PkError::llm(e.to_string()))?;
 
     let entry = WikiEntry::new(out.title, out.content)
         .with_tags(out.tags)
-        .with_sources(out.sources);
+        .with_sources(with_unique_ids(out.sources));
 
     let mut entry = entry;
     // Link graph is derived from bundle-relative links the model embedded in
-    // the body (OKF §5); the JSON `links` array is honored only for
+    // the body (OKF v0.2 §6); the JSON `links` array is honored only for
     // back-compat with older prompts. Body links win and lead.
     let mut links = pk_store::bundle::extract_body_links(&entry.content);
     for slug in out.links {
@@ -314,7 +407,7 @@ fn parse_compile_response(raw: &str) -> PkResult<WikiEntry> {
         }
     }
     entry.links = links;
-    // OKF v0.1 §4.1: `type` is the format's one required frontmatter key.
+    // OKF v0.2 §4.1: `type` is the format's one required frontmatter key.
     // The compile prompt doesn't yet ask the model to classify entries, so
     // every Librarian-compiled entry defaults to the generic OKF type.
     entry.entry_type = Some("Reference".to_string());
@@ -384,5 +477,201 @@ mod tests {
         let response = r#"{"title":"Test","content":"body","tags":[],"links":[],"sources":[]}"#;
         let entry = parse_compile_response(response).unwrap();
         assert_eq!(entry.entry_type.as_deref(), Some("Reference"));
+    }
+
+    /// Every `[^label]` used in a body, in order of first use.
+    fn footnote_labels(body: &str) -> Vec<String> {
+        let mut labels = Vec::new();
+        let mut rest = body;
+        while let Some(start) = rest.find("[^") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find(']') else { break };
+            let label = after[..end].to_owned();
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+            rest = &after[end..];
+        }
+        labels
+    }
+
+    // OKF v0.2 §13.1 supersedes the body `# Citations` list; §5.1 attributes
+    // claims with footnotes whose label is a `sources[].id`.
+    #[test]
+    fn the_compile_prompt_asks_for_keyed_footnotes_not_a_citations_section() {
+        assert!(!crate::prompts::COMPILE_SYSTEM.contains("Citations"));
+        assert!(crate::prompts::COMPILE_SYSTEM.contains("[^"));
+    }
+
+    // The model discovers the sources, so it chooses the labels it cites with.
+    // Re-deriving a label it already used would leave the footnote pointing at
+    // nothing: the silent misattribution §5.1 warns about.
+    #[test]
+    fn a_label_the_model_chose_is_kept_so_its_footnote_still_matches() {
+        let response = r#"{"title":"T","content":"Sharded daily.[^ga4_schema]\n\n[^ga4_schema]: GA4 export schema","sources":[{"id":"ga4_schema","resource":"https://example.com/schema"}]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+
+        assert_eq!(entry.sources[0].id.as_deref(), Some("ga4_schema"));
+        assert_eq!(footnote_labels(&entry.content), vec!["ga4_schema"]);
+    }
+
+    #[test]
+    fn a_source_given_as_a_bare_string_gets_a_derived_id() {
+        let response = r#"{"title":"T","content":"body","sources":["session:ABC 123"]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+
+        assert_eq!(entry.sources[0].resource, "session:ABC 123");
+        assert_eq!(entry.sources[0].id.as_deref(), Some("session-abc-123"));
+    }
+
+    #[test]
+    fn a_label_that_cannot_be_a_footnote_is_replaced_by_a_derived_one() {
+        let response = r#"{"title":"T","content":"body","sources":[{"id":"has space]","resource":"notes/a.md"}]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+
+        assert_eq!(entry.sources[0].id.as_deref(), Some("notes-a-md"));
+    }
+
+    // A duplicate label misattributes silently, because the footnote join is by label.
+    #[test]
+    fn sources_that_reduce_to_one_label_get_distinct_ids() {
+        let response = r#"{"title":"T","content":"One.[^notes-a-md]\n\n[^notes-a-md]: first","sources":["notes/a.md","notes-a.md","notes a md"]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+        let ids: Vec<_> = entry
+            .sources
+            .iter()
+            .map(|s| s.id.clone().unwrap())
+            .collect();
+
+        assert_eq!(ids, vec!["notes-a-md", "notes-a-md-2", "notes-a-md-3"]);
+        for label in footnote_labels(&entry.content) {
+            assert_eq!(ids.iter().filter(|id| **id == label).count(), 1, "{label}");
+        }
+    }
+
+    // Order must not decide attribution: a label derived for an uncited source
+    // may not take the one the model chose, and cited with, further down the list.
+    #[test]
+    fn a_derived_label_never_displaces_one_the_model_cited_with() {
+        let response = r#"{"title":"T","content":"Claim.[^x]\n\n[^x]: the cited one","sources":["x",{"id":"x","resource":"the-cited-source"}]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+        let cited = entry
+            .sources
+            .iter()
+            .find(|s| s.id.as_deref() == Some("x"))
+            .unwrap();
+
+        assert_eq!(cited.resource, "the-cited-source");
+        assert_eq!(entry.sources[0].id.as_deref(), Some("x-2"));
+    }
+
+    // The first fix protected a model's label from a DERIVED one. A suffix pk
+    // hands out itself is the same threat: with x, x, x-2 the second x took
+    // "x-2", and the body's [^x-2] - which meant the third source - resolved
+    // to the second.
+    #[test]
+    fn a_deduplication_suffix_never_displaces_a_label_the_model_cited_with() {
+        let response = r#"{"title":"T","content":"Claim.[^x-2]\n\n[^x-2]: the cited one","sources":[{"id":"x","resource":"A"},{"id":"x","resource":"B"},{"id":"x-2","resource":"the-cited-source"}]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+        let ids: Vec<_> = entry
+            .sources
+            .iter()
+            .map(|s| s.id.clone().unwrap())
+            .collect();
+        let cited = entry
+            .sources
+            .iter()
+            .find(|s| s.id.as_deref() == Some("x-2"))
+            .unwrap();
+
+        assert_eq!(cited.resource, "the-cited-source");
+        assert_eq!(ids, vec!["x", "x-3", "x-2"]);
+    }
+
+    // Markdown footnote labels are case-insensitive: [^Doc] resolves [^doc]:.
+    #[test]
+    fn labels_that_differ_only_by_case_are_the_same_label() {
+        let response = r#"{"title":"T","content":"body","sources":[{"id":"Doc","resource":"A"},{"id":"doc","resource":"B"}]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+        let ids: Vec<_> = entry
+            .sources
+            .iter()
+            .map(|s| s.id.clone().unwrap())
+            .collect();
+
+        assert_eq!(ids, vec!["Doc", "doc-2"]);
+    }
+
+    // The suffixed candidate is compared case-folded too: with doc-2, Doc, Doc the
+    // repeat may be neither "Doc" again nor "Doc-2", which is "doc-2" to markdown.
+    #[test]
+    fn a_suffixed_label_is_compared_case_folded_as_well() {
+        let response = r#"{"title":"T","content":"body","sources":[{"id":"doc-2","resource":"A"},{"id":"Doc","resource":"B"},{"id":"Doc","resource":"C"}]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+        let ids: Vec<_> = entry
+            .sources
+            .iter()
+            .map(|s| s.id.clone().unwrap())
+            .collect();
+
+        assert_eq!(ids, vec!["doc-2", "Doc", "Doc-3"]);
+    }
+
+    // `notes.md`, `session:abc` and `a/b` are valid markdown footnote labels. When
+    // pk rewrote them it left the body's `[^notes.md]` alone, so pk itself broke a
+    // citation the model had got right.
+    #[test]
+    fn a_valid_footnote_label_with_punctuation_is_kept_verbatim() {
+        for label in ["notes.md", "session:abc", "a/b", "rfc9110.s3"] {
+            let response = format!(
+                r#"{{"title":"T","content":"Claim.[^{label}]\n\n[^{label}]: src","sources":[{{"id":"{label}","resource":"somewhere"}}]}}"#
+            );
+
+            let entry = parse_compile_response(&response).unwrap();
+
+            assert_eq!(entry.sources[0].id.as_deref(), Some(label));
+            assert_eq!(footnote_labels(&entry.content), vec![label.to_owned()]);
+        }
+    }
+
+    #[test]
+    fn a_label_that_would_break_the_footnote_syntax_is_still_replaced() {
+        for label in [
+            "has space",
+            "close]bracket",
+            "open[bracket",
+            "care^t",
+            "tab\\there",
+            "",
+        ] {
+            let response = format!(
+                r#"{{"title":"T","content":"body","sources":[{{"id":"{label}","resource":"notes/a.md"}}]}}"#
+            );
+
+            let entry = parse_compile_response(&response).unwrap();
+
+            assert_eq!(
+                entry.sources[0].id.as_deref(),
+                Some("notes-a-md"),
+                "{label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_with_nothing_to_derive_a_label_from_still_gets_one() {
+        let response = r#"{"title":"T","content":"body","sources":["///"]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+
+        assert_eq!(entry.sources[0].id.as_deref(), Some("source"));
     }
 }

@@ -41,7 +41,7 @@ impl ArticleId {
         &self.0
     }
 
-    /// OKF v0.1 §2: a Concept ID is the file's wiki-relative path with the
+    /// OKF v0.2 §2: a Concept ID is the file's wiki-relative path with the
     /// `.md` suffix removed, so an ArticleId MAY contain `/` to address a
     /// nested concept (e.g. `tables/orders`). This checks it is safe to join
     /// onto the wiki root as a filesystem path: no parent-directory
@@ -102,6 +102,95 @@ impl From<&str> for ArticleId {
 }
 
 // ---------------------------------------------------------------------------
+// Source — OKF v0.2 §5.1. A mapping with a required `resource`, an optional
+// `id` (the footnote label claims are attributed by), and whatever other keys
+// the producer wrote: `title`, and the credibility signals `author`,
+// `usage_count` and `last_modified`. Those are kept in `extra` so a read
+// followed by a write loses nothing.
+//
+// pk held sources as strings before v0.2, so a bare string is still accepted
+// on read — from YAML frontmatter and from JSON alike — as `{ resource }`.
+// It is never written back as a string.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Source {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub resource: String,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_yaml::Value>,
+}
+
+impl Source {
+    pub fn new(resource: impl Into<String>) -> Self {
+        Self {
+            id: None,
+            resource: resource.into(),
+            extra: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+impl From<String> for Source {
+    fn from(resource: String) -> Self {
+        Self::new(resource)
+    }
+}
+
+impl From<&str> for Source {
+    fn from(resource: &str) -> Self {
+        Self::new(resource)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SourceRepr {
+    Text(String),
+    Mapping(std::collections::BTreeMap<String, serde_yaml::Value>),
+    // Last, so it only catches what the two above did not.
+    Other(serde_yaml::Value),
+}
+
+impl<'de> Deserialize<'de> for Source {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        let mut extra = match SourceRepr::deserialize(deserializer)? {
+            SourceRepr::Text(resource) => return Ok(Self::new(resource)),
+            SourceRepr::Mapping(mapping) => mapping,
+            // pk 1.8.0 held sources as strings and YAML handed it any scalar as
+            // text, so `sources: [12345]` loaded. Buffered through an untagged
+            // enum the value is already a number; read it as its text.
+            SourceRepr::Other(serde_yaml::Value::Number(n)) => return Ok(Self::new(n.to_string())),
+            SourceRepr::Other(serde_yaml::Value::Bool(b)) => return Ok(Self::new(b.to_string())),
+            SourceRepr::Other(_) => {
+                return Err(D::Error::custom(
+                    "a source must be text or a mapping with a `resource`",
+                ))
+            }
+        };
+        // An untagged enum reports only "did not match any variant"; name the key.
+        let resource = match extra.remove("resource") {
+            Some(serde_yaml::Value::String(resource)) => resource,
+            Some(_) => return Err(D::Error::custom("source `resource` must be a string")),
+            None => return Err(D::Error::missing_field("resource")),
+        };
+        let id = match extra.remove("id") {
+            Some(serde_yaml::Value::String(id)) => Some(id),
+            Some(_) => return Err(D::Error::custom("source `id` must be a string")),
+            None => None,
+        };
+        Ok(Self {
+            id,
+            resource,
+            extra,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WikiEntry — a compiled, structured knowledge article maintained by the
 // Librarian. Stored as a Markdown file with YAML frontmatter.
 // ---------------------------------------------------------------------------
@@ -121,7 +210,7 @@ pub struct WikiEntry {
     pub links: Vec<ArticleId>,
 
     /// Where this knowledge came from (file path, URL, agent session ID, etc.)
-    pub sources: Vec<String>,
+    pub sources: Vec<Source>,
 
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -129,21 +218,28 @@ pub struct WikiEntry {
     /// Revision counter — incremented on every upsert
     pub revision: u32,
 
-    /// Open Knowledge Format (OKF) v0.1 §4.1 `type` — the format's one
+    /// Open Knowledge Format (OKF) v0.2 §4.1 `type` — the format's one
     /// required frontmatter key. `None` for entries compiled before OKF
     /// adoption or lacking a producer-assigned type.
     #[serde(default)]
     pub entry_type: Option<String>,
 
-    /// OKF v0.1 §4.1 `description` — a one-sentence summary used by index
+    /// OKF v0.2 §4.1 `description` — a one-sentence summary used by index
     /// generators, search snippets, and previews.
     #[serde(default)]
     pub description: Option<String>,
 
+    /// OKF v0.2 §5.2 `generated.by` — the actor (§7) that produced the current
+    /// content, as read from disk. `None` when the document carried none; the
+    /// writer then supplies `pk/<version>`. `generated.at` is not stored: it is
+    /// `updated_at`.
+    #[serde(default)]
+    pub generated_by: Option<String>,
+
     /// Frontmatter keys pk does not model structurally (OKF producer
     /// extensions, or fields from a future OKF minor version). Preserved
-    /// verbatim across parse → serialize round-trips per OKF §9's permissive
-    /// consumption rule — unknown keys are never grounds to drop data.
+    /// verbatim across parse → serialize round-trips per OKF v0.2 §4.1 —
+    /// consumers SHOULD preserve unknown keys, and (§11) never reject for them.
     #[serde(default)]
     pub extra: std::collections::BTreeMap<String, serde_yaml::Value>,
 }
@@ -164,6 +260,7 @@ impl WikiEntry {
             revision: 0,
             entry_type: None,
             description: None,
+            generated_by: None,
             extra: std::collections::BTreeMap::new(),
         }
     }
@@ -173,7 +270,7 @@ impl WikiEntry {
         self
     }
 
-    pub fn with_sources(mut self, sources: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    pub fn with_sources(mut self, sources: impl IntoIterator<Item = impl Into<Source>>) -> Self {
         self.sources = sources.into_iter().map(|s| s.into()).collect();
         self
     }

@@ -220,7 +220,7 @@ impl MarkdownStore {
         Ok(inner.entries.values().cloned().collect())
     }
 
-    /// Regenerate the wiki-root `index.md` (OKF §6) from the current entries.
+    /// Regenerate the wiki-root `index.md` (OKF v0.2 §8) from the current entries.
     /// Called after every ingest so the catalog stays current.
     pub async fn regenerate_index(&self) -> PkResult<()> {
         let entries = self.snapshot().await?;
@@ -231,7 +231,7 @@ impl MarkdownStore {
         Ok(())
     }
 
-    /// Append an entry to the wiki-root `log.md` (OKF §7) under today's date
+    /// Append an entry to the wiki-root `log.md` (OKF v0.2 §9) under today's date
     /// group, newest first. `action` is the leading bold verb (`Creation`,
     /// `Update`, …).
     pub async fn append_log(&self, action: &str, title: &str, id: &ArticleId) -> PkResult<()> {
@@ -249,7 +249,7 @@ impl MarkdownStore {
         self.inner.read().await.entries.len()
     }
 
-    /// Scan the wiki tree and return OKF v0.1 §9 conformance reports
+    /// Scan the wiki tree and return OKF v0.2 §11 conformance reports
     /// (deterministic; no LLM). Reads raw files so it can flag documents the
     /// store skipped on load (e.g. unparseable frontmatter), and checks the
     /// reserved `index.md`/`log.md` structure. Orphan detection uses the

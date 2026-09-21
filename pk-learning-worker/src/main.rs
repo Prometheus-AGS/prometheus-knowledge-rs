@@ -377,7 +377,7 @@ async fn process_job(root: &Path, pending_path: &Path) -> Result<()> {
         entry.id = article_id;
         entry.entry_type = Some("SessionRecord".to_owned());
         entry.tags = vec!["karpathy".to_owned(), "session-learning".to_owned()];
-        entry.sources = vec![format!("session:{}", job.session_id)];
+        entry.sources = vec![format!("session:{}", job.session_id).into()];
         store.upsert(entry).await?;
         store.regenerate_index().await?;
         store

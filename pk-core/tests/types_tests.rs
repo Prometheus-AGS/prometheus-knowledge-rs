@@ -1,5 +1,5 @@
 use pk_core::event::LibrarianEvent;
-use pk_core::types::{ArticleId, LintReport, LintSeverity, RawDoc, WikiEntry};
+use pk_core::types::{ArticleId, LintReport, LintSeverity, RawDoc, Source, WikiEntry};
 
 #[test]
 fn article_id_slug_from_title() {
@@ -67,6 +67,83 @@ fn a_title_that_slugs_to_a_device_name_still_yields_a_safe_id() {
     assert_ne!(id, ArticleId::from_slug("Con Entry"));
 }
 
+// OKF v0.2 §5.1: a source is a mapping with a required `resource`. pk used to
+// hold sources as strings; a string cannot carry the per-source signals v0.2
+// defines, so reading one and writing it back would silently drop them.
+#[test]
+fn a_bare_string_source_becomes_a_resource() {
+    let from_yaml: Vec<Source> = serde_yaml::from_str("- session:abc-123\n").unwrap();
+    let from_json: Vec<Source> = serde_json::from_str(r#"["session:abc-123"]"#).unwrap();
+
+    assert_eq!(from_yaml[0].resource, "session:abc-123");
+    assert_eq!(from_yaml[0].id, None);
+    assert_eq!(from_json, from_yaml);
+}
+
+#[test]
+fn a_mapping_source_keeps_every_key_through_a_round_trip() {
+    let yaml = "- id: ga4-schema\n  resource: https://example.com/schema\n  title: GA4 schema\n  author: team:ga4-docs\n  usage_count: 5000\n  last_modified: 2026-05-30T00:00:00Z\n";
+
+    let sources: Vec<Source> = serde_yaml::from_str(yaml).unwrap();
+    let written = serde_yaml::to_string(&sources).unwrap();
+    let reread: Vec<Source> = serde_yaml::from_str(&written).unwrap();
+
+    assert_eq!(sources[0].id.as_deref(), Some("ga4-schema"));
+    assert_eq!(sources[0].resource, "https://example.com/schema");
+    for key in ["title", "author", "usage_count", "last_modified"] {
+        assert!(sources[0].extra.contains_key(key), "lost {key} on read");
+        assert!(written.contains(key), "lost {key} on write: {written}");
+    }
+    assert_eq!(reread, sources);
+}
+
+#[test]
+fn a_source_is_written_as_a_mapping_never_as_a_string() {
+    let written = serde_yaml::to_string(&vec![Source::from("session:abc-123")]).unwrap();
+
+    assert_eq!(written.trim(), "- resource: session:abc-123");
+}
+
+#[test]
+fn a_mapping_source_without_a_resource_names_the_missing_key() {
+    let error = serde_yaml::from_str::<Vec<Source>>("- id: orphan\n  title: no resource\n")
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("resource"), "{error}");
+}
+
+// 1.8.0 held sources as Vec<String>, and serde_yaml hands any scalar to a
+// string visitor, so `sources: [12345]` loaded. An untagged enum buffers the
+// value first - by then it is a number and matches no string variant.
+#[test]
+fn a_numeric_or_boolean_source_is_read_as_its_text() {
+    let from_yaml: Vec<Source> = serde_yaml::from_str("- 12345\n- true\n- 1.5\n").unwrap();
+    let from_json: Vec<Source> = serde_json::from_str("[12345, true, 1.5]").unwrap();
+
+    let resources: Vec<&str> = from_yaml.iter().map(|s| s.resource.as_str()).collect();
+    assert_eq!(resources, vec!["12345", "true", "1.5"]);
+    assert_eq!(from_json, from_yaml);
+}
+
+#[test]
+fn a_source_that_is_neither_text_nor_a_mapping_says_what_it_needs() {
+    for yaml in ["- ~\n", "- [a, b]\n"] {
+        let error = serde_yaml::from_str::<Vec<Source>>(yaml)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("resource"), "{yaml:?} -> {error}");
+    }
+}
+
+#[test]
+fn with_sources_still_accepts_strings() {
+    let entry = WikiEntry::new("T", "body").with_sources(["session:abc-123"]);
+
+    assert_eq!(entry.sources, vec![Source::from("session:abc-123")]);
+}
+
 #[test]
 fn article_id_display() {
     let id = ArticleId::from("prometheus-mesh");
@@ -85,7 +162,7 @@ fn wiki_entry_builder_roundtrip() {
     assert_eq!(entry.title, "TurboQuant KV Compression");
     assert_eq!(entry.id, ArticleId::from_slug("TurboQuant KV Compression"));
     assert_eq!(entry.tags, vec!["rust", "turboquant", "kv-cache"]);
-    assert_eq!(entry.sources, vec!["session:2026-04-10"]);
+    assert_eq!(entry.sources, vec![Source::from("session:2026-04-10")]);
     assert_eq!(entry.revision, 0);
     assert!(entry.links.is_empty());
 }
