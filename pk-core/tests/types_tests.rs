@@ -113,6 +113,28 @@ fn a_mapping_source_without_a_resource_names_the_missing_key() {
     assert!(error.contains("resource"), "{error}");
 }
 
+// 1.8.0 held sources as Vec<String>, and serde_yaml hands any scalar to a
+// string visitor, so `sources: [12345]` loaded. An untagged enum buffers the
+// value first - by then it is a number and matches no string variant.
+#[test]
+fn a_numeric_or_boolean_source_is_read_as_its_text() {
+    let from_yaml: Vec<Source> = serde_yaml::from_str("- 12345\n- true\n- 1.5\n").unwrap();
+    let from_json: Vec<Source> = serde_json::from_str("[12345, true, 1.5]").unwrap();
+
+    let resources: Vec<&str> = from_yaml.iter().map(|s| s.resource.as_str()).collect();
+    assert_eq!(resources, vec!["12345", "true", "1.5"]);
+    assert_eq!(from_json, from_yaml);
+}
+
+#[test]
+fn a_source_that_is_neither_text_nor_a_mapping_says_what_it_needs() {
+    for yaml in ["- ~\n", "- [a, b]\n"] {
+        let error = serde_yaml::from_str::<Vec<Source>>(yaml).unwrap_err().to_string();
+
+        assert!(error.contains("resource"), "{yaml:?} -> {error}");
+    }
+}
+
 #[test]
 fn with_sources_still_accepts_strings() {
     let entry = WikiEntry::new("T", "body").with_sources(["session:abc-123"]);
