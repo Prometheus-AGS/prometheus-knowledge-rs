@@ -2,9 +2,9 @@ Test-first throughout. Cheap checks while implementing (`cargo check -p <crate>`
 
 ## 1. The source type
 
-- [ ] 1.1 In `pk-core/tests/types_tests.rs`, add tests: a bare string deserialises to a source with that `resource`; a mapping keeps `id`, `title`, `author`, `usage_count`, `last_modified`; a mapping with no `resource` is an error; `with_sources` still accepts strings.
-- [ ] 1.2 Add `Source` to `pk-core/src/types.rs`, change `WikiEntry.sources` to `Vec<Source>`, and export it from `pk-core/src/lib.rs`.
-- [ ] 1.3 `cargo check --workspace`; fix the two other users named in the proposal (`pk-librarian/src/librarian.rs`, `pk-learning-worker/src/main.rs`).
+- [x] 1.1 In `pk-core/tests/types_tests.rs`, add tests: a bare string deserialises to a source with that `resource`; a mapping keeps `id`, `title`, `author`, `usage_count`, `last_modified`; a mapping with no `resource` is an error; `with_sources` still accepts strings.
+- [x] 1.2 Add `Source` to `pk-core/src/types.rs`, change `WikiEntry.sources` to `Vec<Source>`, and export it from `pk-core/src/lib.rs`.
+- [x] 1.3 `cargo check --workspace`; fix the two other users named in the proposal (`pk-librarian/src/librarian.rs`, `pk-learning-worker/src/main.rs`).
 
 ## 2. Frontmatter
 

@@ -217,6 +217,13 @@ pub struct WikiEntry {
     #[serde(default)]
     pub description: Option<String>,
 
+    /// OKF v0.2 §5.2 `generated.by` — the actor (§7) that produced the current
+    /// content, as read from disk. `None` when the document carried none; the
+    /// writer then supplies `pk/<version>`. `generated.at` is not stored: it is
+    /// `updated_at`.
+    #[serde(default)]
+    pub generated_by: Option<String>,
+
     /// Frontmatter keys pk does not model structurally (OKF producer
     /// extensions, or fields from a future OKF minor version). Preserved
     /// verbatim across parse → serialize round-trips per OKF §9's permissive
@@ -241,6 +248,7 @@ impl WikiEntry {
             revision: 0,
             entry_type: None,
             description: None,
+            generated_by: None,
             extra: std::collections::BTreeMap::new(),
         }
     }

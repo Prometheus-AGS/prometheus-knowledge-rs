@@ -156,6 +156,7 @@ pub fn markdown_to_entry(raw: &str, fallback_id: Option<&str>) -> PkResult<WikiE
         revision: fm.revision.unwrap_or(1),
         entry_type: fm.entry_type,
         description: fm.description,
+        generated_by: None,
         extra: fm.extra,
     })
 }
@@ -209,6 +210,94 @@ mod tests {
         assert_eq!(from_crlf.id, from_lf.id);
         assert_eq!(from_crlf.title, from_lf.title);
         assert_eq!(from_crlf.tags, from_lf.tags);
+    }
+
+    fn frontmatter_of(markdown: &str) -> serde_yaml::Mapping {
+        let rest = markdown.strip_prefix("---\n").expect("opening fence");
+        let end = rest.find("\n---").expect("closing fence");
+        serde_yaml::from_str(&rest[..end]).expect("frontmatter parses, with no duplicate key")
+    }
+
+    // OKF v0.2 §13.1: `timestamp` is superseded by `generated: { by, at }`.
+    #[test]
+    fn a_written_entry_carries_generated_and_no_timestamp() {
+        let entry = WikiEntry::new("Orders", "body");
+
+        let fm = frontmatter_of(&entry_to_markdown(&entry).unwrap());
+
+        let generated = fm
+            .get("generated")
+            .expect("generated")
+            .as_mapping()
+            .unwrap();
+        let by = generated.get("by").unwrap().as_str().unwrap();
+        assert!(by.starts_with("pk/"), "{by}");
+        assert_eq!(
+            generated.get("at").unwrap().as_str().unwrap(),
+            entry.updated_at.to_rfc3339()
+        );
+        assert!(!fm.contains_key("timestamp"), "timestamp is superseded");
+    }
+
+    // pk is not always the author: a model compiled it, or a person edited it.
+    #[test]
+    fn a_producers_own_generated_by_survives_a_write() {
+        let doc = "---\ntype: Reference\ngenerated: { by: librarian/some-model, at: 2026-06-20T22:53:05Z }\n---\n\nbody\n";
+
+        let entry = markdown_to_entry(doc, Some("orders")).unwrap();
+        let fm = frontmatter_of(&entry_to_markdown(&entry).unwrap());
+
+        assert_eq!(entry.generated_by.as_deref(), Some("librarian/some-model"));
+        let generated = fm.get("generated").unwrap().as_mapping().unwrap();
+        assert_eq!(
+            generated.get("by").unwrap().as_str(),
+            Some("librarian/some-model")
+        );
+    }
+
+    #[test]
+    fn a_v01_timestamp_alone_still_sets_updated_at() {
+        let doc = "---\ntype: Reference\ntimestamp: 2026-05-01T10:00:00Z\n---\n\nbody\n";
+
+        let entry = markdown_to_entry(doc, Some("orders")).unwrap();
+
+        assert_eq!(entry.updated_at.to_rfc3339(), "2026-05-01T10:00:00+00:00");
+    }
+
+    #[test]
+    fn generated_at_outranks_an_older_timestamp() {
+        let doc = "---\ntype: Reference\ntimestamp: 2026-05-01T10:00:00Z\ngenerated: { by: pk/1.0.0, at: 2026-07-01T10:00:00Z }\n---\n\nbody\n";
+
+        let entry = markdown_to_entry(doc, Some("orders")).unwrap();
+
+        assert_eq!(entry.updated_at.to_rfc3339(), "2026-07-01T10:00:00+00:00");
+    }
+
+    // `extra` is a flattened catch-all; a typed `generated` beside it must not
+    // leave the key in both places.
+    #[test]
+    fn a_document_that_already_carries_generated_does_not_emit_it_twice() {
+        let doc = "---\ntype: Reference\ngenerated: { by: pk/1.0.0, at: 2026-07-01T10:00:00Z }\n---\n\nbody\n";
+
+        let entry = markdown_to_entry(doc, Some("orders")).unwrap();
+        let written = entry_to_markdown(&entry).unwrap();
+
+        assert!(!entry.extra.contains_key("generated"));
+        assert_eq!(written.matches("\ngenerated:").count(), 1, "{written}");
+        frontmatter_of(&written);
+    }
+
+    #[test]
+    fn a_crlf_v02_document_has_the_same_provenance_as_its_lf_twin() {
+        let lf = "---\ntype: Reference\ngenerated: { by: pk/1.0.0, at: 2026-07-01T10:00:00Z }\nsources:\n  - id: ga4\n    resource: https://example.com/schema\n    title: GA4 schema\n---\n\nbody\n";
+        let crlf = lf.replace('\n', "\r\n");
+
+        let from_lf = markdown_to_entry(lf, Some("orders")).unwrap();
+        let from_crlf = markdown_to_entry(&crlf, Some("orders")).unwrap();
+
+        assert_eq!(from_crlf.sources, from_lf.sources);
+        assert_eq!(from_crlf.updated_at, from_lf.updated_at);
+        assert_eq!(from_crlf.sources[0].id.as_deref(), Some("ga4"));
     }
 
     #[test]
