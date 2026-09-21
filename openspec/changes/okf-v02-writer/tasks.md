@@ -28,6 +28,6 @@ Test-first throughout. Cheap checks while implementing (`cargo check -p <crate>`
 
 ## 6. Verify and hand over
 
-- [ ] 6.1 `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked --no-fail-fast`.
-- [ ] 6.2 Against a copy of a real v0.1 KB: `pk list` and `pk context` succeed before any write; after one `pk ingest`, only the touched entry is in v0.2 form.
+- [x] 6.1 `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked --no-fail-fast`.
+- [x] 6.2 Against a copy of a real v0.1 KB: `pk list` and `pk context` succeed before any write; after one `pk ingest`, only the touched entry is in v0.2 form.
 - [ ] 6.3 **Stop. Pushing to this repository needs the operator's go-ahead.** On go-ahead, open the PR and read all three OS jobs before reporting.
