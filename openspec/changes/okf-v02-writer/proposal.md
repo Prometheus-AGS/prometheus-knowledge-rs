@@ -35,3 +35,4 @@ Precision about what is wrong today: by §11 a bundle is v0.2-conformant with no
 - `verified`, `status`, `stale_after`, `usage_window`, or Attested Computation: all optional in v0.2, none produced by pk today, and unknown keys are already preserved through `extra`.
 - Parsing a legacy `# Citations` body into `sources`. §13.1 makes that a MAY; the body is left as written.
 - Lint warnings for superseded forms.
+- Recording the compile model in `generated.by` (`pk-librarian/<model>`). Compiled entries are stamped `pk/<version>` today, which names the tool and not the model that wrote the prose. A follow-up; found by the diff review.

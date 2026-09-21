@@ -23,7 +23,9 @@ with an untagged deserialiser that accepts a bare string as `Source { resource, 
 
 ## `generated.by` is only defaulted, never overwritten
 
-pk is not always the author: the librarian compiles with a model, and a human may edit a file. If the writer stamped `pk/<version>` on every write it would erase that. So `generated` is read into the entry, and the writer supplies `pk/<version>` only when none was read. `at` always tracks `updated_at`, which is what "last meaningful change" means (§5.2).
+pk is not always the author: a person may edit a file, and another producer may have written it. If the writer stamped `pk/<version>` on every write it would erase that.
+
+**What this does not do, stated so the rationale is not read as more than it is:** the librarian compiles entries with a model, and that model is **not** recorded. `parse_compile_response` builds the entry with no `generated_by`, so a librarian-compiled entry is written `by: pk/<version>` — the real ingest in `evidence.md`, compiled by `gpt-5.5`, carries `by: pk/1.9.0`. OKF §5.2's own example names the agent and the model (`reference_agent/gemini-2.5-pro`), so recording `pk-librarian/<model>` would be more faithful. It is not done here because the spec for this change fixes `by` as `pk/<crate version>`; it is listed as a follow-up. So `generated` is read into the entry, and the writer supplies `pk/<version>` only when none was read. `at` always tracks `updated_at`, which is what "last meaningful change" means (§5.2).
 
 ## Footnote ids
 
@@ -37,12 +39,17 @@ the sources, so pk has nothing to tell it in advance, and re-deriving a label th
 (`ga4_schema` → `ga4-schema`) would leave the body's `[^ga4_schema]` matching nothing. So the prompt asks
 for `{id, resource}` objects and footnotes that use those ids, and pk:
 
-1. keeps a label verbatim when it can be a footnote label (ASCII letters, digits, `-`, `_`);
+1. keeps a label verbatim unless it would break the footnote syntax — it is refused only when it is empty
+   or contains whitespace, `[`, `]` or `^`. (A first version allowed ASCII letters, digits, `-` and `_` only;
+   `notes.md`, `session:abc` and `a/b` are valid labels, and refusing them made pk rewrite an id the body had
+   already cited with.) Labels compare case-folded, as markdown resolves them;
 2. derives one from `resource` only when the label is missing or unusable — a bare-string source from a
    model that ignored the schema still parses, because `Source` reads both shapes;
 3. de-duplicates with `-2`, `-3`…, the first keeping the label.
 
-Step 1 runs as a pass of its own **before** step 2. Found by reasoning about orderings the first tests did
+These run as **three ordered passes** — first occurrences of model labels, then suffixed repeats, then
+derived labels — because anything pk invents must never take a label the model chose, wherever in the list
+it appears. The first version ran model labels as one pass before derived ones: Found by reasoning about orderings the first tests did
 not cover, then reproduced with a failing test: in a single pass, a label derived for an *uncited* source
 earlier in the list took `x`, the source the model had labelled `x` and cited became `x-2`, and the
 body's `[^x]` resolved to the wrong source — exactly the failure this code exists to prevent.
