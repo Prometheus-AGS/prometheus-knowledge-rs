@@ -334,6 +334,56 @@ mod tests {
         assert_eq!(from_crlf.sources[0].id.as_deref(), Some("ga4"));
     }
 
+    // pk 1.8.0 did not model `generated`: the key fell into `extra`, so a document
+    // carrying any shape of it parsed. Typing the key must not turn a document
+    // that used to load into one that fails — a parse failure also freezes live
+    // reload and blocks snapshot commits for the whole store.
+    #[test]
+    fn a_generated_that_is_not_a_usable_mapping_is_treated_as_absent() {
+        for generated in [
+            "generated: written by hand",
+            "generated: true",
+            "generated: { at: 2026-07-01T10:00:00Z }",
+            "generated: [pk, 2026]",
+            "generated: { by: 7 }",
+        ] {
+            let doc = format!("---\ntype: Reference\n{generated}\n---\n\nbody\n");
+
+            let entry = markdown_to_entry(&doc, Some("orders"))
+                .unwrap_or_else(|e| panic!("{generated:?} must still parse: {e}"));
+
+            assert_eq!(entry.generated_by, None, "{generated}");
+            assert_eq!(entry.content, "body\n");
+        }
+    }
+
+    // chrono's RFC 3339 parser is narrower than "ISO 8601 with an offset". 1.8.0
+    // never looked at `generated.at`, so a value it cannot parse falls through to
+    // the next source of `updated_at` instead of failing the document.
+    #[test]
+    fn an_unparseable_generated_at_falls_through_to_timestamp() {
+        for at in [
+            "2026-07-01T10:00:00",
+            "2026-07-01",
+            "2026-07-01T10:00+00:00",
+            "not a date",
+        ] {
+            let doc = format!(
+                "---\ntype: Reference\ntimestamp: 2026-05-01T10:00:00Z\ngenerated: {{ by: someone/1.0, at: \"{at}\" }}\n---\n\nbody\n"
+            );
+
+            let entry = markdown_to_entry(&doc, Some("orders"))
+                .unwrap_or_else(|e| panic!("at={at:?} must still parse: {e}"));
+
+            assert_eq!(
+                entry.updated_at.to_rfc3339(),
+                "2026-05-01T10:00:00+00:00",
+                "{at}"
+            );
+            assert_eq!(entry.generated_by.as_deref(), Some("someone/1.0"), "{at}");
+        }
+    }
+
     #[test]
     fn rejects_missing_frontmatter() {
         let result = markdown_to_entry("# No frontmatter here\n\nJust a body.", None);
