@@ -63,6 +63,14 @@ The compile prompt SHALL ask for `[^id]` footnotes whose labels are `sources[].i
 - **WHEN** a compile response lists two sources whose text reduces to the same slug
 - **THEN** the entry's two sources have different `id` values, and each footnote label in the body matches exactly one of them
 
+#### Scenario: Nothing pk invents takes a label the model chose
+- **WHEN** the sources are labelled `x`, `x`, `x-2` and the body cites `[^x-2]`, or an unlabelled source that would derive `x` precedes a source labelled `x`
+- **THEN** the source the model labelled keeps its label, and the repeat or the derived label takes the next free one
+
+#### Scenario: Labels are compared as markdown compares them
+- **WHEN** two sources are labelled `Doc` and `doc`, or a repeat of `Doc` meets an existing `doc-2`
+- **THEN** they are treated as the same label and the later one is suffixed past every case-folded match
+
 ### Requirement: The bundle root declares OKF 0.2
 The bundle-root `index.md` SHALL begin with a frontmatter block containing only `okf_version: "0.2"`, and regenerating the index SHALL keep it.
 

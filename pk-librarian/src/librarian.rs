@@ -296,57 +296,76 @@ fn is_footnote_label(label: &str) -> bool {
 ///
 /// The model discovers the sources and cites with labels of its own choosing,
 /// so a usable label is kept exactly as given — re-deriving it would leave the
-/// footnote in the body matching nothing. Those labels are reserved **first**,
-/// in a pass of their own: otherwise a label derived for an uncited source
-/// earlier in the list could take the one a later source was cited with, and
-/// the footnote would resolve to the wrong source. A label is derived from
-/// `resource` only when it is missing or cannot be a footnote. A repeat gets
-/// `-2`, `-3`…; the first keeps the label.
+/// footnote in the body matching nothing. Labels are claimed in three ordered
+/// passes, because anything pk invents must never take a label the model
+/// chose, wherever in the list that label appears:
+///
+/// 1. the first occurrence of every distinct label the model chose;
+/// 2. repeats of a label, which get `-2`, `-3`…;
+/// 3. labels derived from `resource`, for a source with none or an unusable one.
+///
+/// Doing 1 and 2 together let a suffix take a label cited further down (`x`,
+/// `x`, `x-2`: the second `x` became `x-2`), and doing 3 before 1 let a
+/// derived label do the same. Labels compare case-folded: markdown resolves
+/// `[^Doc]` against `[^doc]:`.
 fn with_unique_ids(sources: Vec<Source>) -> Vec<Source> {
-    fn free_label(base: &str, taken: &[String]) -> String {
-        (1..)
-            .map(|n| {
-                if n == 1 {
-                    base.to_owned()
-                } else {
-                    format!("{base}-{n}")
-                }
-            })
-            .find(|candidate| !taken.contains(candidate))
-            .expect("an unbounded range always yields a free label")
+    use std::collections::HashSet;
+
+    fn claim_free(base: &str, taken: &mut HashSet<String>) -> String {
+        let mut n = 1_u32;
+        loop {
+            let candidate = if n == 1 {
+                base.to_owned()
+            } else {
+                format!("{base}-{n}")
+            };
+            if taken.insert(candidate.to_lowercase()) {
+                return candidate;
+            }
+            n += 1;
+        }
     }
 
-    let mut taken: Vec<String> = Vec::new();
-    let chosen: Vec<Option<String>> = sources
+    let chosen: Vec<Option<&str>> = sources
         .iter()
         .map(|source| {
-            let label = source.id.as_deref().filter(|l| is_footnote_label(l))?;
-            let id = free_label(label, &taken);
-            taken.push(id.clone());
-            Some(id)
+            source
+                .id
+                .as_deref()
+                .filter(|label| is_footnote_label(label))
         })
         .collect();
+    let mut taken: HashSet<String> = HashSet::new();
+    let mut ids: Vec<Option<String>> = vec![None; sources.len()];
+
+    for (slot, label) in ids.iter_mut().zip(&chosen) {
+        if let Some(label) = label {
+            if taken.insert(label.to_lowercase()) {
+                *slot = Some((*label).to_owned());
+            }
+        }
+    }
+    for (slot, label) in ids.iter_mut().zip(&chosen) {
+        if let (None, Some(label)) = (&slot, label) {
+            *slot = Some(claim_free(label, &mut taken));
+        }
+    }
+    for (slot, source) in ids.iter_mut().zip(&sources) {
+        if slot.is_none() {
+            let derived = ArticleId::from_slug(&source.resource).0;
+            let base = if is_footnote_label(&derived) {
+                derived.as_str()
+            } else {
+                "source"
+            };
+            *slot = Some(claim_free(base, &mut taken));
+        }
+    }
 
     sources
         .into_iter()
-        .zip(chosen)
-        .map(|(source, chosen)| {
-            let id = chosen.unwrap_or_else(|| {
-                let derived = ArticleId::from_slug(&source.resource).0;
-                let base = if is_footnote_label(&derived) {
-                    derived.as_str()
-                } else {
-                    "source"
-                };
-                let id = free_label(base, &taken);
-                taken.push(id.clone());
-                id
-            });
-            Source {
-                id: Some(id),
-                ..source
-            }
-        })
+        .zip(ids)
+        .map(|(source, id)| Source { id, ..source })
         .collect()
 }
 
@@ -583,6 +602,22 @@ mod tests {
             .collect();
 
         assert_eq!(ids, vec!["Doc", "doc-2"]);
+    }
+
+    // The suffixed candidate is compared case-folded too: with doc-2, Doc, Doc the
+    // repeat may be neither "Doc" again nor "Doc-2", which is "doc-2" to markdown.
+    #[test]
+    fn a_suffixed_label_is_compared_case_folded_as_well() {
+        let response = r#"{"title":"T","content":"body","sources":[{"id":"doc-2","resource":"A"},{"id":"Doc","resource":"B"},{"id":"Doc","resource":"C"}]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+        let ids: Vec<_> = entry
+            .sources
+            .iter()
+            .map(|s| s.id.clone().unwrap())
+            .collect();
+
+        assert_eq!(ids, vec!["doc-2", "Doc", "Doc-3"]);
     }
 
     #[test]
