@@ -26,6 +26,9 @@ jobs:
   build-and-test:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # The default is six hours. A hung test once held a Windows runner with no output at all;
+    # a full three-OS run takes a few minutes, so anything near this limit is a hang.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -42,6 +45,11 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
+      # pk alone, before the workspace: it is the binary other projects vendor, so "does pk build
+      # here" must stay answerable when some other crate does not.
+      - name: Build pk
+        run: cargo build --locked -p pk-cli
+
       - name: Build the workspace
         run: cargo build --workspace --locked
 
@@ -49,8 +57,32 @@ jobs:
       - name: pk --version
         run: cargo run --locked -p pk-cli -- --version
 
+      # Every test injects HOME, which hides what a Windows user actually has: cmd and PowerShell
+      # do not set it. Run the built binary with HOME unset, from an empty directory, and require
+      # that it succeeds and resolves a real directory. `context` creates nothing, so the evidence
+      # is the path pk reports: an unresolved home shows up as a KB "at ~/.prometheus/knowledge".
+      # The binary is run directly because cargo and rustup want a home directory of their own.
+      - name: pk context with HOME unset
+        shell: bash
+        run: |
+          pk="$PWD/target/debug/pk"
+          work="$RUNNER_TEMP/pk-homeless"
+          mkdir -p "$work"
+          cd "$work"
+          report="$(env -u HOME "$pk" context smoke --scope global --format hook 2>&1)"
+          echo "$report"
+          case "$report" in
+            *"global KB at"*) ;;
+            *) echo "pk did not report which KB it used" >&2; exit 1 ;;
+          esac
+          case "$report" in
+            *"KB at ~"*) echo "the home directory did not resolve: pk is using a literal ~ path" >&2; exit 1 ;;
+          esac
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # --no-fail-fast: without it cargo stops at the first failing test binary, so a platform
+      # with several problems reveals them one push at a time.
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
