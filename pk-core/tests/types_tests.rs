@@ -14,6 +14,60 @@ fn article_id_slug_collapses_spaces_and_punctuation() {
 }
 
 #[test]
+fn a_nested_concept_id_is_a_safe_path() {
+    assert!(ArticleId::from("tables/orders").is_safe_path());
+    assert!(ArticleId::from("v1.2-release-notes").is_safe_path());
+}
+
+#[test]
+fn a_posix_traversal_or_absolute_id_is_not_a_safe_path() {
+    assert!(!ArticleId::from("../evil").is_safe_path());
+    assert!(!ArticleId::from("/etc/passwd").is_safe_path());
+    assert!(!ArticleId::from("a//b").is_safe_path());
+}
+
+// An id is joined onto the wiki root as a filesystem path, and it arrives from
+// ingested frontmatter and model output. On Windows a backslash is a separator
+// and a colon introduces a drive, so both escape the root there while looking
+// like an ordinary file name on unix.
+#[test]
+fn a_windows_traversal_or_drive_id_is_not_a_safe_path() {
+    assert!(!ArticleId::from(r"..\..\evil").is_safe_path());
+    assert!(!ArticleId::from(r"\evil").is_safe_path());
+    assert!(!ArticleId::from(r"tables\orders").is_safe_path());
+    assert!(!ArticleId::from("C:/evil").is_safe_path());
+    assert!(!ArticleId::from("C:evil").is_safe_path());
+}
+
+// wiki\con.md opens the console device: the write reports success and no file
+// exists. Windows also strips a trailing dot or space, so "a." and "a" collide.
+#[test]
+fn a_windows_device_name_or_trailing_dot_is_not_a_safe_path() {
+    assert!(!ArticleId::from("con").is_safe_path());
+    assert!(!ArticleId::from("NUL").is_safe_path());
+    assert!(!ArticleId::from("tables/com1").is_safe_path());
+    assert!(!ArticleId::from("aux.notes").is_safe_path());
+    assert!(!ArticleId::from("lpt9/orders").is_safe_path());
+    assert!(!ArticleId::from("orders.").is_safe_path());
+    assert!(!ArticleId::from("orders ").is_safe_path());
+}
+
+#[test]
+fn a_name_that_merely_starts_like_a_device_is_a_safe_path() {
+    assert!(ArticleId::from("console").is_safe_path());
+    assert!(ArticleId::from("com10").is_safe_path());
+    assert!(ArticleId::from("nullable-columns").is_safe_path());
+}
+
+#[test]
+fn a_title_that_slugs_to_a_device_name_still_yields_a_safe_id() {
+    let id = ArticleId::from_slug("Con");
+
+    assert!(id.is_safe_path());
+    assert_ne!(id, ArticleId::from_slug("Con Entry"));
+}
+
+#[test]
 fn article_id_display() {
     let id = ArticleId::from("prometheus-mesh");
     assert_eq!(id.to_string(), "prometheus-mesh");

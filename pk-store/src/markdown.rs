@@ -114,7 +114,7 @@ pub fn markdown_to_entry(raw: &str, fallback_id: Option<&str>) -> PkResult<WikiE
 
     if !ArticleId::from(id.clone()).is_safe_path() {
         return Err(PkError::frontmatter(format!(
-            "id {id:?} is not a safe concept path (no leading '/', no '..' or empty segments)"
+            "id {id:?} is not a safe concept path (no leading '/', no '\\' or ':', and no segment that is empty, '..', a Windows device name, or ends in '.' or a space)"
         )));
     }
 
