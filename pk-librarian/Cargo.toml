@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 pk-core    = { workspace = true }
 pk-store   = { workspace = true }
-pk-watcher = { workspace = true }
 tokio      = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }

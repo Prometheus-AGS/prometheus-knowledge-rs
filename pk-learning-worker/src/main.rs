@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
 }
 
 fn default_queue_root() -> PathBuf {
-    dirs::home_dir()
+    pk_core::paths::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".prometheus")
         .join("learning-queue")
@@ -356,7 +356,7 @@ async fn process_job(root: &Path, pending_path: &Path) -> Result<()> {
     let packet = build_session_packet(&job)?;
     let target_kb = match job.scope {
         LearningScope::Project => job.project_root.join(".prometheus/knowledge"),
-        LearningScope::Shared => dirs::home_dir()
+        LearningScope::Shared => pk_core::paths::home_dir()
             .context("HOME unavailable")?
             .join(".prometheus/knowledge/shared"),
     };
@@ -530,7 +530,7 @@ fn git_changed_paths(project_root: &Path) -> Vec<String> {
 }
 
 fn append_learning_log(job: &LearningJob, packet: &str) -> Result<()> {
-    let home = dirs::home_dir().context("HOME unavailable")?;
+    let home = pk_core::paths::home_dir().context("HOME unavailable")?;
     let directory = home.join(".prometheus/learning-log");
     fs::create_dir_all(&directory)?;
     let date = Utc::now().format("%Y-%m-%d").to_string();
@@ -918,8 +918,20 @@ fn durable_rename(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Flush a directory entry to disk so a just-completed rename survives a crash.
+///
+/// This is a POSIX idiom. On Windows `File::open` on a directory fails with "Access is denied"
+/// (os error 5) — opening a directory there needs `FILE_FLAG_BACKUP_SEMANTICS` — and there is no
+/// directory-fsync equivalent to call anyway; NTFS journals directory metadata itself. So the
+/// non-unix twin is a no-op rather than an error that fails every snapshot commit.
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 

@@ -147,7 +147,7 @@ impl MarkdownStore {
     pub async fn upsert(&self, mut entry: WikiEntry) -> PkResult<WikiEntry> {
         if !entry.id.is_safe_path() {
             return Err(PkError::frontmatter(format!(
-                "id {:?} is not a safe concept path (no leading '/', no '..' or empty segments)",
+                "id {:?} is not a safe concept path (no leading '/', no '\\' or ':', and no segment that is empty, '..', a Windows device name, or ends in '.' or a space)",
                 entry.id.as_str()
             )));
         }

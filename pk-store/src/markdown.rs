@@ -3,6 +3,7 @@ use pk_core::{
     types::{ArticleId, WikiEntry},
 };
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -85,6 +86,13 @@ pub fn entry_to_markdown(entry: &WikiEntry) -> PkResult<String> {
 /// conformant OKF document may) — callers with a file path pass the
 /// wiki-relative path (minus `.md`) per OKF §2's Concept ID definition.
 pub fn markdown_to_entry(raw: &str, fallback_id: Option<&str>) -> PkResult<WikiEntry> {
+    // Accept CRLF, keep LF: the body feeds the content hash and the snapshot
+    // generation id, which must not depend on the checkout that produced it.
+    let raw: Cow<str> = if raw.contains('\r') {
+        Cow::Owned(raw.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(raw)
+    };
     let raw = raw.trim_start();
 
     if !raw.starts_with("---") {
@@ -114,7 +122,7 @@ pub fn markdown_to_entry(raw: &str, fallback_id: Option<&str>) -> PkResult<WikiE
 
     if !ArticleId::from(id.clone()).is_safe_path() {
         return Err(PkError::frontmatter(format!(
-            "id {id:?} is not a safe concept path (no leading '/', no '..' or empty segments)"
+            "id {id:?} is not a safe concept path (no leading '/', no '\\' or ':', and no segment that is empty, '..', a Windows device name, or ends in '.' or a space)"
         )));
     }
 
@@ -183,6 +191,24 @@ mod tests {
         assert_eq!(recovered.content, entry.content);
         assert_eq!(recovered.tags, entry.tags);
         assert_eq!(recovered.revision, entry.revision);
+    }
+
+    // A Windows checkout (or editor) hands the parser CRLF. The body must not
+    // keep the carriage returns: it feeds the content hash and the snapshot
+    // generation id, so the same KB would hash differently per OS.
+    #[test]
+    fn a_crlf_document_parses_identically_to_its_lf_twin() {
+        let lf = "---\nid: tables/orders\ntitle: Orders\ntags: [sql, core]\n---\n\nFirst line.\nSecond line.\n";
+        let crlf = lf.replace('\n', "\r\n");
+
+        let from_lf = markdown_to_entry(lf, None).unwrap();
+        let from_crlf = markdown_to_entry(&crlf, None).unwrap();
+
+        assert_eq!(from_crlf.content, "First line.\nSecond line.\n");
+        assert_eq!(from_crlf.content, from_lf.content);
+        assert_eq!(from_crlf.id, from_lf.id);
+        assert_eq!(from_crlf.title, from_lf.title);
+        assert_eq!(from_crlf.tags, from_lf.tags);
     }
 
     #[test]

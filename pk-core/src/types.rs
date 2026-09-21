@@ -29,6 +29,10 @@ impl ArticleId {
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("-");
+        // A slug never contains `_`, so this cannot collide with another title.
+        if is_windows_device_name(&slug) {
+            return Self(format!("{slug}_"));
+        }
         Self(slug)
     }
 
@@ -42,9 +46,35 @@ impl ArticleId {
     /// nested concept (e.g. `tables/orders`). This checks it is safe to join
     /// onto the wiki root as a filesystem path: no parent-directory
     /// traversal (`..` segments) and no absolute-path leading slash.
+    ///
+    /// The rule is the same on every OS, so a KB that is valid on one machine
+    /// is valid on all of them. `\` is a separator and `:` a drive or stream
+    /// marker on Windows, so an id containing either can leave the wiki root
+    /// there; see [`is_safe_segment`] for the per-segment rules.
     pub fn is_safe_path(&self) -> bool {
-        !self.0.starts_with('/') && !self.0.split('/').any(|seg| seg.is_empty() || seg == "..")
+        let id = self.0.as_str();
+        !id.starts_with('/') && !id.contains(['\\', ':']) && id.split('/').all(is_safe_segment)
     }
+}
+
+/// Windows resolves these names to devices in every directory and with any
+/// extension: writing `wiki\con.md` reports success and creates no file.
+const WINDOWS_DEVICE_NAMES: [&str; 22] = [
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+fn is_windows_device_name(segment: &str) -> bool {
+    let stem = segment.split('.').next().unwrap_or(segment);
+    WINDOWS_DEVICE_NAMES
+        .iter()
+        .any(|device| stem.eq_ignore_ascii_case(device))
+}
+
+/// A segment is unsafe when it is empty, is `.` or `..`, names a Windows device,
+/// or ends in a dot or space — Windows strips those, so `a.` and `a` collide.
+fn is_safe_segment(segment: &str) -> bool {
+    !segment.is_empty() && !segment.ends_with(['.', ' ']) && !is_windows_device_name(segment)
 }
 
 impl Default for ArticleId {

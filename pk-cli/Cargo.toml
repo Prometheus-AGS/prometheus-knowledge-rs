@@ -13,7 +13,6 @@ path = "src/main.rs"
 pk-core        = { workspace = true }
 pk-store       = { workspace = true }
 pk-librarian   = { workspace = true }
-pk-watcher     = { workspace = true }
 pk-event-store = { workspace = true }
 tokio        = { workspace = true }
 serde        = { workspace = true }
@@ -22,9 +21,14 @@ anyhow       = { workspace = true }
 clap         = { workspace = true }
 tracing      = { workspace = true }
 tracing-subscriber = { workspace = true }
-tikv-jemallocator = { workspace = true }
 sha2         = { workspace = true }
-dirs         = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+# jemalloc does not build for MSVC: its autoconf configure step cannot produce a working
+# compiler there. main.rs already gates the allocator on cfg(not(target_env = "msvc")); the
+# dependency has to carry the same condition, or Cargo still compiles tikv-jemalloc-sys on
+# Windows and the build script fails before any of our code is reached.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }

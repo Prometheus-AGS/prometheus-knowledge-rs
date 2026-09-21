@@ -1,5 +1,6 @@
 pub mod error;
 pub mod event;
+pub mod paths;
 pub mod types;
 
 pub use error::PkError;

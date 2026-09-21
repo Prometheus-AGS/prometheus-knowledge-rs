@@ -8,11 +8,12 @@ static ALLOC: Jemalloc = Jemalloc;
 
 use anyhow::Result;
 use clap::Parser;
+use pk_core::paths::expand_tilde;
 use pk_librarian::{Librarian, ModelRouter};
 use pk_mcp::{McpServer, ReadinessHandle};
 use pk_store::{commit_prompt_snapshot, MarkdownStore};
 use pk_watcher::{spawn_wiki_watcher, InboxWatcher, WikiWatchEvent};
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::info;
 
@@ -151,13 +152,4 @@ async fn main() -> Result<()> {
 
     server.serve().await?;
     Ok(())
-}
-
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(path)
 }

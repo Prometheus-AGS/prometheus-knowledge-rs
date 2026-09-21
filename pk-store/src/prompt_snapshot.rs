@@ -2,7 +2,7 @@ use pk_core::{error::PkResult, types::WikiEntry};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -167,8 +167,20 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> PkResult<()> {
     Ok(())
 }
 
+/// Flush a directory entry to disk so a just-completed rename survives a crash.
+///
+/// This is a POSIX idiom. On Windows `File::open` on a directory fails with "Access is denied"
+/// (os error 5) — opening a directory there needs `FILE_FLAG_BACKUP_SEMANTICS` — and there is no
+/// directory-fsync equivalent to call anyway; NTFS journals directory metadata itself. So the
+/// non-unix twin is a no-op rather than an error that fails every snapshot commit.
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> PkResult<()> {
-    File::open(path)?.sync_all()?;
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> PkResult<()> {
     Ok(())
 }
 

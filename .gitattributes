@@ -1,0 +1,3 @@
+# Check out LF everywhere. Fixtures and golden files are compared byte-for-byte,
+# and a Windows clone with core.autocrlf=true would otherwise rewrite them.
+* text=auto eol=lf

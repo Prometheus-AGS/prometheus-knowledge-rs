@@ -7,6 +7,7 @@ static ALLOC: Jemalloc = Jemalloc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use pk_core::paths::expand_tilde;
 use pk_core::types::RawDoc;
 use pk_event_store::EventStore;
 use pk_librarian::{Librarian, ModelRouter};
@@ -469,7 +470,7 @@ async fn main() -> Result<()> {
                 h.update(k.to_string().as_bytes());
                 format!("{:x}", h.finalize())
             };
-            let cache_dir = dirs::home_dir()
+            let cache_dir = pk_core::paths::home_dir()
                 .map(|h| h.join(".prometheus").join("pk-focus-cache"))
                 .unwrap_or_else(|| PathBuf::from(".prometheus/pk-focus-cache"));
             let cache_file = cache_dir.join(format!("{cache_key}.md"));
@@ -1064,15 +1065,6 @@ fn global_kb_dir() -> PathBuf {
     expand_tilde("~/.prometheus/knowledge")
 }
 
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(path)
-}
-
 /// Dry-run (default) or execute migration of global KB entries to per-project directories.
 async fn run_migrate(execute: bool) -> Result<()> {
     let global = global_kb_dir();
@@ -1165,9 +1157,7 @@ fn extract_project_hint(content: &str) -> Option<String> {
 fn resolve_project_kb_for_hint(hint: &str) -> Option<PathBuf> {
     // Search common project parent directories for a matching project name
     let search_parents = [
-        std::env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(h).join("Projects")),
+        pk_core::paths::home_dir().map(|h| h.join("Projects")),
         Some(PathBuf::from("/Users")),
     ];
 
@@ -1212,10 +1202,32 @@ struct DoctorSummary {
     failed: usize,
 }
 
-fn run_doctor(json_output: bool, project_kb: &Path) -> Result<()> {
+/// Whether the hooks log is readable by its owner only.
+///
+/// POSIX mode bits are the only thing this inspects, so it is compiled for unix alone; the
+/// non-unix twin below keeps `run_doctor` building on Windows, where `std::os::unix` does not
+/// exist and an unguarded import is a hard compile error for the whole `pk` binary.
+#[cfg(unix)]
+fn hook_log_is_private(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o777 == 0o600
+}
 
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+/// Windows has no POSIX mode bits and its ACLs are not inspected here, so the check cannot be
+/// made. Existence is all that can be reported; `HOOK_LOG_REQUIREMENT` says so in the output
+/// rather than implying a mode was verified.
+#[cfg(not(unix))]
+fn hook_log_is_private(_metadata: &fs::Metadata) -> bool {
+    true
+}
+
+#[cfg(unix)]
+const HOOK_LOG_REQUIREMENT: &str = "required mode 0600";
+#[cfg(not(unix))]
+const HOOK_LOG_REQUIREMENT: &str = "present; POSIX mode check not applicable on this platform";
+
+fn run_doctor(json_output: bool, project_kb: &Path) -> Result<()> {
+    let home = pk_core::paths::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let plugin_root = std::env::var_os("PROMETHEUS_PLUGIN_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".prometheus/plugins/prometheus-skill-pack"));
@@ -1223,7 +1235,7 @@ fn run_doctor(json_output: bool, project_kb: &Path) -> Result<()> {
     let hook_status = fs::metadata(&hook_log)
         .ok()
         .filter(|metadata| metadata.is_file())
-        .map(|metadata| metadata.permissions().mode() & 0o777 == 0o600)
+        .map(|metadata| hook_log_is_private(&metadata))
         .unwrap_or(false);
     let active_generation = active_plugin_generation(&plugin_root);
     let stable_scripts = [
@@ -1290,7 +1302,7 @@ fn run_doctor(json_output: bool, project_kb: &Path) -> Result<()> {
         DoctorCheck {
             name: "hooks-log-path",
             status: if hook_status { "PASS" } else { "FAIL" },
-            detail: format!("{} (required mode 0600)", hook_log.display()),
+            detail: format!("{} ({HOOK_LOG_REQUIREMENT})", hook_log.display()),
         },
         DoctorCheck {
             name: "plugin-generation",
