@@ -394,7 +394,7 @@ mod tests {
             ),
         ];
         let idx = render_index(&entries);
-        assert!(idx.starts_with("# Wiki Index"));
+        assert!(idx.contains("\n# Wiki Index\n"));
         assert!(idx.contains("## Table"));
         assert!(idx.contains("## Playbook"));
         // Within a group, entries are alphabetical by title.
@@ -404,6 +404,49 @@ mod tests {
         assert!(idx.contains("* [Orders](/orders.md) - One row per order."));
         // No description → no trailing " - ".
         assert!(idx.contains("* [Triage](/triage.md)\n"));
+    }
+
+    // OKF v0.2 §12: a bundle MAY declare the version it targets, in the
+    // bundle-root index.md and nowhere else. pk renders only that index.
+    #[test]
+    fn the_root_index_declares_okf_0_2_and_nothing_else() {
+        for entries in [vec![], vec![entry("orders", "Orders", Some("Table"), None)]] {
+            let idx = render_index(&entries);
+
+            let rest = idx
+                .strip_prefix("---\n")
+                .expect("opens with a frontmatter fence");
+            let end = rest.find("\n---\n").expect("closes the fence");
+            let block: serde_yaml::Mapping = serde_yaml::from_str(&rest[..end]).unwrap();
+
+            assert_eq!(block.len(), 1, "{idx}");
+            assert_eq!(
+                block.get("okf_version").and_then(|v| v.as_str()),
+                Some("0.2")
+            );
+            assert!(rest[end..].starts_with("\n---\n\n# Wiki Index\n"), "{idx}");
+        }
+    }
+
+    #[test]
+    fn regenerating_the_index_is_stable() {
+        let entries = vec![entry(
+            "orders",
+            "Orders",
+            Some("Table"),
+            Some("One row per order."),
+        )];
+
+        assert_eq!(render_index(&entries), render_index(&entries));
+    }
+
+    // The writer and the linter must agree: pk may not write an index its own
+    // lint then warns about.
+    #[test]
+    fn the_index_pk_writes_passes_its_own_structure_check() {
+        for entries in [vec![], vec![entry("orders", "Orders", Some("Table"), None)]] {
+            assert!(okf_index_reports(&render_index(&entries)).is_empty());
+        }
     }
 
     #[test]
