@@ -918,8 +918,20 @@ fn durable_rename(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Flush a directory entry to disk so a just-completed rename survives a crash.
+///
+/// This is a POSIX idiom. On Windows `File::open` on a directory fails with "Access is denied"
+/// (os error 5) — opening a directory there needs `FILE_FLAG_BACKUP_SEMANTICS` — and there is no
+/// directory-fsync equivalent to call anyway; NTFS journals directory metadata itself. So the
+/// non-unix twin is a no-op rather than an error that fails every snapshot commit.
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
