@@ -530,6 +530,18 @@ mod tests {
         assert!(okf_index_reports(no_fm).is_empty());
     }
 
+    // The check reads the block with lines(), which drops the carriage return,
+    // so a CRLF index.md needs no normalising here. This test is what keeps it so.
+    #[test]
+    fn a_crlf_index_gets_the_same_verdict_as_its_lf_twin() {
+        let with_version = "---\r\nokf_version: \"0.1\"\r\n---\r\n\r\n# Wiki Index\r\n";
+        assert!(okf_index_reports(with_version).is_empty());
+
+        let with_extra =
+            "---\r\nokf_version: \"0.1\"\r\ntitle: nope\r\n---\r\n\r\n# Wiki Index\r\n";
+        assert_eq!(okf_index_reports(with_extra).len(), 1);
+    }
+
     #[test]
     fn log_non_iso_date_heading_warns() {
         let bad = "# Update Log\n\n## July 2 2026\n* **Creation**: [Foo](/foo.md)\n";
