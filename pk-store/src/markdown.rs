@@ -26,6 +26,23 @@ struct Generated {
     at: Option<String>,
 }
 
+/// Read `generated` leniently. pk 1.8.0 did not model the key, so a document
+/// carrying any shape of it parsed; a strict type here would turn a document
+/// that used to load into one that fails, and a parse failure is not local —
+/// it freezes live reload and blocks snapshot commits for the whole store. So
+/// anything but a mapping with a string `by` (§5.2 requires `by`) is absent,
+/// and an `at` that is not a string is ignored.
+fn lenient_generated<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Generated>, D::Error> {
+    let value = Option::<serde_yaml::Value>::deserialize(deserializer)?;
+    let Some(serde_yaml::Value::Mapping(mapping)) = value else {
+        return Ok(None);
+    };
+    let text = |key: &str| mapping.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+    Ok(text("by").map(|by| Generated { by, at: text("at") }))
+}
+
 /// The actor pk names when a document carried no `generated.by` of its own:
 /// `<producer>/<version>`, the §7 form for agents and tools.
 const PK_ACTOR: &str = concat!("pk/", env!("CARGO_PKG_VERSION"));
@@ -59,7 +76,11 @@ struct Frontmatter {
     sources: Vec<Source>,
     /// OKF v0.2 §5.2. Typed rather than left to `extra`, so it is never written
     /// twice.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient_generated",
+        skip_serializing_if = "Option::is_none"
+    )]
     generated: Option<Generated>,
     /// OKF v0.1 §4.1 `timestamp`, superseded by `generated.at` (v0.2 §13.1).
     /// Read as a fallback for v0.1 documents; never written.
@@ -164,18 +185,30 @@ pub fn markdown_to_entry(raw: &str, fallback_id: Option<&str>) -> PkResult<WikiE
         None => now,
     };
     // An explicit `updated_at` (pk-native) wins, then v0.2's `generated.at`,
-    // then v0.1's `timestamp` (§13.1 allows the fallback).
-    let generated_at = fm.generated.as_ref().and_then(|g| g.at.as_ref());
-    let updated_at = match fm
-        .updated_at
+    // then v0.1's `timestamp` (§13.1 allows the fallback). `updated_at` and
+    // `timestamp` stay as strict as 1.8.0 had them. `generated.at` is new to pk:
+    // chrono's RFC 3339 parser is narrower than "ISO 8601 with an offset", and a
+    // value it rejects falls through rather than failing a document 1.8.0 read.
+    let strict = |field: &str, s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .map(|at| at.with_timezone(&chrono::Utc))
+            .map_err(|e| PkError::frontmatter(format!("{field}: {e}")))
+    };
+    let generated_at = fm
+        .generated
         .as_ref()
-        .or(generated_at)
-        .or(fm.timestamp.as_ref())
-    {
-        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
-            .map_err(|e| PkError::frontmatter(format!("updated_at/generated.at/timestamp: {e}")))?
-            .with_timezone(&chrono::Utc),
-        None => now,
+        .and_then(|g| g.at.as_deref())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|at| at.with_timezone(&chrono::Utc));
+    let updated_at = match (
+        fm.updated_at.as_deref(),
+        generated_at,
+        fm.timestamp.as_deref(),
+    ) {
+        (Some(s), _, _) => strict("updated_at", s)?,
+        (None, Some(at), _) => at,
+        (None, None, Some(s)) => strict("timestamp", s)?,
+        (None, None, None) => now,
     };
 
     Ok(WikiEntry {

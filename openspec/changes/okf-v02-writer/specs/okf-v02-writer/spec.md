@@ -22,6 +22,17 @@
 - **WHEN** a document carries both `generated.at` and an older `timestamp`
 - **THEN** `updated_at` equals `generated.at`
 
+### Requirement: A document 1.8.0 could read does not fail because of `generated`
+pk 1.8.0 did not model `generated`, so a document carrying any shape of it parsed. The reader SHALL treat a `generated` that is not a mapping with a string `by` as absent, and SHALL let a `generated.at` it cannot parse fall through to the next source of `updated_at`. `updated_at` and `timestamp` SHALL stay as strict as 1.8.0 had them.
+
+#### Scenario: A malformed generated is absent, not fatal
+- **WHEN** `generated` is a string, a boolean, a sequence, a mapping with no `by`, or a mapping whose `by` is not a string
+- **THEN** the document parses, its body is intact, and it carries no `generated_by`
+
+#### Scenario: An unparseable generated.at falls through
+- **WHEN** `generated.at` has no offset, is a date alone, omits the seconds, or is not a date, and the document also carries a `timestamp`
+- **THEN** the document parses, `updated_at` equals the `timestamp`, and `generated.by` is still read
+
 ### Requirement: `sources` is a list of mappings that round-trips without loss
 A source SHALL be a mapping with a required `resource` and an optional `id`, and SHALL preserve every other key it was read with. The writer SHALL emit the mapping form only. The reader SHALL accept a legacy string as `{ resource: <string> }`.
 
