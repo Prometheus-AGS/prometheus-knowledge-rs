@@ -77,3 +77,12 @@ One thing the test fixture taught: building the fixture file through `serde_json
 keys, so the stored entries no longer matched the text that had been hashed and the test failed for a reason
 of its own. The fixture is two fixed constants — what was hashed and what was stored — and neither is derived
 from the other by the code under test, which would have let a broken `compact_json` agree with itself.
+
+## Declined: guarding `Source.extra` against reserved keys
+
+The audit noted that `Source.extra` is `pub`, so code could insert `id` or `resource` into it and serialise
+duplicate keys. It cannot happen from parsed data — the deserialiser removes both before filling `extra` —
+and nothing in the workspace builds a `Source` with extras. No failure has been observed and none is
+reachable, so no guard is added: a private field with a validating accessor is API surface with no caller.
+If a caller ever needs to construct a `Source` with extra keys, that is the moment to add it, with the
+caller's real requirements in hand.

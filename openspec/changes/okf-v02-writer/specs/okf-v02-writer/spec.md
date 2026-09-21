@@ -63,6 +63,10 @@ The compile prompt SHALL ask for `[^id]` footnotes whose labels are `sources[].i
 - **WHEN** a compile response lists two sources whose text reduces to the same slug
 - **THEN** the entry's two sources have different `id` values, and each footnote label in the body matches exactly one of them
 
+#### Scenario: A citation is not mistaken for a link
+- **WHEN** a body cites `[^notes]` and defines it as `[^notes]: /private/tmp/session/results.md`
+- **THEN** the entry's links do not include that path, while a genuine bundle-relative link written inside a footnote definition is still a link
+
 #### Scenario: A valid label is never rewritten
 - **WHEN** the model labels a source `notes.md`, `session:abc` or `a/b` and cites with it
 - **THEN** the id is kept exactly, and the body's footnote still matches it; only a label containing whitespace, `[`, `]` or `^`, or an empty one, is replaced

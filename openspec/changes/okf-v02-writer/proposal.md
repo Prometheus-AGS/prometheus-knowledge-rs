@@ -7,7 +7,10 @@ Precision about what is wrong today: by §11 a bundle is v0.2-conformant with no
 ## What Changes
 
 - The writer emits `generated: { by: pk/<version>, at: <updated_at> }` and no longer emits `timestamp`.
-- `sources` is written as a list of mappings, `{ id, resource, … }`. **BREAKING for readers of pk's own files that expect strings** — none exist outside pk.
+- `sources` is written as a list of mappings, `{ id, resource, … }`. **BREAKING**, in three places, and the first draft of this proposal named only the first:
+  - readers of pk's own files that expect strings — none exist outside pk;
+  - **the MCP `get` tool**: `handle_get` returns the whole `WikiEntry`, so `sources` arrives as an array of mappings where it was an array of strings, and `generated_by` is a new key. A client reading `sources[i]` as a string breaks. (The other tools return a five-field summary and are unaffected.)
+  - **the Rust API**: `WikiEntry.sources` changed type and the struct gained a public field, `generated_by`. That is source-breaking inside a 1.8 → 1.9 bump; the only outside dependant found, `prometheus-skill-pack/tools/forge-rs`, uses no pk types.
 - The reader accepts both shapes: a legacy string becomes `{ resource: <string> }`; a mapping keeps every key it carries, so `title`, `author`, `usage_count` and `last_modified` survive a round trip. `timestamp` is read when `generated` is absent.
 - The librarian prompt stops asking for a `# Citations` body section and asks for `[^id]` footnotes whose labels are `sources[].id`.
 - The bundle-root `index.md` declares `okf_version: "0.2"`, and rewriting the index preserves the declaration.

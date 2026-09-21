@@ -6,7 +6,7 @@
 //! without a store or an LLM; `MarkdownStore` wires these to disk.
 
 use pk_core::types::{ArticleId, LintReport, LintSeverity, WikiEntry};
-use pulldown_cmark::{Event, Parser, Tag};
+use pulldown_cmark::{Event, Options, Parser, Tag};
 use std::collections::HashSet;
 
 /// OKF v0.2 §6.1: a bundle-relative link begins with `/` (interpreted from the
@@ -31,7 +31,10 @@ fn bundle_link_to_concept_id(dest: &str) -> Option<ArticleId> {
 /// Order-preserving and deduplicated.
 pub fn extract_body_links(content: &str) -> Vec<ArticleId> {
     let mut links: Vec<ArticleId> = Vec::new();
-    for event in Parser::new(content) {
+    // Footnotes must be on: without them `[^id]: /some/file.md` is read as a link
+    // reference definition labelled `^id`, and every citation of it becomes a
+    // link to that path. Entries cite this way since OKF v0.2 (§5.1).
+    for event in Parser::new_ext(content, Options::ENABLE_FOOTNOTES) {
         if let Event::Start(Tag::Link { dest_url, .. }) = event {
             if let Some(id) = bundle_link_to_concept_id(&dest_url) {
                 if !links.contains(&id) {
