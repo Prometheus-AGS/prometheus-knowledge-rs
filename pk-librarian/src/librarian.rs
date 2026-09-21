@@ -385,4 +385,87 @@ mod tests {
         let entry = parse_compile_response(response).unwrap();
         assert_eq!(entry.entry_type.as_deref(), Some("Reference"));
     }
+
+    /// Every `[^label]` used in a body, in order of first use.
+    fn footnote_labels(body: &str) -> Vec<String> {
+        let mut labels = Vec::new();
+        let mut rest = body;
+        while let Some(start) = rest.find("[^") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find(']') else { break };
+            let label = after[..end].to_owned();
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+            rest = &after[end..];
+        }
+        labels
+    }
+
+    // OKF v0.2 §13.1 supersedes the body `# Citations` list; §5.1 attributes
+    // claims with footnotes whose label is a `sources[].id`.
+    #[test]
+    fn the_compile_prompt_asks_for_keyed_footnotes_not_a_citations_section() {
+        assert!(!crate::prompts::COMPILE_SYSTEM.contains("Citations"));
+        assert!(crate::prompts::COMPILE_SYSTEM.contains("[^"));
+    }
+
+    // The model discovers the sources, so it chooses the labels it cites with.
+    // Re-deriving a label it already used would leave the footnote pointing at
+    // nothing: the silent misattribution §5.1 warns about.
+    #[test]
+    fn a_label_the_model_chose_is_kept_so_its_footnote_still_matches() {
+        let response = r#"{"title":"T","content":"Sharded daily.[^ga4_schema]\n\n[^ga4_schema]: GA4 export schema","sources":[{"id":"ga4_schema","resource":"https://example.com/schema"}]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+
+        assert_eq!(entry.sources[0].id.as_deref(), Some("ga4_schema"));
+        assert_eq!(footnote_labels(&entry.content), vec!["ga4_schema"]);
+    }
+
+    #[test]
+    fn a_source_given_as_a_bare_string_gets_a_derived_id() {
+        let response = r#"{"title":"T","content":"body","sources":["session:ABC 123"]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+
+        assert_eq!(entry.sources[0].resource, "session:ABC 123");
+        assert_eq!(entry.sources[0].id.as_deref(), Some("session-abc-123"));
+    }
+
+    #[test]
+    fn a_label_that_cannot_be_a_footnote_is_replaced_by_a_derived_one() {
+        let response = r#"{"title":"T","content":"body","sources":[{"id":"has space]","resource":"notes/a.md"}]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+
+        assert_eq!(entry.sources[0].id.as_deref(), Some("notes-a-md"));
+    }
+
+    // A duplicate label misattributes silently, because the footnote join is by label.
+    #[test]
+    fn sources_that_reduce_to_one_label_get_distinct_ids() {
+        let response = r#"{"title":"T","content":"One.[^notes-a-md]\n\n[^notes-a-md]: first","sources":["notes/a.md","notes-a.md","notes a md"]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+        let ids: Vec<_> = entry
+            .sources
+            .iter()
+            .map(|s| s.id.clone().unwrap())
+            .collect();
+
+        assert_eq!(ids, vec!["notes-a-md", "notes-a-md-2", "notes-a-md-3"]);
+        for label in footnote_labels(&entry.content) {
+            assert_eq!(ids.iter().filter(|id| **id == label).count(), 1, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_source_with_nothing_to_derive_a_label_from_still_gets_one() {
+        let response = r#"{"title":"T","content":"body","sources":["///"]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+
+        assert_eq!(entry.sources[0].id.as_deref(), Some("source"));
+    }
 }
