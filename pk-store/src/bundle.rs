@@ -411,6 +411,31 @@ mod tests {
         assert!(idx.contains("* [Triage](/triage.md)\n"));
     }
 
+    // The v0.2 prompt makes entries cite with `[^label]` and end with a definition
+    // line. Parsed without footnote support, `[^notes]: /abs/path/file.md` is a
+    // LINK REFERENCE DEFINITION labelled `^notes`, so the citation in the body
+    // becomes a link to that path and lands in the link graph as a bogus concept.
+    #[test]
+    fn a_footnote_definition_naming_a_md_path_is_not_a_link() {
+        let body = "Verified.[^notes]\n\n[^notes]: /private/tmp/session/results.md\n";
+
+        assert!(
+            extract_body_links(body).is_empty(),
+            "{:?}",
+            extract_body_links(body)
+        );
+    }
+
+    #[test]
+    fn a_real_link_inside_a_footnote_definition_still_counts() {
+        let body = "Verified.[^n]\n\n[^n]: see [Orders](/tables/orders.md)\n";
+
+        assert_eq!(
+            extract_body_links(body),
+            vec![ArticleId::from("tables/orders")]
+        );
+    }
+
     // OKF v0.2 §12: a bundle MAY declare the version it targets, in the
     // bundle-root index.md and nowhere else. pk renders only that index.
     #[test]
