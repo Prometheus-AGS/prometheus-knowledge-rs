@@ -44,6 +44,10 @@ A source SHALL be a mapping with a required `resource` and an optional `id`, and
 - **WHEN** a document with `sources: ["session:abc-123"]` is parsed and written back
 - **THEN** the output has `sources: [{ resource: "session:abc-123" }]`
 
+#### Scenario: A scalar source that is not text is read as its text
+- **WHEN** a document written for 1.8.0 lists a number or a boolean under `sources`, in YAML or in JSON
+- **THEN** it loads, with the scalar's text as the `resource`, as 1.8.0 loaded it
+
 #### Scenario: A source without a resource is rejected
 - **WHEN** a document carries a source mapping with no `resource`
 - **THEN** parsing fails with a frontmatter error naming the missing key

@@ -129,7 +129,9 @@ fn a_numeric_or_boolean_source_is_read_as_its_text() {
 #[test]
 fn a_source_that_is_neither_text_nor_a_mapping_says_what_it_needs() {
     for yaml in ["- ~\n", "- [a, b]\n"] {
-        let error = serde_yaml::from_str::<Vec<Source>>(yaml).unwrap_err().to_string();
+        let error = serde_yaml::from_str::<Vec<Source>>(yaml)
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("resource"), "{yaml:?} -> {error}");
     }

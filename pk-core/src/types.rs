@@ -149,6 +149,8 @@ impl From<&str> for Source {
 enum SourceRepr {
     Text(String),
     Mapping(std::collections::BTreeMap<String, serde_yaml::Value>),
+    // Last, so it only catches what the two above did not.
+    Other(serde_yaml::Value),
 }
 
 impl<'de> Deserialize<'de> for Source {
@@ -158,6 +160,16 @@ impl<'de> Deserialize<'de> for Source {
         let mut extra = match SourceRepr::deserialize(deserializer)? {
             SourceRepr::Text(resource) => return Ok(Self::new(resource)),
             SourceRepr::Mapping(mapping) => mapping,
+            // pk 1.8.0 held sources as strings and YAML handed it any scalar as
+            // text, so `sources: [12345]` loaded. Buffered through an untagged
+            // enum the value is already a number; read it as its text.
+            SourceRepr::Other(serde_yaml::Value::Number(n)) => return Ok(Self::new(n.to_string())),
+            SourceRepr::Other(serde_yaml::Value::Bool(b)) => return Ok(Self::new(b.to_string())),
+            SourceRepr::Other(_) => {
+                return Err(D::Error::custom(
+                    "a source must be text or a mapping with a `resource`",
+                ))
+            }
         };
         // An untagged enum reports only "did not match any variant"; name the key.
         let resource = match extra.remove("resource") {
