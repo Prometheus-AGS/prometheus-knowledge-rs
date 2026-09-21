@@ -19,8 +19,8 @@ Test-first throughout. Cheap checks while implementing (`cargo check -p <crate>`
 
 ## 4. The root index
 
-- [ ] 4.1 In `pk-store/src/bundle.rs` tests: the root index begins with an `okf_version: "0.2"`-only block; rendering twice is stable; a nested index has no frontmatter; `okf_index_reports` still accepts the root form.
-- [ ] 4.2 Implement in `render_index` and its caller at `pk-store/src/store.rs:228`.
+- [x] 4.1 In `pk-store/src/bundle.rs` tests: the root index begins with an `okf_version: "0.2"`-only block; rendering twice is stable; `okf_index_reports` accepts the form pk writes. (The "nested index" case was dropped: pk renders no nested index — `render_index` has one caller.)
+- [x] 4.2 Implement in `render_index`. Its caller at `pk-store/src/store.rs:228` writes what it returns and needed no change.
 
 ## 5. Documentation
 

@@ -44,13 +44,17 @@ pub fn extract_body_links(content: &str) -> Vec<ArticleId> {
 }
 
 const INDEX_TITLE: &str = "# Wiki Index";
+/// OKF v0.2 §12: the one frontmatter block an `index.md` may carry, and only
+/// at the bundle root. pk renders no other index, so every index it writes is
+/// the root one.
+const INDEX_VERSION_BLOCK: &str = "---\nokf_version: \"0.2\"\n---\n\n";
 const LOG_TITLE: &str = "# Update Log";
 
 /// Render OKF §6 `index.md` from the current entries, grouped by concept
 /// `type`. Each entry is listed as `* [Title](/id.md) - description`, with
 /// the description taken from frontmatter when present. Groups and entries
-/// are sorted for deterministic output (stable diffs). Contains no
-/// frontmatter, per §6.
+/// are sorted for deterministic output (stable diffs). Opens with the
+/// `okf_version` declaration and carries no other frontmatter (§8, §12).
 pub fn render_index(entries: &[WikiEntry]) -> String {
     use std::collections::BTreeMap;
 
@@ -64,6 +68,7 @@ pub fn render_index(entries: &[WikiEntry]) -> String {
     }
 
     let mut out = String::new();
+    out.push_str(INDEX_VERSION_BLOCK);
     out.push_str(INDEX_TITLE);
     out.push_str("\n\n");
 

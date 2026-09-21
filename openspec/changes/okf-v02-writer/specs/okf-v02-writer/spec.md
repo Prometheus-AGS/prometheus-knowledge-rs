@@ -55,9 +55,13 @@ The bundle-root `index.md` SHALL begin with a frontmatter block containing only 
 - **WHEN** the index is rendered twice
 - **THEN** both outputs begin with the `okf_version: "0.2"` block, and the second equals the first
 
-#### Scenario: A nested index carries no frontmatter
-- **WHEN** an `index.md` is rendered for a subdirectory
-- **THEN** it has no frontmatter block
+#### Scenario: pk writes no index but the root one
+- **WHEN** the callers of `render_index` are listed
+- **THEN** there is exactly one, and it writes `<wiki root>/index.md` — so every index pk writes is the bundle root's, and no index below the root is written with or without frontmatter
+
+#### Scenario: The writer and the linter agree
+- **WHEN** the index pk renders is passed to pk's own index structure check, for an empty and a non-empty wiki
+- **THEN** the check reports nothing
 
 ### Requirement: The behaviour holds on every platform pk builds for
 Every scenario above SHALL pass on `ubuntu-latest`, `macos-latest` and `windows-latest`, and a CRLF document SHALL parse to the same sources and the same `generated` as its LF twin.
