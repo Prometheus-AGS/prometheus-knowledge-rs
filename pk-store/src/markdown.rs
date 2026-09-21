@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Filenames reserved by the Open Knowledge Format (OKF v0.1 §3.1) at any
+/// Filenames reserved by the Open Knowledge Format (OKF v0.2 §3.1) at any
 /// level of a bundle. Never treated as concept documents.
 pub const RESERVED_FILENAMES: [&str; 2] = ["index.md", "log.md"];
 
@@ -31,11 +31,11 @@ struct Generated {
 const PK_ACTOR: &str = concat!("pk/", env!("CARGO_PKG_VERSION"));
 
 // ---------------------------------------------------------------------------
-// Frontmatter — permissive per OKF v0.1 §4.1 and §9. `type` is OKF's one
+// Frontmatter — permissive per OKF v0.2 §4.1 and §11. `type` is OKF's one
 // required key; every pk-native field is optional so both a minimal OKF
 // document and a legacy pre-OKF pk document parse without error. Keys this
 // struct doesn't model are captured in `extra` and preserved verbatim on
-// round-trip (OKF §9: unknown keys are never grounds to drop data).
+// round-trip (OKF v0.2 §4.1: consumers SHOULD preserve unknown keys).
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -112,7 +112,7 @@ pub fn entry_to_markdown(entry: &WikiEntry) -> PkResult<String> {
 ///
 /// `fallback_id` supplies the concept ID when frontmatter omits `id` (as any
 /// conformant OKF document may) — callers with a file path pass the
-/// wiki-relative path (minus `.md`) per OKF §2's Concept ID definition.
+/// wiki-relative path (minus `.md`) per OKF v0.2 §2's Concept ID definition.
 pub fn markdown_to_entry(raw: &str, fallback_id: Option<&str>) -> PkResult<WikiEntry> {
     // Accept CRLF, keep LF: the body feeds the content hash and the snapshot
     // generation id, which must not depend on the checkout that produced it.
@@ -340,7 +340,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// OKF v0.1 §9: a bundle is conformant if every frontmatter block has a
+    /// OKF v0.2 §11: a bundle is conformant if every frontmatter block has a
     /// non-empty `type` — nothing else is required. This is the minimal
     /// legal OKF document; pk must parse it without an `id`.
     #[test]
@@ -373,7 +373,7 @@ mod tests {
         assert_eq!(entry.tags, vec!["old".to_string()]);
     }
 
-    /// OKF §9: unknown frontmatter keys must survive a round-trip, not be
+    /// OKF v0.2 §4.1: unknown frontmatter keys must survive a round-trip, not be
     /// silently dropped when pk re-serializes an entry it doesn't fully model.
     #[test]
     fn unknown_frontmatter_keys_round_trip() {

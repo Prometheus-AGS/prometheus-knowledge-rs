@@ -78,7 +78,7 @@ impl Librarian {
         // than an incidental title-slug collision.
         let is_new = entry.revision == 0;
 
-        // Maintain the two OKF reserved bundle files (§6 index, §7 log) after
+        // Maintain the two OKF reserved bundle files (§8 index, §9 log) after
         // every ingest. Best-effort: a bookkeeping failure must not lose the
         // compiled entry, which is already persisted.
         if let Err(e) = self.store.regenerate_index().await {
@@ -116,7 +116,7 @@ impl Librarian {
         let count = snapshot.len();
         info!(entries = count, "starting lint pass");
 
-        // Deterministic OKF §9 conformance always runs first — it needs no
+        // Deterministic OKF v0.2 §11 conformance always runs first — it needs no
         // model, so it stays reliable even when the lint LLM is unavailable.
         let mut reports = self.store.okf_conformance_reports().await?;
         let okf_count = reports.len();
@@ -373,7 +373,7 @@ fn parse_compile_response(raw: &str) -> PkResult<WikiEntry> {
 
     let mut entry = entry;
     // Link graph is derived from bundle-relative links the model embedded in
-    // the body (OKF §5); the JSON `links` array is honored only for
+    // the body (OKF v0.2 §6); the JSON `links` array is honored only for
     // back-compat with older prompts. Body links win and lead.
     let mut links = pk_store::bundle::extract_body_links(&entry.content);
     for slug in out.links {
@@ -383,7 +383,7 @@ fn parse_compile_response(raw: &str) -> PkResult<WikiEntry> {
         }
     }
     entry.links = links;
-    // OKF v0.1 §4.1: `type` is the format's one required frontmatter key.
+    // OKF v0.2 §4.1: `type` is the format's one required frontmatter key.
     // The compile prompt doesn't yet ask the model to classify entries, so
     // every Librarian-compiled entry defaults to the generic OKF type.
     entry.entry_type = Some("Reference".to_string());

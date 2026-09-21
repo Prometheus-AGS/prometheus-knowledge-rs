@@ -70,7 +70,7 @@ async fn reconcile_removes_one_of_two_aliases_to_the_same_article() {
     assert!(store.get(&ArticleId::from("second")).await.is_ok());
 }
 
-/// OKF §9: pk lint scans raw files (so it catches documents the store skips
+/// OKF v0.2 §11: pk lint scans raw files (so it catches documents the store skips
 /// on load) and classifies violations by the permissive-consumption split —
 /// a missing `type` is an auto-fixable error; a healthy page is clean.
 /// okf_autofix_type then repairs it deterministically.
@@ -136,7 +136,7 @@ async fn okf_conformance_lint_and_autofix() {
     );
 }
 
-/// OKF §6/§7: after ingests, the wiki root carries an index.md cataloging
+/// OKF v0.2 §8/§9: after ingests, the wiki root carries an index.md cataloging
 /// every entry and a log.md with dated, newest-first entries. Reserved files
 /// must survive a store reopen (they are skipped as concept documents).
 #[tokio::test]
@@ -351,7 +351,7 @@ async fn entries_persist_across_store_reopen() {
     assert_eq!(uar.title, "UAR");
 }
 
-/// OKF v0.1 §2: a Concept ID is the wiki-relative path minus `.md`, so
+/// OKF v0.2 §2: a Concept ID is the wiki-relative path minus `.md`, so
 /// concepts MAY live in subdirectories (§3's bundle tree). A nested entry
 /// must write to, and reload correctly from, a subdirectory of wiki/.
 #[tokio::test]
@@ -385,7 +385,7 @@ async fn unsafe_article_id_is_rejected_on_upsert() {
     assert!(store.upsert(entry).await.is_err());
 }
 
-/// OKF v0.1 §3.1: index.md and log.md are reserved bundle files, never
+/// OKF v0.2 §3.1: index.md and log.md are reserved bundle files, never
 /// concept documents. A frontmatter-less index.md must not be treated as a
 /// malformed entry or block store load.
 #[tokio::test]

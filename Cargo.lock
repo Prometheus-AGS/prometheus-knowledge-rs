@@ -1232,7 +1232,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pk-cherry"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1252,7 +1252,7 @@ dependencies = [
 
 [[package]]
 name = "pk-cli"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1272,7 +1272,7 @@ dependencies = [
 
 [[package]]
 name = "pk-core"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "pk-event-store"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1301,7 +1301,7 @@ dependencies = [
 
 [[package]]
 name = "pk-learning-worker"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "pk-librarian"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "pk-mcp"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1359,7 +1359,7 @@ dependencies = [
 
 [[package]]
 name = "pk-store"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1377,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "pk-uar"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1394,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "pk-watcher"
-version = "1.8.0"
+version = "1.9.0"
 dependencies = [
  "anyhow",
  "chrono",

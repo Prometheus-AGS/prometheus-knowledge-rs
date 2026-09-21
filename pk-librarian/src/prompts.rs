@@ -29,7 +29,7 @@ Rules:
 - content must NOT repeat the title as a heading at the top
 - omit fluff, speculation, and filler — engineering knowledge only
 
-Cross-links (Open Knowledge Format section 5):
+Cross-links (Open Knowledge Format v0.2 section 6):
 - When the body references another article from the RELATED ARTICLES context,
   link it INLINE as a bundle-relative markdown link: [That Title](/that-article-id.md)
   where the id is that article's slug. Do NOT emit a separate links array —

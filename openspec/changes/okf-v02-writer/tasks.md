@@ -24,7 +24,7 @@ Test-first throughout. Cheap checks while implementing (`cargo check -p <crate>`
 
 ## 5. Documentation
 
-- [ ] 5.1 Replace "OKF v0.1" in doc comments with the version and section each actually cites; bump the workspace version.
+- [x] 5.1 Replace "OKF v0.1" in doc comments with the version and section each actually cites; bump the workspace version.
 
 ## 6. Verify and hand over
 

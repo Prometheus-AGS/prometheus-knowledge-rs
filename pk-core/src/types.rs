@@ -41,7 +41,7 @@ impl ArticleId {
         &self.0
     }
 
-    /// OKF v0.1 §2: a Concept ID is the file's wiki-relative path with the
+    /// OKF v0.2 §2: a Concept ID is the file's wiki-relative path with the
     /// `.md` suffix removed, so an ArticleId MAY contain `/` to address a
     /// nested concept (e.g. `tables/orders`). This checks it is safe to join
     /// onto the wiki root as a filesystem path: no parent-directory
@@ -206,13 +206,13 @@ pub struct WikiEntry {
     /// Revision counter — incremented on every upsert
     pub revision: u32,
 
-    /// Open Knowledge Format (OKF) v0.1 §4.1 `type` — the format's one
+    /// Open Knowledge Format (OKF) v0.2 §4.1 `type` — the format's one
     /// required frontmatter key. `None` for entries compiled before OKF
     /// adoption or lacking a producer-assigned type.
     #[serde(default)]
     pub entry_type: Option<String>,
 
-    /// OKF v0.1 §4.1 `description` — a one-sentence summary used by index
+    /// OKF v0.2 §4.1 `description` — a one-sentence summary used by index
     /// generators, search snippets, and previews.
     #[serde(default)]
     pub description: Option<String>,
@@ -226,8 +226,8 @@ pub struct WikiEntry {
 
     /// Frontmatter keys pk does not model structurally (OKF producer
     /// extensions, or fields from a future OKF minor version). Preserved
-    /// verbatim across parse → serialize round-trips per OKF §9's permissive
-    /// consumption rule — unknown keys are never grounds to drop data.
+    /// verbatim across parse → serialize round-trips per OKF v0.2 §4.1 —
+    /// consumers SHOULD preserve unknown keys, and (§11) never reject for them.
     #[serde(default)]
     pub extra: std::collections::BTreeMap<String, serde_yaml::Value>,
 }
