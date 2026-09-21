@@ -68,29 +68,75 @@ pub fn read_prompt_snapshot(knowledge_root: &Path, scope: &str) -> PkResult<Prom
             "prompt snapshot pointer is not a SHA-256 generation".to_owned(),
         ));
     }
-    let snapshot: PromptSnapshot = serde_json::from_slice(&fs::read(
+    let stored: StoredSnapshot = serde_json::from_slice(&fs::read(
         root.join("generations").join(format!("{generation}.json")),
     )?)?;
-    let entries_bytes = serde_json::to_vec(&snapshot.entries)?;
-    let expected = snapshot_generation(scope, &entries_bytes);
-    if snapshot.schema_version != 1
-        || snapshot.scope != scope
-        || snapshot.generation != generation
+    // Identity is checked against the entries AS STORED, never against a
+    // re-serialisation of them: re-serialising ties every existing snapshot to
+    // the exact shape of today's `WikiEntry`, and a changed field then
+    // invalidates them all. The generation was taken over compact JSON and the
+    // file is pretty-printed, so the stored text is compacted first.
+    let entries_bytes = compact_json(stored.entries.get());
+    let expected = snapshot_generation(scope, entries_bytes.as_bytes());
+    let entries: Vec<WikiEntry> = serde_json::from_str(stored.entries.get())?;
+    if stored.schema_version != 1
+        || stored.scope != scope
+        || stored.generation != generation
         || expected != generation
-        || snapshot.candidate_count != snapshot.entries.len()
-        || snapshot.byte_count != entries_bytes.len()
+        || stored.candidate_count != entries.len()
+        || stored.byte_count != entries_bytes.len()
     {
         return Err(pk_core::error::PkError::Other(
             "prompt snapshot failed identity or count validation".to_owned(),
         ));
     }
-    Ok(snapshot)
+    Ok(PromptSnapshot {
+        schema_version: stored.schema_version,
+        scope: stored.scope,
+        generation: stored.generation,
+        candidate_count: stored.candidate_count,
+        byte_count: stored.byte_count,
+        entries,
+    })
 }
 
-/// STUB — returns its input unchanged. Replaced in the GREEN commit.
-#[allow(dead_code)]
+/// A snapshot file with its entries left as the text that was written.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredSnapshot {
+    schema_version: u32,
+    scope: String,
+    generation: String,
+    candidate_count: usize,
+    byte_count: usize,
+    entries: Box<serde_json::value::RawValue>,
+}
+
+/// Remove the whitespace a JSON pretty-printer adds, leaving string contents
+/// alone. `serde_json` formats scalars identically in both modes and only adds
+/// whitespace between tokens, so this reproduces its compact output exactly.
 fn compact_json(text: &str) -> String {
-    text.to_owned()
+    let mut out = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in text.chars() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+        } else if !matches!(c, ' ' | '\t' | '\n' | '\r') {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn snapshot_generation(scope: &str, entries_bytes: &[u8]) -> String {
@@ -199,27 +245,41 @@ mod tests {
     /// strings and there is no `generated_by` key. Compact, as it was hashed.
     const ENTRIES_FROM_1_8_0: &str = r#"[{"id":"orders","title":"Orders","content":"One row per order: \"id\", {total}.","tags":["sql"],"links":[],"sources":["session:abc-123"],"created_at":"2026-08-03T10:00:00Z","updated_at":"2026-08-03T10:00:00Z","revision":1,"entry_type":"Table","description":null,"extra":{}}]"#;
 
-    /// Write a snapshot the way `commit_prompt_snapshot` does — generation over
-    /// the compact entries, file pretty-printed — but from fixed entry text, so
-    /// it does not depend on how today's `WikiEntry` happens to serialise.
-    fn write_snapshot_with_entries(root: &Path, scope: &str, compact_entries: &str) -> String {
-        let generation = snapshot_generation(scope, compact_entries.as_bytes());
-        let entries: serde_json::Value = serde_json::from_str(compact_entries).unwrap();
-        let file = serde_json::json!({
-            "schemaVersion": 1,
-            "scope": scope,
-            "generation": generation,
-            "candidateCount": entries.as_array().unwrap().len(),
-            "byteCount": compact_entries.len(),
-            "entries": entries,
-        });
+    /// The same entry as it sat in the 1.8.0 file: pretty-printed, keys in struct
+    /// order. Fixed text, NOT derived from the constant above by the code under
+    /// test — otherwise a broken `compact_json` would agree with itself.
+    const ENTRIES_FROM_1_8_0_AS_STORED: &str = r#"[
+    {
+      "id": "orders",
+      "title": "Orders",
+      "content": "One row per order: \"id\", {total}.",
+      "tags": [
+        "sql"
+      ],
+      "links": [],
+      "sources": [
+        "session:abc-123"
+      ],
+      "created_at": "2026-08-03T10:00:00Z",
+      "updated_at": "2026-08-03T10:00:00Z",
+      "revision": 1,
+      "entry_type": "Table",
+      "description": null,
+      "extra": {}
+    }
+  ]"#;
+
+    /// Write a snapshot file as pk 1.8.0 left it: generation and byte count over
+    /// the compact entries, the entries themselves stored pretty-printed.
+    fn write_1_8_0_snapshot(root: &Path, scope: &str) -> String {
+        let generation = snapshot_generation(scope, ENTRIES_FROM_1_8_0.as_bytes());
+        let file = format!(
+            "{{\n  \"schemaVersion\": 1,\n  \"scope\": \"{scope}\",\n  \"generation\": \"{generation}\",\n  \"candidateCount\": 1,\n  \"byteCount\": {},\n  \"entries\": {ENTRIES_FROM_1_8_0_AS_STORED}\n}}",
+            ENTRIES_FROM_1_8_0.len()
+        );
         let dir = snapshot_root(root, scope).join("generations");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join(format!("{generation}.json")),
-            serde_json::to_vec_pretty(&file).unwrap(),
-        )
-        .unwrap();
+        fs::write(dir.join(format!("{generation}.json")), file).unwrap();
         fs::write(
             snapshot_root(root, scope).join("current"),
             format!("{generation}\n"),
@@ -236,7 +296,7 @@ mod tests {
     #[test]
     fn a_snapshot_written_by_1_8_0_still_validates() {
         let temp = TempDir::new().unwrap();
-        let generation = write_snapshot_with_entries(temp.path(), "global", ENTRIES_FROM_1_8_0);
+        let generation = write_1_8_0_snapshot(temp.path(), "global");
 
         let snapshot = read_prompt_snapshot(temp.path(), "global").unwrap();
 
@@ -251,7 +311,7 @@ mod tests {
     #[test]
     fn entries_that_differ_from_what_was_hashed_are_refused() {
         let temp = TempDir::new().unwrap();
-        let generation = write_snapshot_with_entries(temp.path(), "global", ENTRIES_FROM_1_8_0);
+        let generation = write_1_8_0_snapshot(temp.path(), "global");
         let path = snapshot_root(temp.path(), "global")
             .join("generations")
             .join(format!("{generation}.json"));

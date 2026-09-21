@@ -50,3 +50,30 @@ body's `[^x]` resolved to the wrong source — exactly the failure this code exi
 A footnote whose label matches no source is left as the model wrote it. No failure of that kind has been
 observed, and inventing a repair for it would be guessing at the model's intent.
 
+## Snapshot identity (added after the Rust audit)
+
+`commit_prompt_snapshot` takes the generation over the **compact** serialisation of the entries and then
+writes the file **pretty-printed**. `read_prompt_snapshot` used to check identity by deserialising the
+entries, re-serialising them compact, and hashing that. It worked only while `WikiEntry` serialised exactly
+as it had when the snapshot was written. This change altered `sources` and added `generated_by`, and every
+non-empty 1.8.0 snapshot stopped validating: `pk context` returned nothing for that scope until something
+re-committed. Reproduced on a real global snapshot — 1.8.0: 4 candidates; this branch: 0 and a validation
+failure. The change's own 136 tests did not catch it, and its evidence could not: the sandbox copied only
+the wiki root, so no 1.8.0 snapshot was ever read.
+
+The fix verifies what is stored. The entries are kept as raw text (`serde_json::value::RawValue`, which is
+why the `raw_value` feature is now on), compacted, and hashed; only then are they parsed. The first plan
+was to hash the stored bytes directly, and reading the writer showed why that cannot work: the stored bytes
+are pretty-printed and were never what was hashed. Going through `serde_json::Value` would not work either,
+because without `preserve_order` it sorts keys. `serde_json`'s pretty printer formats scalars identically
+and only adds whitespace between tokens, so removing whitespace outside strings reproduces the compact bytes
+exactly; a test pins that against `serde_json` itself.
+
+A bump of `schemaVersion` with a "stale, regenerate" error was the alternative. It was not chosen because it
+turns a silent empty result into a loud one without fixing it: retrieval would still be empty until a
+re-commit, on every machine, for a change that does not alter what a snapshot means.
+
+One thing the test fixture taught: building the fixture file through `serde_json::json!` sorted each entry's
+keys, so the stored entries no longer matched the text that had been hashed and the test failed for a reason
+of its own. The fixture is two fixed constants — what was hashed and what was stored — and neither is derived
+from the other by the code under test, which would have let a broken `compact_json` agree with itself.

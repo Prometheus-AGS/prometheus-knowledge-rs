@@ -63,6 +63,21 @@ The bundle-root `index.md` SHALL begin with a frontmatter block containing only 
 - **WHEN** the index pk renders is passed to pk's own index structure check, for an empty and a non-empty wiki
 - **THEN** the check reports nothing
 
+### Requirement: A change to how an entry serialises does not invalidate stored snapshots
+`read_prompt_snapshot` SHALL verify a snapshot's generation and byte count against the entries as they are stored in the file, and SHALL NOT derive them by re-serialising the deserialised entries.
+
+#### Scenario: A snapshot written by 1.8.0 still validates
+- **WHEN** a snapshot whose entries carry string-form `sources` and no `generated_by` key, with the generation 1.8.0 computed for it, is read by 1.9.0
+- **THEN** it validates, its entries load with each string source as a `resource`, and `pk context` returns the same candidates 1.8.0 returned
+
+#### Scenario: Stored entries that differ from what was hashed are still refused
+- **WHEN** one character inside a stored entry is changed
+- **THEN** the snapshot fails identity validation
+
+#### Scenario: Formatting is not content, and content is not formatting
+- **WHEN** pretty-printed JSON containing strings with runs of spaces, an escaped quote, a backslash and an escaped newline is compacted
+- **THEN** the result equals `serde_json`'s compact serialisation of the same value, byte for byte
+
 ### Requirement: The behaviour holds on every platform pk builds for
 Every scenario above SHALL pass on `ubuntu-latest`, `macos-latest` and `windows-latest`, and a CRLF document SHALL parse to the same sources and the same `generated` as its LF twin.
 
