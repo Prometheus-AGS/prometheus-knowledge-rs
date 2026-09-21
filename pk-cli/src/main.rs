@@ -1212,9 +1212,31 @@ struct DoctorSummary {
     failed: usize,
 }
 
-fn run_doctor(json_output: bool, project_kb: &Path) -> Result<()> {
+/// Whether the hooks log is readable by its owner only.
+///
+/// POSIX mode bits are the only thing this inspects, so it is compiled for unix alone; the
+/// non-unix twin below keeps `run_doctor` building on Windows, where `std::os::unix` does not
+/// exist and an unguarded import is a hard compile error for the whole `pk` binary.
+#[cfg(unix)]
+fn hook_log_is_private(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o777 == 0o600
+}
 
+/// Windows has no POSIX mode bits and its ACLs are not inspected here, so the check cannot be
+/// made. Existence is all that can be reported; `HOOK_LOG_REQUIREMENT` says so in the output
+/// rather than implying a mode was verified.
+#[cfg(not(unix))]
+fn hook_log_is_private(_metadata: &fs::Metadata) -> bool {
+    true
+}
+
+#[cfg(unix)]
+const HOOK_LOG_REQUIREMENT: &str = "required mode 0600";
+#[cfg(not(unix))]
+const HOOK_LOG_REQUIREMENT: &str = "present; POSIX mode check not applicable on this platform";
+
+fn run_doctor(json_output: bool, project_kb: &Path) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let plugin_root = std::env::var_os("PROMETHEUS_PLUGIN_ROOT")
         .map(PathBuf::from)
@@ -1223,7 +1245,7 @@ fn run_doctor(json_output: bool, project_kb: &Path) -> Result<()> {
     let hook_status = fs::metadata(&hook_log)
         .ok()
         .filter(|metadata| metadata.is_file())
-        .map(|metadata| metadata.permissions().mode() & 0o777 == 0o600)
+        .map(|metadata| hook_log_is_private(&metadata))
         .unwrap_or(false);
     let active_generation = active_plugin_generation(&plugin_root);
     let stable_scripts = [
@@ -1290,7 +1312,7 @@ fn run_doctor(json_output: bool, project_kb: &Path) -> Result<()> {
         DoctorCheck {
             name: "hooks-log-path",
             status: if hook_status { "PASS" } else { "FAIL" },
-            detail: format!("{} (required mode 0600)", hook_log.display()),
+            detail: format!("{} ({HOOK_LOG_REQUIREMENT})", hook_log.display()),
         },
         DoctorCheck {
             name: "plugin-generation",

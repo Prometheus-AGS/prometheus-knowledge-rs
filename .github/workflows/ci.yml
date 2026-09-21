@@ -1,0 +1,56 @@
+# CI for prometheus-knowledge-rs.
+#
+# This repository had no CI, so nothing had ever compiled it on Windows — and `pk` did not:
+# `run_doctor` imported `std::os::unix` without a cfg guard, which is a hard compile error for the
+# whole binary on x86_64-pc-windows-msvc. The three-OS matrix exists so that class of break is
+# caught by a machine instead of by the first Windows user.
+#
+# Build and test are separate steps on purpose. "Does it compile on Windows" and "do the tests
+# pass on Windows" are different questions, and the first must stay answerable when the second
+# is not.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup ships on every GitHub-hosted runner; no third-party toolchain action needed.
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update
+
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Build the workspace
+        run: cargo build --workspace --locked
+
+      # Proves the binary runs, not merely that it links.
+      - name: pk --version
+        run: cargo run --locked -p pk-cli -- --version
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
