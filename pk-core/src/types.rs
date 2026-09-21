@@ -102,6 +102,83 @@ impl From<&str> for ArticleId {
 }
 
 // ---------------------------------------------------------------------------
+// Source — OKF v0.2 §5.1. A mapping with a required `resource`, an optional
+// `id` (the footnote label claims are attributed by), and whatever other keys
+// the producer wrote: `title`, and the credibility signals `author`,
+// `usage_count` and `last_modified`. Those are kept in `extra` so a read
+// followed by a write loses nothing.
+//
+// pk held sources as strings before v0.2, so a bare string is still accepted
+// on read — from YAML frontmatter and from JSON alike — as `{ resource }`.
+// It is never written back as a string.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Source {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub resource: String,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_yaml::Value>,
+}
+
+impl Source {
+    pub fn new(resource: impl Into<String>) -> Self {
+        Self {
+            id: None,
+            resource: resource.into(),
+            extra: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+impl From<String> for Source {
+    fn from(resource: String) -> Self {
+        Self::new(resource)
+    }
+}
+
+impl From<&str> for Source {
+    fn from(resource: &str) -> Self {
+        Self::new(resource)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SourceRepr {
+    Text(String),
+    Mapping(std::collections::BTreeMap<String, serde_yaml::Value>),
+}
+
+impl<'de> Deserialize<'de> for Source {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        let mut extra = match SourceRepr::deserialize(deserializer)? {
+            SourceRepr::Text(resource) => return Ok(Self::new(resource)),
+            SourceRepr::Mapping(mapping) => mapping,
+        };
+        // An untagged enum reports only "did not match any variant"; name the key.
+        let resource = match extra.remove("resource") {
+            Some(serde_yaml::Value::String(resource)) => resource,
+            Some(_) => return Err(D::Error::custom("source `resource` must be a string")),
+            None => return Err(D::Error::missing_field("resource")),
+        };
+        let id = match extra.remove("id") {
+            Some(serde_yaml::Value::String(id)) => Some(id),
+            Some(_) => return Err(D::Error::custom("source `id` must be a string")),
+            None => None,
+        };
+        Ok(Self {
+            id,
+            resource,
+            extra,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WikiEntry — a compiled, structured knowledge article maintained by the
 // Librarian. Stored as a Markdown file with YAML frontmatter.
 // ---------------------------------------------------------------------------
@@ -121,7 +198,7 @@ pub struct WikiEntry {
     pub links: Vec<ArticleId>,
 
     /// Where this knowledge came from (file path, URL, agent session ID, etc.)
-    pub sources: Vec<String>,
+    pub sources: Vec<Source>,
 
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -173,7 +250,7 @@ impl WikiEntry {
         self
     }
 
-    pub fn with_sources(mut self, sources: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    pub fn with_sources(mut self, sources: impl IntoIterator<Item = impl Into<Source>>) -> Self {
         self.sources = sources.into_iter().map(|s| s.into()).collect();
         self
     }

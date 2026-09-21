@@ -138,7 +138,7 @@ fn wiki_entry_builder_roundtrip() {
     assert_eq!(entry.title, "TurboQuant KV Compression");
     assert_eq!(entry.id, ArticleId::from_slug("TurboQuant KV Compression"));
     assert_eq!(entry.tags, vec!["rust", "turboquant", "kv-cache"]);
-    assert_eq!(entry.sources, vec!["session:2026-04-10"]);
+    assert_eq!(entry.sources, vec![Source::from("session:2026-04-10")]);
     assert_eq!(entry.revision, 0);
     assert!(entry.links.is_empty());
 }
