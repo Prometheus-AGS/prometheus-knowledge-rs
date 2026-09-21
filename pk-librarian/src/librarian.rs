@@ -620,6 +620,47 @@ mod tests {
         assert_eq!(ids, vec!["doc-2", "Doc", "Doc-3"]);
     }
 
+    // `notes.md`, `session:abc` and `a/b` are valid markdown footnote labels. When
+    // pk rewrote them it left the body's `[^notes.md]` alone, so pk itself broke a
+    // citation the model had got right.
+    #[test]
+    fn a_valid_footnote_label_with_punctuation_is_kept_verbatim() {
+        for label in ["notes.md", "session:abc", "a/b", "rfc9110.s3"] {
+            let response = format!(
+                r#"{{"title":"T","content":"Claim.[^{label}]\n\n[^{label}]: src","sources":[{{"id":"{label}","resource":"somewhere"}}]}}"#
+            );
+
+            let entry = parse_compile_response(&response).unwrap();
+
+            assert_eq!(entry.sources[0].id.as_deref(), Some(label));
+            assert_eq!(footnote_labels(&entry.content), vec![label.to_owned()]);
+        }
+    }
+
+    #[test]
+    fn a_label_that_would_break_the_footnote_syntax_is_still_replaced() {
+        for label in [
+            "has space",
+            "close]bracket",
+            "open[bracket",
+            "care^t",
+            "tab\\there",
+            "",
+        ] {
+            let response = format!(
+                r#"{{"title":"T","content":"body","sources":[{{"id":"{label}","resource":"notes/a.md"}}]}}"#
+            );
+
+            let entry = parse_compile_response(&response).unwrap();
+
+            assert_eq!(
+                entry.sources[0].id.as_deref(),
+                Some("notes-a-md"),
+                "{label:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_source_with_nothing_to_derive_a_label_from_still_gets_one() {
         let response = r#"{"title":"T","content":"body","sources":["///"]}"#;
