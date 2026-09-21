@@ -2,11 +2,11 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     net::TcpListener,
     process::Command,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[test]
@@ -51,8 +51,26 @@ fn accepts_a_valid_receipt_after_the_previous_ten_second_ceiling() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let receipt_hash = payload_hash.clone();
+    // accept() with a deadline: a worker that exits without connecting must fail
+    // this test, not hang it. A blocking accept() did exactly that on Windows CI.
+    listener.set_nonblocking(true).unwrap();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the worker never connected to the memory server"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        };
+        // An accepted socket inherits non-blocking mode on Windows and the BSDs.
+        stream.set_nonblocking(false).unwrap();
         let mut request = [0_u8; 4096];
         let count = stream.read(&mut request).unwrap();
         let request = String::from_utf8_lossy(&request[..count]);
@@ -93,13 +111,14 @@ fn accepts_a_valid_receipt_after_the_previous_ten_second_ceiling() {
         .args(["--memory-url", &format!("http://{address}"), "run-once"])
         .output()
         .unwrap();
-    server.join().unwrap();
 
+    // Before the join, so a failed worker reports its stderr rather than a timeout.
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    server.join().unwrap();
     assert!(queue
         .join("memory/completed")
         .join(format!("{operation_id}.json"))
