@@ -284,11 +284,16 @@ fn semantic_batch_failure(batch_index: usize, error: &PkError) -> LintReport {
 }
 
 /// Whether `label` can be written as a markdown footnote label, `[^label]`.
+///
+/// Only what would break the syntax is refused: whitespace, `[`, `]` and `^`.
+/// `notes.md`, `session:abc` and `a/b` are valid labels, and refusing them made
+/// pk rewrite an id the body had already cited with — pk breaking a citation the
+/// model had got right.
 fn is_footnote_label(label: &str) -> bool {
     !label.is_empty()
-        && label
+        && !label
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            .any(|c| c.is_whitespace() || matches!(c, '[' | ']' | '^'))
 }
 
 /// Give every source an id that is unique within the entry (OKF v0.2 §5.1: the

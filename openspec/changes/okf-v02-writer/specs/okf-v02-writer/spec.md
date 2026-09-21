@@ -63,6 +63,10 @@ The compile prompt SHALL ask for `[^id]` footnotes whose labels are `sources[].i
 - **WHEN** a compile response lists two sources whose text reduces to the same slug
 - **THEN** the entry's two sources have different `id` values, and each footnote label in the body matches exactly one of them
 
+#### Scenario: A valid label is never rewritten
+- **WHEN** the model labels a source `notes.md`, `session:abc` or `a/b` and cites with it
+- **THEN** the id is kept exactly, and the body's footnote still matches it; only a label containing whitespace, `[`, `]` or `^`, or an empty one, is replaced
+
 #### Scenario: Nothing pk invents takes a label the model chose
 - **WHEN** the sources are labelled `x`, `x`, `x-2` and the body cites `[^x-2]`, or an unlabelled source that would derive `x` precedes a source labelled `x`
 - **THEN** the source the model labelled keeps its label, and the repeat or the derived label takes the next free one
