@@ -14,8 +14,8 @@ Test-first throughout. Cheap checks while implementing (`cargo check -p <crate>`
 
 ## 3. Citations
 
-- [ ] 3.1 In `pk-librarian` tests: the compile system prompt does not contain `Citations`; two sources reducing to one slug get distinct ids; every `[^label]` in a compiled body matches one source id.
-- [ ] 3.2 Update `pk-librarian/src/prompts.rs` and the id derivation in `pk-librarian/src/librarian.rs`.
+- [x] 3.1 In `pk-librarian` tests: the compile system prompt does not contain `Citations`; two sources reducing to one slug get distinct ids; every `[^label]` in a compiled body matches one source id.
+- [x] 3.2 Update `pk-librarian/src/prompts.rs` and the id derivation in `pk-librarian/src/librarian.rs`.
 
 ## 4. The root index
 

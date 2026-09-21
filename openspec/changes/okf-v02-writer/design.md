@@ -27,12 +27,26 @@ pk is not always the author: the librarian compiles with a model, and a human ma
 
 ## Footnote ids
 
-The compile response is JSON from the model with `sources: [String]` (`librarian.rs:296`). pk derives each `id` as a slug of the source text, and disambiguates a collision with a numeric suffix, because §5.1's footnote join is by label and a duplicate label misattributes silently. The prompt tells the model which ids exist rather than letting it invent them.
+The compile response is JSON from the model (`librarian.rs`, `parse_compile_response`). §5.1's footnote
+join is by label, and a duplicate label misattributes silently, so every source gets an id unique within
+the entry.
 
-## Compatibility
+**The model chooses the labels; pk does not re-derive them.** An earlier draft of this section had pk slug
+every id from the source text and "tell the model which ids exist". That cannot work: the model *discovers*
+the sources, so pk has nothing to tell it in advance, and re-deriving a label the model already cited with
+(`ga4_schema` → `ga4-schema`) would leave the body's `[^ga4_schema]` matching nothing. So the prompt asks
+for `{id, resource}` objects and footnotes that use those ids, and pk:
 
-A v0.1 knowledge base is read as-is. Nothing is migrated in bulk: an entry is rewritten in v0.2 form on its next upsert. A KB therefore holds a mix for a while, which v0.2 consumers must tolerate by §13 and pk's own reader does.
+1. keeps a label verbatim when it can be a footnote label (ASCII letters, digits, `-`, `_`);
+2. derives one from `resource` only when the label is missing or unusable — a bare-string source from a
+   model that ignored the schema still parses, because `Source` reads both shapes;
+3. de-duplicates with `-2`, `-3`…, the first keeping the label.
 
-## Risk
+Step 1 runs as a pass of its own **before** step 2. Found by reasoning about orderings the first tests did
+not cover, then reproduced with a failing test: in a single pass, a label derived for an *uncited* source
+earlier in the list took `x`, the source the model had labelled `x` and cited became `x-2`, and the
+body's `[^x]` resolved to the wrong source — exactly the failure this code exists to prevent.
 
-`extra` is a flattened catch-all on `Frontmatter`. Adding a typed `generated` field changes which keys land in `extra`; a document that already carries `generated` as an unknown key today must not end up with it twice. A round-trip test on such a document guards this.
+A footnote whose label matches no source is left as the model wrote it. No failure of that kind has been
+observed, and inventing a repair for it would be guessing at the model's intent.
+

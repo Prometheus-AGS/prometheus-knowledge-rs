@@ -9,7 +9,7 @@ use crate::{
 };
 use pk_core::{
     error::{PkError, PkResult},
-    types::{ArticleId, LintReport, LintSeverity, RawDoc, WikiEntry},
+    types::{ArticleId, LintReport, LintSeverity, RawDoc, Source, WikiEntry},
     LibrarianEvent,
 };
 use pk_store::MarkdownStore;
@@ -283,6 +283,73 @@ fn semantic_batch_failure(batch_index: usize, error: &PkError) -> LintReport {
     }
 }
 
+/// Whether `label` can be written as a markdown footnote label, `[^label]`.
+fn is_footnote_label(label: &str) -> bool {
+    !label.is_empty()
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Give every source an id that is unique within the entry (OKF v0.2 §5.1: the
+/// footnote join is by label, so a duplicate misattributes silently).
+///
+/// The model discovers the sources and cites with labels of its own choosing,
+/// so a usable label is kept exactly as given — re-deriving it would leave the
+/// footnote in the body matching nothing. Those labels are reserved **first**,
+/// in a pass of their own: otherwise a label derived for an uncited source
+/// earlier in the list could take the one a later source was cited with, and
+/// the footnote would resolve to the wrong source. A label is derived from
+/// `resource` only when it is missing or cannot be a footnote. A repeat gets
+/// `-2`, `-3`…; the first keeps the label.
+fn with_unique_ids(sources: Vec<Source>) -> Vec<Source> {
+    fn free_label(base: &str, taken: &[String]) -> String {
+        (1..)
+            .map(|n| {
+                if n == 1 {
+                    base.to_owned()
+                } else {
+                    format!("{base}-{n}")
+                }
+            })
+            .find(|candidate| !taken.contains(candidate))
+            .expect("an unbounded range always yields a free label")
+    }
+
+    let mut taken: Vec<String> = Vec::new();
+    let chosen: Vec<Option<String>> = sources
+        .iter()
+        .map(|source| {
+            let label = source.id.as_deref().filter(|l| is_footnote_label(l))?;
+            let id = free_label(label, &taken);
+            taken.push(id.clone());
+            Some(id)
+        })
+        .collect();
+
+    sources
+        .into_iter()
+        .zip(chosen)
+        .map(|(source, chosen)| {
+            let id = chosen.unwrap_or_else(|| {
+                let derived = ArticleId::from_slug(&source.resource).0;
+                let base = if is_footnote_label(&derived) {
+                    derived.as_str()
+                } else {
+                    "source"
+                };
+                let id = free_label(base, &taken);
+                taken.push(id.clone());
+                id
+            });
+            Source {
+                id: Some(id),
+                ..source
+            }
+        })
+        .collect()
+}
+
 fn parse_compile_response(raw: &str) -> PkResult<WikiEntry> {
     #[derive(serde::Deserialize)]
     struct CompileOutput {
@@ -292,15 +359,17 @@ fn parse_compile_response(raw: &str) -> PkResult<WikiEntry> {
         tags: Vec<String>,
         #[serde(default)]
         links: Vec<String>,
+        // A mapping `{id, resource}` as the prompt asks, or a bare string from a
+        // model that ignored it: `Source` reads both.
         #[serde(default)]
-        sources: Vec<String>,
+        sources: Vec<Source>,
     }
 
     let out: CompileOutput = parse_json(raw).map_err(|e| PkError::llm(e.to_string()))?;
 
     let entry = WikiEntry::new(out.title, out.content)
         .with_tags(out.tags)
-        .with_sources(out.sources);
+        .with_sources(with_unique_ids(out.sources));
 
     let mut entry = entry;
     // Link graph is derived from bundle-relative links the model embedded in
@@ -458,6 +527,23 @@ mod tests {
         for label in footnote_labels(&entry.content) {
             assert_eq!(ids.iter().filter(|id| **id == label).count(), 1, "{label}");
         }
+    }
+
+    // Order must not decide attribution: a label derived for an uncited source
+    // may not take the one the model chose, and cited with, further down the list.
+    #[test]
+    fn a_derived_label_never_displaces_one_the_model_cited_with() {
+        let response = r#"{"title":"T","content":"Claim.[^x]\n\n[^x]: the cited one","sources":["x",{"id":"x","resource":"the-cited-source"}]}"#;
+
+        let entry = parse_compile_response(response).unwrap();
+        let cited = entry
+            .sources
+            .iter()
+            .find(|s| s.id.as_deref() == Some("x"))
+            .unwrap();
+
+        assert_eq!(cited.resource, "the-cited-source");
+        assert_eq!(entry.sources[0].id.as_deref(), Some("x-2"));
     }
 
     #[test]
