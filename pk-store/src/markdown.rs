@@ -1,6 +1,6 @@
 use pk_core::{
     error::{PkError, PkResult},
-    types::{ArticleId, WikiEntry},
+    types::{ArticleId, Source, WikiEntry},
 };
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -41,7 +41,7 @@ struct Frontmatter {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     links: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    sources: Vec<String>,
+    sources: Vec<Source>,
     /// OKF §4.1 `timestamp` — mirrors pk's `updated_at` when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timestamp: Option<String>,
