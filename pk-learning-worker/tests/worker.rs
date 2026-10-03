@@ -511,7 +511,8 @@ fn quarantine_dry_run_is_read_only_and_quarantine_release_round_trips() {
     assert_eq!(released["payloadHash"], original["payloadHash"]);
     assert_eq!(released["arguments"], original["arguments"]);
     assert_eq!(released["firstAcceptedAt"], original["firstAcceptedAt"]);
-    assert_eq!(released["unchangedPolls"], 0);
+    // Zero is omitted from the record, like every unset bookkeeping field.
+    assert_eq!(released["unchangedPolls"].as_u64().unwrap_or(0), 0);
     assert!(released["nextPollAt"].is_null());
     // The stale clock restarts, so the record gets a full window to deliver.
     let report = stdout_json(&succeed(&home, &["status", "--json"]));

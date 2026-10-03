@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, TimeDelta, Utc};
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
 use pk_core::WikiEntry;
@@ -19,6 +19,11 @@ use std::{
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MEMORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// First wait before re-polling an accepted operation whose receipt did not change.
+const POLL_BACKOFF_BASE_SECONDS: u64 = 60;
+/// Longest wait between polls, so a stranded operation still recovers within an
+/// hour of the server finishing it.
+const POLL_BACKOFF_CAP_SECONDS: u64 = 3_600;
 
 #[derive(Debug, Parser)]
 #[command(name = "prometheus-learning-worker", version)]
@@ -31,6 +36,15 @@ struct Cli {
         default_value = "http://127.0.0.1:23001"
     )]
     memory_url: String,
+    /// How long an accepted memory operation may go without receipt progress
+    /// before it counts as stale (`<n>s|m|h|d`).
+    #[arg(
+        long,
+        env = "PROMETHEUS_LEARNING_STALE_AFTER",
+        default_value = "6h",
+        value_parser = parse_duration
+    )]
+    stale_after: Duration,
     #[command(subcommand)]
     command: Option<WorkerCommand>,
 }
@@ -41,6 +55,29 @@ enum WorkerCommand {
     RunOnce,
     /// Print the current worker and queue state.
     Status {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Move stale accepted memory operations to `memory/stalled`, out of the
+    /// redelivery loop, and record them in a manifest.
+    Quarantine {
+        /// Staleness threshold for this command; defaults to `--stale-after`.
+        #[arg(long, value_parser = parse_duration)]
+        older_than: Option<Duration>,
+        /// List the operations that would move and change nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Return stalled memory operations to the redelivery loop.
+    Release {
+        /// Release every stalled operation.
+        #[arg(long, default_value_t = false, conflicts_with = "operation_ids")]
+        all: bool,
+        /// Operation ids to release.
+        #[arg(required_unless_present = "all")]
+        operation_ids: Vec<String>,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -90,6 +127,38 @@ struct MemoryOperation {
     last_error: Option<String>,
     #[serde(default)]
     receipt: Option<OperationReceipt>,
+    /// When the server first accepted the operation, from its receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_accepted_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_receipt_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_receipt_progress_seq: Option<u64>,
+    /// When the receipt state or progress sequence last changed. Staleness is
+    /// measured from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_receipt_change_at: Option<String>,
+    /// Consecutive polls that returned an unchanged receipt.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    unchanged_polls: u32,
+    /// Earliest time an unchanged accepted operation is polled again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_poll_at: Option<String>,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
+/// What a receipt did to a local operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptOutcome {
+    /// The operation moved to a new local state (accepted, completed, rejected).
+    Transitioned,
+    /// Still accepted, but the server reported progress.
+    Progressed,
+    /// Still accepted, and the receipt is the same as last time.
+    Unchanged,
 }
 
 fn default_delivery_state() -> String {
@@ -121,8 +190,19 @@ struct RunSummary {
     completed_at: String,
     jobs_completed: usize,
     jobs_rejected: usize,
+    /// Operations that moved to a new local state during this run.
     memory_delivered: usize,
+    /// Operations polled this run whose receipt is still non-terminal.
+    memory_in_flight: usize,
+    /// Accepted operations skipped this run because they are backing off.
+    memory_deferred: usize,
     memory_awaiting_reconciliation: usize,
+    /// Accepted operations with no receipt progress for longer than the threshold.
+    memory_stale: usize,
+    /// Operations quarantined in `memory/stalled`.
+    memory_stalled: usize,
+    oldest_accepted_age_seconds: Option<i64>,
+    stale_after_seconds: u64,
     last_error: Option<String>,
 }
 
@@ -142,8 +222,36 @@ struct QueueStatus {
     memory_accepted: usize,
     memory_rejected: usize,
     memory_completed: usize,
+    /// Quarantined operations. Kept apart from the unhealthy counts.
+    memory_stalled: usize,
+    memory_stale: usize,
+    oldest_accepted_age_seconds: Option<i64>,
+    stale_after_seconds: u64,
     ambiguous_delivery: usize,
     last_run: Option<Value>,
+}
+
+/// One operation moved (or, in a dry run, selected) by `quarantine` or `release`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManifestEntry {
+    operation_id: String,
+    from: String,
+    to: String,
+    last_receipt_state: Option<String>,
+    stale_since: Option<String>,
+    stale_seconds: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Manifest {
+    schema_version: u32,
+    action: &'static str,
+    created_at: String,
+    dry_run: bool,
+    older_than_seconds: Option<u64>,
+    operations: Vec<ManifestEntry>,
 }
 
 #[tokio::main]
@@ -157,8 +265,30 @@ async fn main() -> Result<()> {
     ensure_layout(&queue_root)?;
 
     match cli.command.unwrap_or(WorkerCommand::RunOnce) {
-        WorkerCommand::RunOnce => run_once(&queue_root, &cli.memory_url).await,
-        WorkerCommand::Status { json } => print_status(&queue_root, json),
+        WorkerCommand::RunOnce => run_once(&queue_root, &cli.memory_url, cli.stale_after).await,
+        WorkerCommand::Status { json } => print_status(&queue_root, cli.stale_after, json),
+        WorkerCommand::Quarantine {
+            older_than,
+            dry_run,
+            json,
+        } => {
+            let manifest = quarantine(
+                &queue_root,
+                older_than.unwrap_or(cli.stale_after),
+                dry_run,
+                Utc::now(),
+            )?;
+            print_manifest(&manifest, json)
+        }
+        WorkerCommand::Release {
+            all,
+            operation_ids,
+            json,
+        } => {
+            let selection = (!all).then_some(operation_ids.as_slice());
+            let manifest = release(&queue_root, selection, Utc::now())?;
+            print_manifest(&manifest, json)
+        }
     }
 }
 
@@ -186,6 +316,8 @@ fn ensure_layout(root: &Path) -> Result<()> {
         "memory/completed",
         "memory/rejected",
         "memory/dead-letter",
+        "memory/stalled",
+        "memory/manifests",
     ] {
         fs::create_dir_all(root.join(directory))?;
         harden_directory(&root.join(directory))?;
@@ -193,7 +325,8 @@ fn ensure_layout(root: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn run_once(root: &Path, memory_url: &str) -> Result<()> {
+/// Take the queue lock, or return `None` when another worker holds it.
+fn try_worker_lock(root: &Path) -> Result<Option<File>> {
     let lock_path = root.join("worker.lock");
     let lock = OpenOptions::new()
         .create(true)
@@ -203,8 +336,15 @@ async fn run_once(root: &Path, memory_url: &str) -> Result<()> {
         .open(&lock_path)?;
     harden_file(&lock_path)?;
     if lock.try_lock_exclusive().is_err() {
-        return Ok(());
+        return Ok(None);
     }
+    Ok(Some(lock))
+}
+
+async fn run_once(root: &Path, memory_url: &str, stale_after: Duration) -> Result<()> {
+    let Some(lock) = try_worker_lock(root)? else {
+        return Ok(());
+    };
 
     recover_processing(root)?;
     migrate_legacy_job_retry(root)?;
@@ -241,8 +381,16 @@ async fn run_once(root: &Path, memory_url: &str) -> Result<()> {
         ["memory/submitting", "memory/accepted", "memory/pending"]
     {
         for path in json_files(&root.join(directory))? {
-            match reconcile_memory(root, &path, memory_url, &client).await {
-                Ok(()) => summary.memory_delivered += 1,
+            let now = Utc::now();
+            if directory == "memory/accepted" && poll_deferred(&path, now) {
+                summary.memory_deferred += 1;
+                continue;
+            }
+            match reconcile_memory(root, &path, memory_url, &client, now).await {
+                Ok(ReceiptOutcome::Transitioned) => summary.memory_delivered += 1,
+                Ok(ReceiptOutcome::Progressed | ReceiptOutcome::Unchanged) => {
+                    summary.memory_in_flight += 1
+                }
                 Err(error) => {
                     summary.last_error = Some(error.to_string());
                     record_memory_error(root, &path, &error.to_string())?;
@@ -254,7 +402,13 @@ async fn run_once(root: &Path, memory_url: &str) -> Result<()> {
             }
         }
     }
-    summary.completed_at = Utc::now().to_rfc3339();
+    let now = Utc::now();
+    let health = accepted_health(root, now, stale_after)?;
+    summary.memory_stale = health.stale;
+    summary.oldest_accepted_age_seconds = health.oldest_age_seconds;
+    summary.memory_stalled = json_files(&root.join("memory/stalled"))?.len();
+    summary.stale_after_seconds = stale_after.as_secs();
+    summary.completed_at = now.to_rfc3339();
     atomic_json(&root.join("status.json"), &summary)?;
     lock.unlock()?;
     Ok(())
@@ -581,6 +735,12 @@ fn enqueue_memory(root: &Path, job: &LearningJob, packet: &str) -> Result<()> {
         queued_at: Utc::now().to_rfc3339(),
         last_error: None,
         receipt: None,
+        first_accepted_at: None,
+        last_receipt_state: None,
+        last_receipt_progress_seq: None,
+        last_receipt_change_at: None,
+        unchanged_polls: 0,
+        next_poll_at: None,
     };
     let filename = format!("{}.json", operation.operation_id);
     let path = root.join("memory/pending").join(&filename);
@@ -595,7 +755,8 @@ async fn reconcile_memory(
     path: &Path,
     memory_url: &str,
     client: &reqwest::Client,
-) -> Result<()> {
+    now: DateTime<Utc>,
+) -> Result<ReceiptOutcome> {
     let mut current_path = path.to_path_buf();
     let mut operation = read_operation(&current_path)?;
     if operation.state == "pending" {
@@ -628,7 +789,7 @@ async fn reconcile_memory(
             bounded_error(&response.text().await.unwrap_or_default())
         );
     };
-    apply_receipt(root, &current_path, &mut operation, receipt)
+    apply_receipt(root, &current_path, &mut operation, receipt, now)
 }
 
 async fn ensure_ledger_ready(memory_url: &str, client: &reqwest::Client) -> Result<()> {
@@ -689,7 +850,8 @@ fn apply_receipt(
     path: &Path,
     operation: &mut MemoryOperation,
     receipt: OperationReceipt,
-) -> Result<()> {
+    now: DateTime<Utc>,
+) -> Result<ReceiptOutcome> {
     let expected_hash = operation
         .payload_hash
         .as_deref()
@@ -702,6 +864,8 @@ fn apply_receipt(
     {
         anyhow::bail!("receipt contract, identity, or payload hash does not match local operation");
     }
+    let previous_state = operation.state.clone();
+    let receipt_changed = observe_receipt(operation, &receipt, now);
     operation.receipt = Some(receipt.clone());
     operation.last_error = receipt.error.clone();
     let destination = match receipt.state.as_str() {
@@ -735,6 +899,332 @@ fn apply_receipt(
             durable_rename(path, &target)?;
         }
     }
+    Ok(if operation.state != previous_state {
+        ReceiptOutcome::Transitioned
+    } else if receipt_changed {
+        ReceiptOutcome::Progressed
+    } else {
+        ReceiptOutcome::Unchanged
+    })
+}
+
+/// Record a receipt in the operation's bookkeeping and schedule the next poll.
+/// Returns whether the receipt state or progress sequence changed.
+///
+/// A record with no bookkeeping (written by an older worker) takes its clocks
+/// from the server's receipt timestamps rather than from `now`. Otherwise an
+/// operation stranded for days would get a fresh staleness window on upgrade.
+fn observe_receipt(
+    operation: &mut MemoryOperation,
+    receipt: &OperationReceipt,
+    now: DateTime<Utc>,
+) -> bool {
+    let server_time = |raw: &str| {
+        parse_time(raw)
+            .map_or(now, |time| time.min(now))
+            .to_rfc3339()
+    };
+    if operation.first_accepted_at.is_none() {
+        operation.first_accepted_at = Some(server_time(&receipt.created_at));
+    }
+    let first_observation = operation.last_receipt_state.is_none();
+    let changed = operation.last_receipt_state.as_deref() != Some(receipt.state.as_str())
+        || operation.last_receipt_progress_seq != Some(receipt.progress_seq);
+    if changed {
+        operation.last_receipt_change_at = Some(if first_observation {
+            server_time(&receipt.updated_at)
+        } else {
+            now.to_rfc3339()
+        });
+        operation.last_receipt_state = Some(receipt.state.clone());
+        operation.last_receipt_progress_seq = Some(receipt.progress_seq);
+        operation.unchanged_polls = 0;
+        operation.next_poll_at = None;
+    } else {
+        operation.unchanged_polls = operation.unchanged_polls.saturating_add(1);
+        operation.next_poll_at = Some((now + poll_backoff(operation.unchanged_polls)).to_rfc3339());
+    }
+    changed
+}
+
+/// Exponential backoff for unchanged receipts: 1m, 2m, 4m, ... capped at 1h.
+fn poll_backoff(unchanged_polls: u32) -> TimeDelta {
+    let doublings = unchanged_polls.saturating_sub(1).min(16);
+    let seconds = POLL_BACKOFF_BASE_SECONDS
+        .saturating_mul(1_u64 << doublings)
+        .min(POLL_BACKOFF_CAP_SECONDS);
+    TimeDelta::seconds(i64::try_from(seconds).unwrap_or(i64::MAX))
+}
+
+/// An accepted operation is skipped while its backoff window is open.
+fn poll_deferred(path: &Path, now: DateTime<Utc>) -> bool {
+    read_operation(path)
+        .ok()
+        .and_then(|operation| operation.next_poll_at)
+        .and_then(|raw| parse_time(&raw))
+        .is_some_and(|next_poll| next_poll > now)
+}
+
+fn parse_time(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|time| time.with_timezone(&Utc))
+}
+
+fn to_time_delta(duration: Duration) -> TimeDelta {
+    TimeDelta::from_std(duration).unwrap_or(TimeDelta::MAX)
+}
+
+/// Parse `<n>s`, `<n>m`, `<n>h`, or `<n>d`.
+fn parse_duration(raw: &str) -> std::result::Result<Duration, String> {
+    let raw = raw.trim();
+    let split = raw
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(raw.len());
+    let (digits, unit) = raw.split_at(split);
+    let expected = || format!("invalid duration {raw:?}: expected <number><s|m|h|d>, e.g. 6h");
+    let value: u64 = digits.parse().map_err(|_| expected())?;
+    let unit_seconds = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        _ => return Err(expected()),
+    };
+    value
+        .checked_mul(unit_seconds)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("duration {raw:?} is too large"))
+}
+
+/// When an operation's staleness clock started: the last receipt change, else
+/// first acceptance, else when it was queued.
+fn stale_since(operation: &MemoryOperation) -> Option<DateTime<Utc>> {
+    operation
+        .last_receipt_change_at
+        .as_deref()
+        .or(operation.first_accepted_at.as_deref())
+        .and_then(parse_time)
+        .or_else(|| parse_time(&operation.queued_at))
+}
+
+fn is_stale(operation: &MemoryOperation, now: DateTime<Utc>, threshold: Duration) -> bool {
+    stale_since(operation)
+        .is_some_and(|since| now.signed_duration_since(since) > to_time_delta(threshold))
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AcceptedHealth {
+    stale: usize,
+    oldest_age_seconds: Option<i64>,
+}
+
+/// Count stale accepted operations and the age of the oldest one. Unreadable
+/// records are skipped here; reconciliation reports them.
+fn accepted_health(root: &Path, now: DateTime<Utc>, threshold: Duration) -> Result<AcceptedHealth> {
+    let operations = json_files(&root.join("memory/accepted"))?
+        .iter()
+        .filter_map(|path| read_operation(path).ok())
+        .collect::<Vec<_>>();
+    let stale = operations
+        .iter()
+        .filter(|operation| is_stale(operation, now, threshold))
+        .count();
+    let oldest_age_seconds = operations
+        .iter()
+        .filter_map(|operation| {
+            operation
+                .first_accepted_at
+                .as_deref()
+                .and_then(parse_time)
+                .or_else(|| parse_time(&operation.queued_at))
+        })
+        .map(|since| now.signed_duration_since(since).num_seconds())
+        .max();
+    Ok(AcceptedHealth {
+        stale,
+        oldest_age_seconds,
+    })
+}
+
+fn quarantine(
+    root: &Path,
+    older_than: Duration,
+    dry_run: bool,
+    now: DateTime<Utc>,
+) -> Result<Manifest> {
+    // A dry run only reads, so it neither takes nor creates the lock.
+    let lock = if dry_run {
+        None
+    } else {
+        Some(
+            try_worker_lock(root)?
+                .context("the learning worker is running; retry when it exits")?,
+        )
+    };
+    let mut selected = Vec::new();
+    for path in json_files(&root.join("memory/accepted"))? {
+        let operation =
+            read_operation(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        if is_stale(&operation, now, older_than) {
+            selected.push((path, operation));
+        }
+    }
+    let target_for = |path: &Path| -> Result<PathBuf> {
+        Ok(root.join("memory/stalled").join(
+            path.file_name()
+                .context("memory operation has no filename")?,
+        ))
+    };
+    for (path, _) in &selected {
+        let target = target_for(path)?;
+        if target.exists() {
+            anyhow::bail!("{} already exists; nothing was moved", target.display());
+        }
+    }
+    let mut entries = Vec::with_capacity(selected.len());
+    for (path, mut operation) in selected {
+        let since = stale_since(&operation);
+        entries.push(ManifestEntry {
+            operation_id: operation.operation_id.clone(),
+            from: "memory/accepted".to_owned(),
+            to: "memory/stalled".to_owned(),
+            last_receipt_state: operation.last_receipt_state.clone(),
+            stale_since: since.map(|time| time.to_rfc3339()),
+            stale_seconds: since.map(|time| now.signed_duration_since(time).num_seconds()),
+        });
+        if !dry_run {
+            operation.state = "stalled".to_owned();
+            atomic_json(&path, &operation)?;
+            durable_rename(&path, &target_for(&path)?)?;
+        }
+    }
+    let manifest = Manifest {
+        schema_version: 1,
+        action: "quarantine",
+        created_at: now.to_rfc3339(),
+        dry_run,
+        older_than_seconds: Some(older_than.as_secs()),
+        operations: entries,
+    };
+    if let Some(lock) = lock {
+        write_manifest(root, &manifest)?;
+        lock.unlock()?;
+    }
+    Ok(manifest)
+}
+
+/// Move stalled operations back for redelivery: to `memory/accepted` when the
+/// server already issued a receipt, otherwise to `memory/pending`. `None`
+/// releases everything. Unknown ids fail the command before anything moves.
+fn release(root: &Path, operation_ids: Option<&[String]>, now: DateTime<Utc>) -> Result<Manifest> {
+    let lock =
+        try_worker_lock(root)?.context("the learning worker is running; retry when it exits")?;
+    let mut stalled = Vec::new();
+    for path in json_files(&root.join("memory/stalled"))? {
+        let operation =
+            read_operation(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        stalled.push((path, operation));
+    }
+    if let Some(ids) = operation_ids {
+        let unknown = ids
+            .iter()
+            .filter(|id| {
+                !stalled
+                    .iter()
+                    .any(|(_, operation)| &operation.operation_id == *id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            anyhow::bail!("not in memory/stalled: {}", unknown.join(", "));
+        }
+        stalled.retain(|(_, operation)| ids.contains(&operation.operation_id));
+    }
+    let mut moves = Vec::with_capacity(stalled.len());
+    for (path, operation) in stalled {
+        let state = if operation.receipt.is_some() {
+            "accepted"
+        } else {
+            "pending"
+        };
+        let target = root.join("memory").join(state).join(
+            path.file_name()
+                .context("memory operation has no filename")?,
+        );
+        if target.exists() {
+            anyhow::bail!("{} already exists; nothing was moved", target.display());
+        }
+        moves.push((path, target, state, operation));
+    }
+    let mut entries = Vec::with_capacity(moves.len());
+    for (path, target, state, mut operation) in moves {
+        operation.state = state.to_owned();
+        operation.unchanged_polls = 0;
+        operation.next_poll_at = None;
+        if operation.receipt.is_some() {
+            // Restart the staleness clock so a released record gets a full window.
+            operation.last_receipt_change_at = Some(now.to_rfc3339());
+        }
+        atomic_json(&path, &operation)?;
+        durable_rename(&path, &target)?;
+        entries.push(ManifestEntry {
+            operation_id: operation.operation_id,
+            from: "memory/stalled".to_owned(),
+            to: format!("memory/{state}"),
+            last_receipt_state: operation.last_receipt_state,
+            stale_since: None,
+            stale_seconds: None,
+        });
+    }
+    let manifest = Manifest {
+        schema_version: 1,
+        action: "release",
+        created_at: now.to_rfc3339(),
+        dry_run: false,
+        older_than_seconds: None,
+        operations: entries,
+    };
+    write_manifest(root, &manifest)?;
+    lock.unlock()?;
+    Ok(manifest)
+}
+
+fn write_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
+    if manifest.operations.is_empty() {
+        return Ok(());
+    }
+    let name = format!(
+        "{}-{}-{}.json",
+        manifest.action,
+        Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+        std::process::id()
+    );
+    atomic_json(&root.join("memory/manifests").join(name), manifest)
+}
+
+fn print_manifest(manifest: &Manifest, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(manifest)?);
+        return Ok(());
+    }
+    let verb = match (manifest.action, manifest.dry_run) {
+        ("quarantine", true) => "would quarantine",
+        ("quarantine", false) => "quarantined",
+        _ => "released",
+    };
+    for entry in &manifest.operations {
+        let detail = match (entry.stale_seconds, entry.last_receipt_state.as_deref()) {
+            (Some(seconds), state) => format!(
+                " (no receipt progress for {}h, last state {})",
+                seconds / 3_600,
+                state.unwrap_or("unknown")
+            ),
+            (None, _) => String::new(),
+        };
+        println!("{verb} {} -> {}{detail}", entry.operation_id, entry.to);
+    }
+    println!("{verb}: {} operation(s)", manifest.operations.len());
     Ok(())
 }
 
@@ -845,7 +1335,14 @@ fn locate_memory_operation(root: &Path, original_path: &Path) -> Result<PathBuf>
     let name = original_path
         .file_name()
         .context("memory operation has no filename")?;
-    for state in ["submitting", "accepted", "pending", "completed", "rejected"] {
+    for state in [
+        "submitting",
+        "accepted",
+        "pending",
+        "completed",
+        "rejected",
+        "stalled",
+    ] {
         let candidate = root.join("memory").join(state).join(name);
         if candidate.exists() {
             return Ok(candidate);
@@ -935,7 +1432,8 @@ fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn print_status(root: &Path, json_output: bool) -> Result<()> {
+fn print_status(root: &Path, stale_after: Duration, json_output: bool) -> Result<()> {
+    let health = accepted_health(root, Utc::now(), stale_after)?;
     let status = QueueStatus {
         queue_root: root.display().to_string(),
         pending: json_files(&root.join("pending"))?.len(),
@@ -951,6 +1449,10 @@ fn print_status(root: &Path, json_output: bool) -> Result<()> {
         memory_rejected: json_files(&root.join("memory/rejected"))?.len()
             + json_files(&root.join("memory/dead-letter"))?.len(),
         memory_completed: json_files(&root.join("memory/completed"))?.len(),
+        memory_stalled: json_files(&root.join("memory/stalled"))?.len(),
+        memory_stale: health.stale,
+        oldest_accepted_age_seconds: health.oldest_age_seconds,
+        stale_after_seconds: stale_after.as_secs(),
         ambiguous_delivery: 0,
         last_run: fs::read(root.join("status.json"))
             .ok()
@@ -968,6 +1470,17 @@ fn print_status(root: &Path, json_output: bool) -> Result<()> {
         println!("memory pending: {}", status.memory_pending);
         println!("memory submitting: {}", status.memory_submitting);
         println!("memory accepted: {}", status.memory_accepted);
+        println!(
+            "memory stale: {} (no receipt progress for {}s)",
+            status.memory_stale, status.stale_after_seconds
+        );
+        println!(
+            "oldest accepted age: {}",
+            status
+                .oldest_accepted_age_seconds
+                .map_or_else(|| "-".to_owned(), |seconds| format!("{seconds}s"))
+        );
+        println!("memory stalled: {}", status.memory_stalled);
         println!("memory completed: {}", status.memory_completed);
         println!("memory rejected: {}", status.memory_rejected);
         println!("ambiguous delivery: {}", status.ambiguous_delivery);
@@ -1070,6 +1583,12 @@ mod tests {
             queued_at: "2026-08-03T00:00:00Z".to_owned(),
             last_error: None,
             receipt: None,
+            first_accepted_at: None,
+            last_receipt_state: None,
+            last_receipt_progress_seq: None,
+            last_receipt_change_at: None,
+            unchanged_polls: 0,
+            next_poll_at: None,
         }
     }
 
@@ -1169,7 +1688,9 @@ mod tests {
         let path = temp.path().join("memory/submitting/operation-1.json");
         atomic_json(&path, &operation).unwrap();
         let receipt = receipt(&operation, "committed");
-        apply_receipt(temp.path(), &path, &mut operation, receipt).unwrap();
+        let outcome =
+            apply_receipt(temp.path(), &path, &mut operation, receipt, Utc::now()).unwrap();
+        assert_eq!(outcome, ReceiptOutcome::Transitioned);
         assert!(!path.exists());
         let completed = temp.path().join("memory/completed/operation-1.json");
         assert!(completed.exists());
@@ -1203,7 +1724,7 @@ mod tests {
         let mut mismatched = receipt(&operation, "accepted");
         mismatched.dependencies = vec!["unexpected".to_owned()];
 
-        let error = apply_receipt(temp.path(), &path, &mut operation, mismatched)
+        let error = apply_receipt(temp.path(), &path, &mut operation, mismatched, Utc::now())
             .unwrap_err()
             .to_string();
 
@@ -1348,9 +1869,15 @@ mod tests {
         };
         let (url, server) = serve_ledger(fixture).await;
 
-        reconcile_memory(temp.path(), &path, &url, &reqwest::Client::new())
-            .await
-            .unwrap();
+        reconcile_memory(
+            temp.path(),
+            &path,
+            &url,
+            &reqwest::Client::new(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(*posts.lock().unwrap(), 0);
         assert!(temp
@@ -1385,9 +1912,15 @@ mod tests {
         let client = memory_client(Duration::from_millis(25)).unwrap();
         let started = Instant::now();
 
-        let error = reconcile_memory(temp.path(), &path, &format!("http://{address}"), &client)
-            .await
-            .unwrap_err();
+        let error = reconcile_memory(
+            temp.path(),
+            &path,
+            &format!("http://{address}"),
+            &client,
+            Utc::now(),
+        )
+        .await
+        .unwrap_err();
 
         assert!(memory_transport_unavailable(&error));
         assert!(started.elapsed() < Duration::from_millis(500));
@@ -1413,7 +1946,14 @@ mod tests {
         };
         let (url, server) = serve_ledger(fixture).await;
 
-        let result = reconcile_memory(temp.path(), &path, &url, &reqwest::Client::new()).await;
+        let result = reconcile_memory(
+            temp.path(),
+            &path,
+            &url,
+            &reqwest::Client::new(),
+            Utc::now(),
+        )
+        .await;
 
         assert!(result.is_err());
         assert_eq!(*posts.lock().unwrap(), 0);
@@ -1439,15 +1979,67 @@ mod tests {
         };
         let (url, server) = serve_ledger(fixture).await;
 
-        reconcile_memory(temp.path(), &path, &url, &reqwest::Client::new())
-            .await
-            .unwrap();
+        reconcile_memory(
+            temp.path(),
+            &path,
+            &url,
+            &reqwest::Client::new(),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(*posts.lock().unwrap(), 1);
         let accepted = temp.path().join("memory/accepted/operation-1.json");
         assert!(accepted.exists());
         assert_eq!(read_operation(&accepted).unwrap().state, "accepted");
         server.abort();
+    }
+
+    #[test]
+    fn receipt_progress_resets_backoff_and_the_staleness_clock() {
+        let start = parse_time("2026-10-01T00:00:00Z").unwrap();
+        let mut operation = operation("add_memory", json!({"content":"delta"}));
+        operation.payload_hash = Some(canonical_payload_hash(&operation.arguments).unwrap());
+        let mut planned = receipt(&operation, "planned");
+        planned.updated_at = start.to_rfc3339();
+
+        assert!(observe_receipt(&mut operation, &planned, start));
+        assert!(!observe_receipt(
+            &mut operation,
+            &planned,
+            start + TimeDelta::minutes(1)
+        ));
+        assert!(!observe_receipt(
+            &mut operation,
+            &planned,
+            start + TimeDelta::minutes(2)
+        ));
+        assert_eq!(operation.unchanged_polls, 2);
+        assert_eq!(
+            operation.next_poll_at.as_deref().and_then(parse_time),
+            Some(start + TimeDelta::minutes(4))
+        );
+        let later = start + TimeDelta::hours(7);
+        assert!(is_stale(&operation, later, Duration::from_secs(6 * 3_600)));
+
+        planned.progress_seq += 1;
+        assert!(observe_receipt(&mut operation, &planned, later));
+        assert_eq!(operation.unchanged_polls, 0);
+        assert!(operation.next_poll_at.is_none());
+        assert!(!is_stale(&operation, later, Duration::from_secs(6 * 3_600)));
+        assert_eq!(poll_backoff(40), TimeDelta::seconds(3_600));
+    }
+
+    #[test]
+    fn duration_flags_require_a_unit() {
+        assert_eq!(parse_duration("90s"), Ok(Duration::from_secs(90)));
+        assert_eq!(parse_duration("15m"), Ok(Duration::from_secs(900)));
+        assert_eq!(parse_duration("6h"), Ok(Duration::from_secs(21_600)));
+        assert_eq!(parse_duration("2d"), Ok(Duration::from_secs(172_800)));
+        for invalid in ["", "6", "h", "6x", "-1h", "1.5h"] {
+            assert!(parse_duration(invalid).is_err(), "{invalid:?}");
+        }
     }
 
     /// Revert line: delete the `.filter(|path| !path.starts_with(...))` call in

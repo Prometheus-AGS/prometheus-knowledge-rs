@@ -12,6 +12,35 @@ Rust knowledge and learning runtime for human-readable Markdown records, immutab
 
 Queue states are explicit. Learning jobs use `pending → processing → completed | rejected`. Memory delivery uses `pending → submitting → accepted → completed | rejected`. Legacy retry/dead-letter directories are migration evidence and must be reconciled rather than treated as success.
 
+### Stalled memory operations
+
+An operation stays in `memory/accepted` while the server's receipt is non-terminal (`accepted`, `validated`, `blocked`, `planned`, `processing`, `indexed`). The worker records `firstAcceptedAt`, `lastReceiptState`, `lastReceiptProgressSeq` and `lastReceiptChangeAt` on each record. When a poll returns an unchanged receipt, it backs off before polling again: 1m, 2m, 4m and so on, capped at 1h (`unchangedPolls`, `nextPollAt`). An accepted operation is **stale** when its receipt has not changed for longer than `--stale-after` (env `PROMETHEUS_LEARNING_STALE_AFTER`, default `6h`; units `s|m|h|d`).
+
+`status.json`, written by every `run-once`:
+
+| Field | Meaning |
+|---|---|
+| `memoryDelivered` | Operations that moved to a new local state this run (accepted, completed, rejected). Re-polling an accepted operation does not count. |
+| `memoryInFlight` | Operations polled this run whose receipt is still non-terminal. |
+| `memoryDeferred` | Accepted operations skipped this run because they are backing off. |
+| `memoryAwaitingReconciliation` | Operations whose reconciliation failed this run (transport, contract, or server error). |
+| `memoryStale` | Accepted operations with no receipt progress for longer than the threshold. |
+| `memoryStalled` | Operations quarantined in `memory/stalled`. |
+| `oldestAcceptedAgeSeconds` | Age of the oldest accepted operation, measured from first acceptance (`null` if none). |
+| `staleAfterSeconds` | The staleness threshold in effect. |
+
+`prometheus-learning-worker status [--json]` reports the same stale, stalled and oldest-age values next to the per-directory counts.
+
+To take stale operations out of the redelivery loop, then return them once the server is fixed:
+
+```bash
+prometheus-learning-worker quarantine --dry-run          # list stale accepted operations; changes nothing
+prometheus-learning-worker quarantine [--older-than 6h]  # move them to memory/stalled
+prometheus-learning-worker release --all                 # or: release <operation-id>...
+```
+
+`release` returns an operation to `memory/accepted` if it already has a receipt, otherwise to `memory/pending`, and restarts its staleness clock. Both commands write a manifest to `memory/manifests/` and refuse to run while a worker holds the queue lock. `memory/stalled` is an operator decision, not an unsettled record: `pk doctor` reports its size but does not fail on it.
+
 Canonical documentation is published under [Knowledge & Learning](https://prometheus-ags.github.io/prometheus-skill-system/docs/knowledge-learning/snapshots-and-context).
 
 ## Binaries
