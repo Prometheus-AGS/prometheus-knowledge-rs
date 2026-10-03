@@ -1,0 +1,14 @@
+{
+  "mcp": {
+    "compass": {
+      "type": "local",
+      "command": [
+        "compass",
+        "serve",
+        "--transport",
+        "stdio"
+      ],
+      "enabled": true
+    }
+  }
+}

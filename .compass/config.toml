@@ -1,0 +1,8 @@
+version = 2
+
+[build]
+include = []
+exclude = [".prometheus/**", ".agents/**", ".dsh/**", ".kimi-code/**", ".opencode/**", ".codex/**", ".agent-team/**", ".kbd-orchestrator/**"]
+
+[storage]
+store = "json"

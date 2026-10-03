@@ -49,3 +49,8 @@ tarpaulin-report.html
 # pk wiki write lock and interrupted-write temp files
 .prometheus/knowledge/wiki/.index.lock
 .prometheus/knowledge/wiki/.*.tmp
+
+# Compass: commit the config, graph and report; everything else in compass-out/ is local per-worktree state
+compass-out/*
+!compass-out/graph.json
+!compass-out/GRAPH_REPORT.md
