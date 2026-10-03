@@ -542,3 +542,239 @@ async fn distinct_content_still_creates_a_new_entry() {
     assert_ne!(second.id, first.id);
     assert_eq!(second.revision, 0);
 }
+
+// ── GitHub issue #15: rebuilding index.md must not destroy entries ──────────
+
+/// A page whose frontmatter this binary rejects: `tags` must be a sequence,
+/// so a mapping fails YAML deserialization in `markdown_to_entry`.
+const UNPARSEABLE_PAGE: &str =
+    "---\nid: zeta-format\ntitle: Zeta Format\ntags:\n  nested: {a: 1}\n---\n\nBody.\n";
+
+#[tokio::test]
+async fn rebuilding_index_keeps_pages_this_binary_cannot_parse() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wiki = dir.path().join("wiki");
+    tokio::fs::create_dir_all(&wiki).await.unwrap();
+    tokio::fs::write(wiki.join("zeta-format.md"), UNPARSEABLE_PAGE)
+        .await
+        .unwrap();
+    tokio::fs::write(
+        wiki.join("index.md"),
+        "---\nokf_version: \"0.2\"\n---\n\n# Wiki Index\n\n## Reference\n\n* [Zeta Format](/zeta-format.md) - written by a newer binary\n",
+    )
+    .await
+    .unwrap();
+
+    let store = MarkdownStore::open(dir.path()).await.unwrap();
+    // Precondition: the page really is rejected by this binary.
+    assert_eq!(store.readiness_report().await.parse_failures, 1);
+    assert_eq!(store.entry_count().await, 0);
+
+    let mut axum = WikiEntry::new("Axum", "Async web framework.");
+    axum.entry_type = Some("Reference".into());
+    store.upsert(axum).await.unwrap();
+    store.regenerate_index().await.unwrap();
+
+    let index = tokio::fs::read_to_string(wiki.join("index.md"))
+        .await
+        .unwrap();
+    let carried = "* [Zeta Format](/zeta-format.md) - written by a newer binary";
+    let section = index
+        .find("## Reference")
+        .unwrap_or_else(|| panic!("Reference section missing: {index}"));
+    let line = index
+        .find(carried)
+        .unwrap_or_else(|| panic!("unparseable page dropped from index: {index}"));
+    assert!(
+        line > section,
+        "carried line not under ## Reference: {index}"
+    );
+    assert!(
+        index.contains("[Axum](/axum.md)"),
+        "fresh entry missing: {index}"
+    );
+    assert!(
+        index.find("[Axum]").unwrap() < line,
+        "entries not sorted by title: {index}"
+    );
+}
+
+#[tokio::test]
+async fn two_stale_writers_both_end_up_in_the_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = MarkdownStore::open(dir.path()).await.unwrap();
+    let second = MarkdownStore::open(dir.path()).await.unwrap();
+
+    first
+        .upsert(WikiEntry::new("Axum", "Async web framework."))
+        .await
+        .unwrap();
+    first.regenerate_index().await.unwrap();
+    second
+        .upsert(WikiEntry::new("Tower", "Middleware layers."))
+        .await
+        .unwrap();
+    second.regenerate_index().await.unwrap();
+
+    let index = tokio::fs::read_to_string(dir.path().join("wiki").join("index.md"))
+        .await
+        .unwrap();
+    assert!(index.contains("[Axum](/axum.md)"), "Axum lost: {index}");
+    assert!(index.contains("[Tower](/tower.md)"), "Tower lost: {index}");
+}
+
+#[tokio::test]
+async fn rebuilt_index_keeps_okf_version_frontmatter() {
+    let (store, dir) = temp_store().await;
+    store
+        .upsert(WikiEntry::new("Axum", "Async web framework."))
+        .await
+        .unwrap();
+    store.regenerate_index().await.unwrap();
+    store.regenerate_index().await.unwrap();
+
+    let index = tokio::fs::read_to_string(dir.path().join("wiki").join("index.md"))
+        .await
+        .unwrap();
+    assert!(
+        index.starts_with("---\nokf_version: \"0.2\"\n---"),
+        "frontmatter missing: {index}"
+    );
+    assert!(index.contains("# Wiki Index"), "title missing: {index}");
+}
+
+#[tokio::test]
+async fn rebuilt_index_drops_lines_for_deleted_pages() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wiki = dir.path().join("wiki");
+    tokio::fs::create_dir_all(&wiki).await.unwrap();
+    tokio::fs::write(
+        wiki.join("index.md"),
+        "---\nokf_version: \"0.2\"\n---\n\n# Wiki Index\n\n## Reference\n\n* [Gone](/gone.md) - deleted page\n",
+    )
+    .await
+    .unwrap();
+
+    let store = MarkdownStore::open(dir.path()).await.unwrap();
+    store
+        .upsert(WikiEntry::new("Axum", "Async web framework."))
+        .await
+        .unwrap();
+    store.regenerate_index().await.unwrap();
+
+    let index = tokio::fs::read_to_string(wiki.join("index.md"))
+        .await
+        .unwrap();
+    assert!(
+        !index.contains("/gone.md"),
+        "deleted page still listed: {index}"
+    );
+    assert!(
+        !index.contains("## Reference"),
+        "empty section kept: {index}"
+    );
+    assert!(index.contains("[Axum](/axum.md)"), "Axum missing: {index}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_append_log_calls_keep_every_line() {
+    const ROUNDS: usize = 40;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = Arc::new(MarkdownStore::open(dir.path()).await.unwrap());
+    let second = Arc::new(MarkdownStore::open(dir.path()).await.unwrap());
+
+    let append_all = |store: Arc<MarkdownStore>, prefix: &'static str| async move {
+        for i in 0..ROUNDS {
+            let id = ArticleId::from(format!("{prefix}-{i}"));
+            store
+                .append_log("Creation", &format!("{prefix} {i}"), &id)
+                .await
+                .unwrap();
+        }
+    };
+    let a = tokio::spawn(append_all(first, "alpha"));
+    let b = tokio::spawn(append_all(second, "beta"));
+    let (ra, rb) = tokio::join!(a, b);
+    ra.unwrap();
+    rb.unwrap();
+
+    let log = tokio::fs::read_to_string(dir.path().join("wiki").join("log.md"))
+        .await
+        .unwrap();
+    let missing: Vec<String> = ["alpha", "beta"]
+        .iter()
+        .flat_map(|p| (0..ROUNDS).map(move |i| format!("(/{p}-{i}.md)")))
+        .filter(|needle| !log.contains(needle.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "log.md lost {} lines: {missing:?}",
+        missing.len()
+    );
+}
+
+#[tokio::test]
+async fn page_whose_filename_differs_from_its_id_is_listed_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wiki = dir.path().join("wiki");
+    tokio::fs::create_dir_all(&wiki).await.unwrap();
+    tokio::fs::write(
+        wiki.join("foo.md"),
+        "---\nid: bar\ntitle: Bar\n---\n\nBody.\n",
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        wiki.join("index.md"),
+        "---\nokf_version: \"0.2\"\n---\n\n# Wiki Index\n\n## Uncategorized\n\n* [Foo](/foo.md) - stale line for the file name\n",
+    )
+    .await
+    .unwrap();
+
+    let store = MarkdownStore::open(dir.path()).await.unwrap();
+    assert_eq!(store.readiness_report().await.parse_failures, 0);
+    store.regenerate_index().await.unwrap();
+
+    let index = tokio::fs::read_to_string(wiki.join("index.md"))
+        .await
+        .unwrap();
+    assert_eq!(index.matches("(/bar.md)").count(), 1, "{index}");
+    assert!(
+        !index.contains("(/foo.md)"),
+        "stale line carried for a page that parses: {index}"
+    );
+}
+
+#[tokio::test]
+async fn multi_line_description_survives_when_a_line_is_carried() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wiki = dir.path().join("wiki");
+    tokio::fs::create_dir_all(&wiki).await.unwrap();
+    tokio::fs::write(wiki.join("zeta-format.md"), UNPARSEABLE_PAGE)
+        .await
+        .unwrap();
+    tokio::fs::write(
+        wiki.join("index.md"),
+        "---\nokf_version: \"0.2\"\n---\n\n# Wiki Index\n\n## Reference\n\n* [Zeta Format](/zeta-format.md) - written by a newer binary\n",
+    )
+    .await
+    .unwrap();
+
+    let store = MarkdownStore::open(dir.path()).await.unwrap();
+    let mut axum = WikiEntry::new("Axum", "Async web framework.");
+    axum.description = Some("line one\nline two".into());
+    store.upsert(axum).await.unwrap();
+    store.regenerate_index().await.unwrap();
+
+    let index = tokio::fs::read_to_string(wiki.join("index.md"))
+        .await
+        .unwrap();
+    assert!(
+        index.contains("(/zeta-format.md)"),
+        "carried line lost: {index}"
+    );
+    assert!(
+        index.contains("[Axum](/axum.md) - line one\nline two"),
+        "multi-line description cut: {index}"
+    );
+}

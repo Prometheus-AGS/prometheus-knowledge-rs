@@ -45,3 +45,7 @@ tarpaulin-report.html
 # agent-team-creator: local coordination state and install backups
 .agent-team/*/state.json
 .agent-team/recovery/
+
+# pk wiki write lock and interrupted-write temp files
+.prometheus/knowledge/wiki/.index.lock
+.prometheus/knowledge/wiki/.*.tmp

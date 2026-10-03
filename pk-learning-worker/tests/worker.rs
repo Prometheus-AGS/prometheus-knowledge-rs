@@ -222,6 +222,87 @@ fn processes_a_job_once_and_preserves_ambiguous_memory_delivery() {
     assert_eq!(learning_log.lines().count(), 1);
 }
 
+#[test]
+fn a_worker_run_keeps_index_entries_for_pages_it_cannot_parse() {
+    // Issue #15: a worker that rebuilt index.md from only the pages it could
+    // parse dropped every other entry and the okf_version frontmatter.
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    let project = fixture.path().join("project");
+    let queue = home.join(".prometheus/learning-queue");
+    let wiki = project.join(".prometheus/knowledge/wiki");
+    fs::create_dir_all(queue.join("pending")).unwrap();
+    fs::create_dir_all(project.join(".git")).unwrap();
+    fs::create_dir_all(&wiki).unwrap();
+    // A `tags:` mapping is the shape pk-store rejects (see pk-store
+    // store_tests `rebuilding_index_keeps_pages_this_binary_cannot_parse`).
+    fs::write(
+        wiki.join("legacy-page.md"),
+        "---\nid: legacy-page\ntitle: Legacy page\ntags:\n  nested: {a: 1}\n---\n\nBody.\n",
+    )
+    .unwrap();
+    fs::write(
+        wiki.join("index.md"),
+        "---\nokf_version: \"0.2\"\n---\n\n# Wiki Index\n\n## Reference\n\n* [Legacy page](/legacy-page.md)\n",
+    )
+    .unwrap();
+    let transcript = fixture.path().join("transcript.jsonl");
+    fs::write(
+        &transcript,
+        serde_json::to_string(&json!({
+            "type":"assistant",
+            "message":{"role":"assistant","content":[{"type":"text","text":"Kept the index intact."}]}
+        }))
+        .unwrap()
+            + "\n",
+    )
+    .unwrap();
+    let event_id = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    fs::write(
+        queue.join("pending").join(format!("{event_id}.json")),
+        serde_json::to_vec_pretty(&json!({
+            "schemaVersion":2,
+            "eventId":event_id,
+            "eventType":"stop",
+            "harness":"fixture",
+            "sessionId":"fixture-session",
+            "projectRoot":project,
+            "transcriptPath":transcript,
+            "capturedAt":"2026-08-03T00:00:00Z",
+            "payloadDigest":"fixture",
+            "attempt":0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    succeed(&home, &["--memory-url", "http://127.0.0.1:1", "run-once"]);
+
+    assert!(
+        wiki.join("karpathy-session-fedcba9876543210.md").exists(),
+        "worker did not write the session record"
+    );
+    let index = fs::read_to_string(wiki.join("index.md")).unwrap();
+    assert!(
+        index.starts_with("---\nokf_version: \"0.2\"\n---\n"),
+        "okf_version frontmatter lost: {index}"
+    );
+    let section = index
+        .find("## Reference")
+        .unwrap_or_else(|| panic!("Reference section missing: {index}"));
+    let legacy = index
+        .find("[Legacy page](/legacy-page.md)")
+        .unwrap_or_else(|| panic!("unparseable page dropped from index: {index}"));
+    assert!(
+        legacy > section,
+        "legacy line not under ## Reference: {index}"
+    );
+    assert!(
+        index.contains("[Karpathy session fedcba987654](/karpathy-session-fedcba9876543210.md)"),
+        "new SessionRecord entry missing: {index}"
+    );
+}
+
 fn worker(home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_prometheus-learning-worker"))
         .env("HOME", home)

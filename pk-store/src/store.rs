@@ -9,9 +9,14 @@ use pk_core::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    fs::{File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -46,6 +51,9 @@ struct ScanOutcome {
     content_hash_index: HashMap<String, ArticleId>,
     on_disk_count: usize,
     parse_failures: usize,
+    /// Bundle-relative paths (minus `.md`, `/`-separated — the scan's
+    /// fallback ids) of pages that could not be read or parsed.
+    failed_paths: HashSet<String>,
 }
 
 /// Read the ingest content-hash stamped on an entry's `extra` frontmatter
@@ -220,29 +228,87 @@ impl MarkdownStore {
         Ok(inner.entries.values().cloned().collect())
     }
 
-    /// Regenerate the wiki-root `index.md` (OKF v0.2 §8) from the current entries.
+    /// Regenerate the wiki-root `index.md` (OKF v0.2 §8) from the pages on disk.
     /// Called after every ingest so the catalog stays current.
+    ///
+    /// Holds an exclusive lock on `wiki/.index.lock` across scan, merge, render
+    /// and write, so concurrent rebuilds (other stores, other processes) are
+    /// serialized. Renders from a fresh disk scan rather than this store's
+    /// in-memory snapshot, keeps existing index lines for pages this binary
+    /// cannot parse, and replaces the file atomically (issue #15).
+    ///
+    /// Not reentrant: must not be called while the caller already holds
+    /// `wiki/.index.lock` (for example from inside `append_log`), or the
+    /// blocking lock on a second descriptor deadlocks.
     pub async fn regenerate_index(&self) -> PkResult<()> {
-        let entries = self.snapshot().await?;
-        let content = crate::bundle::render_index(&entries);
+        let lock = self.lock_index().await?;
+        let result = self.rebuild_index_locked().await;
+        release_lock(lock);
+        result
+    }
+
+    /// Take the exclusive `wiki/.index.lock` that serializes every rewrite of
+    /// the reserved `index.md` and `log.md` files, across stores and processes.
+    /// The blocking wait runs off the async runtime threads. There is no
+    /// reentrancy guard: taking it again while held (on another descriptor)
+    /// blocks forever, so never nest `regenerate_index` / `append_log`.
+    async fn lock_index(&self) -> PkResult<File> {
+        let lock_path = self.wiki_dir.join(INDEX_LOCK_FILENAME);
+        let lock = tokio::task::spawn_blocking(move || acquire_exclusive_lock(&lock_path))
+            .await
+            .map_err(join_error)??;
+        Ok(lock)
+    }
+
+    async fn rebuild_index_locked(&self) -> PkResult<()> {
+        let scan = scan_wiki_tree(&self.wiki_dir).await?;
+        let entries: Vec<WikiEntry> = scan.entries.into_values().collect();
+
         let path = self.wiki_dir.join("index.md");
-        tokio::fs::write(&path, content).await?;
-        debug!(path = %path.display(), "index.md regenerated");
+        let existing = match tokio::fs::read(&path).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let content =
+            crate::bundle::render_index_preserving(&entries, &existing, &scan.failed_paths);
+        write_atomic(&path, content).await?;
+        debug!(
+            path = %path.display(),
+            parse_failures = scan.failed_paths.len(),
+            "index.md regenerated"
+        );
         Ok(())
     }
 
     /// Append an entry to the wiki-root `log.md` (OKF v0.2 §9) under today's date
     /// group, newest first. `action` is the leading bold verb (`Creation`,
     /// `Update`, …).
+    ///
+    /// The read-modify-write runs under the same `wiki/.index.lock` as
+    /// `regenerate_index`, so concurrent appenders never drop each other's
+    /// lines. Not reentrant: must not be called while the caller already holds
+    /// `wiki/.index.lock` (for example from inside `regenerate_index`).
     pub async fn append_log(&self, action: &str, title: &str, id: &ArticleId) -> PkResult<()> {
-        let path = self.wiki_dir.join("log.md");
-        let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let line = format!("* **{action}**: [{title}](/{}.md)", id.as_str());
-        let updated = crate::bundle::append_log_line(&existing, &date, &line);
-        tokio::fs::write(&path, updated).await?;
-        debug!(path = %path.display(), action, "log.md appended");
+        let lock = self.lock_index().await?;
+        let result = self.append_log_locked(&line).await;
+        release_lock(lock);
+        result?;
+        debug!(action, "log.md appended");
         Ok(())
+    }
+
+    async fn append_log_locked(&self, line: &str) -> PkResult<()> {
+        let path = self.wiki_dir.join("log.md");
+        let existing = match tokio::fs::read(&path).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let updated = crate::bundle::append_log_line(&existing, &date, line);
+        write_atomic(&path, updated).await
     }
 
     pub async fn entry_count(&self) -> usize {
@@ -255,8 +321,6 @@ impl MarkdownStore {
     /// reserved `index.md`/`log.md` structure. Orphan detection uses the
     /// in-memory snapshot.
     pub async fn okf_conformance_reports(&self) -> PkResult<Vec<LintReport>> {
-        use std::collections::HashSet;
-
         let mut concept_files: Vec<(String, String)> = Vec::new();
         let mut index_raw: Option<String> = None;
         let mut log_raw: Option<String> = None;
@@ -388,6 +452,76 @@ impl MarkdownStore {
     }
 }
 
+/// Lock file serializing `index.md` rebuilds. No `.md` extension, so the
+/// wiki scan never treats it as a concept page.
+const INDEX_LOCK_FILENAME: &str = ".index.lock";
+
+fn join_error(error: tokio::task::JoinError) -> PkError {
+    PkError::from(std::io::Error::other(error))
+}
+
+/// Open (creating if needed) `lock_path` and take a blocking exclusive `fs2`
+/// lock on it. Call only from a blocking context. The lock lives as long as
+/// the returned `File`.
+fn acquire_exclusive_lock(lock_path: &Path) -> std::io::Result<File> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    Ok(lock)
+}
+
+/// Release a lock taken by `acquire_exclusive_lock`. Closing the descriptor
+/// releases it too; unlocking first makes the hand-off explicit.
+fn release_lock(lock: File) {
+    let _ = fs2::FileExt::unlock(&lock);
+    drop(lock);
+}
+
+/// Replace `path` atomically: write a uniquely named temp file in the same
+/// directory, sync it, then rename it over the target. A crash leaves either
+/// the old file or the new one, never a truncated one.
+async fn write_atomic(path: &Path, contents: String) -> PkResult<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || write_atomic_blocking(&path, contents.as_bytes()))
+        .await
+        .map_err(join_error)??;
+    Ok(())
+}
+
+fn write_atomic_blocking(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let tmp = dir.join(format!(
+        ".{name}.{}.{nanos}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let written = write_synced(&tmp, contents).and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+fn write_synced(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
 async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
     let mut outcome = ScanOutcome {
         entries: HashMap::new(),
@@ -396,6 +530,7 @@ async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
         content_hash_index: HashMap::new(),
         on_disk_count: 0,
         parse_failures: 0,
+        failed_paths: HashSet::new(),
     };
     // Canonicalizing every article schedules one blocking filesystem task per
     // file. Large project stores made the learning worker spend minutes in
@@ -429,10 +564,17 @@ async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
             outcome.on_disk_count += 1;
             let relative = path.strip_prefix(wiki_dir).unwrap_or(&path);
             let canonical_path = canonical_wiki_dir.join(relative);
+            let fallback_id: String = relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let fallback_id = fallback_id.trim_end_matches(".md");
             let content = match tokio::fs::read_to_string(&path).await {
                 Ok(content) => content,
                 Err(error) => {
                     outcome.parse_failures += 1;
+                    outcome.failed_paths.insert(fallback_id.to_owned());
                     warn!(path = %path.display(), err = %error, "failed to read entry");
                     continue;
                 }
@@ -442,12 +584,6 @@ async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
                 format!("{:x}", Sha256::digest(content.as_bytes())),
             );
 
-            let fallback_id: String = relative
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            let fallback_id = fallback_id.trim_end_matches(".md");
             match markdown_to_entry(&content, Some(fallback_id)) {
                 Ok(wiki_entry) => {
                     debug!(id = %wiki_entry.id, "loaded entry");
@@ -461,6 +597,7 @@ async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
                 }
                 Err(error) => {
                     outcome.parse_failures += 1;
+                    outcome.failed_paths.insert(fallback_id.to_owned());
                     warn!(path = %path.display(), err = %error, "skipping malformed entry");
                 }
             }
