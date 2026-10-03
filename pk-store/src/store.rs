@@ -51,6 +51,9 @@ struct ScanOutcome {
     content_hash_index: HashMap<String, ArticleId>,
     on_disk_count: usize,
     parse_failures: usize,
+    /// Bundle-relative paths (minus `.md`, `/`-separated — the scan's
+    /// fallback ids) of pages that could not be read or parsed.
+    failed_paths: HashSet<String>,
 }
 
 /// Read the ingest content-hash stamped on an entry's `extra` frontmatter
@@ -233,6 +236,10 @@ impl MarkdownStore {
     /// serialized. Renders from a fresh disk scan rather than this store's
     /// in-memory snapshot, keeps existing index lines for pages this binary
     /// cannot parse, and replaces the file atomically (issue #15).
+    ///
+    /// Not reentrant: must not be called while the caller already holds
+    /// `wiki/.index.lock` (for example from inside `append_log`), or the
+    /// blocking lock on a second descriptor deadlocks.
     pub async fn regenerate_index(&self) -> PkResult<()> {
         let lock = self.lock_index().await?;
         let result = self.rebuild_index_locked().await;
@@ -242,7 +249,9 @@ impl MarkdownStore {
 
     /// Take the exclusive `wiki/.index.lock` that serializes every rewrite of
     /// the reserved `index.md` and `log.md` files, across stores and processes.
-    /// The blocking wait runs off the async runtime threads.
+    /// The blocking wait runs off the async runtime threads. There is no
+    /// reentrancy guard: taking it again while held (on another descriptor)
+    /// blocks forever, so never nest `regenerate_index` / `append_log`.
     async fn lock_index(&self) -> PkResult<File> {
         let lock_path = self.wiki_dir.join(INDEX_LOCK_FILENAME);
         let lock = tokio::task::spawn_blocking(move || acquire_exclusive_lock(&lock_path))
@@ -253,9 +262,7 @@ impl MarkdownStore {
 
     async fn rebuild_index_locked(&self) -> PkResult<()> {
         let scan = scan_wiki_tree(&self.wiki_dir).await?;
-        let entries: Vec<WikiEntry> = scan.entries.values().cloned().collect();
-        let parsed_ids: HashSet<ArticleId> = scan.entries.into_keys().collect();
-        let rendered = crate::bundle::render_index(&entries);
+        let entries: Vec<WikiEntry> = scan.entries.into_values().collect();
 
         let path = self.wiki_dir.join("index.md");
         let existing = match tokio::fs::read(&path).await {
@@ -264,13 +271,11 @@ impl MarkdownStore {
             Err(error) => return Err(error.into()),
         };
         let content =
-            crate::bundle::merge_preserved_index_entries(&rendered, &existing, &parsed_ids, |id| {
-                article_path(&self.wiki_dir, &ArticleId::from(id)).is_file()
-            });
+            crate::bundle::render_index_preserving(&entries, &existing, &scan.failed_paths);
         write_atomic(&path, content).await?;
         debug!(
             path = %path.display(),
-            parse_failures = scan.parse_failures,
+            parse_failures = scan.failed_paths.len(),
             "index.md regenerated"
         );
         Ok(())
@@ -282,7 +287,8 @@ impl MarkdownStore {
     ///
     /// The read-modify-write runs under the same `wiki/.index.lock` as
     /// `regenerate_index`, so concurrent appenders never drop each other's
-    /// lines.
+    /// lines. Not reentrant: must not be called while the caller already holds
+    /// `wiki/.index.lock` (for example from inside `regenerate_index`).
     pub async fn append_log(&self, action: &str, title: &str, id: &ArticleId) -> PkResult<()> {
         let line = format!("* **{action}**: [{title}](/{}.md)", id.as_str());
         let lock = self.lock_index().await?;
@@ -524,6 +530,7 @@ async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
         content_hash_index: HashMap::new(),
         on_disk_count: 0,
         parse_failures: 0,
+        failed_paths: HashSet::new(),
     };
     // Canonicalizing every article schedules one blocking filesystem task per
     // file. Large project stores made the learning worker spend minutes in
@@ -557,10 +564,17 @@ async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
             outcome.on_disk_count += 1;
             let relative = path.strip_prefix(wiki_dir).unwrap_or(&path);
             let canonical_path = canonical_wiki_dir.join(relative);
+            let fallback_id: String = relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let fallback_id = fallback_id.trim_end_matches(".md");
             let content = match tokio::fs::read_to_string(&path).await {
                 Ok(content) => content,
                 Err(error) => {
                     outcome.parse_failures += 1;
+                    outcome.failed_paths.insert(fallback_id.to_owned());
                     warn!(path = %path.display(), err = %error, "failed to read entry");
                     continue;
                 }
@@ -570,12 +584,6 @@ async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
                 format!("{:x}", Sha256::digest(content.as_bytes())),
             );
 
-            let fallback_id: String = relative
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            let fallback_id = fallback_id.trim_end_matches(".md");
             match markdown_to_entry(&content, Some(fallback_id)) {
                 Ok(wiki_entry) => {
                     debug!(id = %wiki_entry.id, "loaded entry");
@@ -589,6 +597,7 @@ async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
                 }
                 Err(error) => {
                     outcome.parse_failures += 1;
+                    outcome.failed_paths.insert(fallback_id.to_owned());
                     warn!(path = %path.display(), err = %error, "skipping malformed entry");
                 }
             }
