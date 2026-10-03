@@ -10,6 +10,8 @@ Rust knowledge and learning runtime for human-readable Markdown records, immutab
 - **`prometheus-learning-worker`** owns extraction, queue transitions, Memory operation submission, receipt reconciliation, and snapshot publication.
 - **`pk doctor --json`** diagnoses the active plugin generation, stable dispatchers, snapshots, queue state, hook log permissions, and project scope without creating or changing state.
 
+**Wiki index and log writes** rebuild `index.md` from the pages on disk under an exclusive `wiki/.index.lock`, keep entries for pages the running binary cannot parse, and replace `index.md` and `log.md` atomically. Projects that commit their wiki should ignore `wiki/.index.lock` and `wiki/.*.tmp`. Keep `pk`, `pk-cherry` and `prometheus-learning-worker` at the same version: an older writer still rebuilds the index from only the pages it can read.
+
 Queue states are explicit. Learning jobs use `pending → processing → completed | rejected`. Memory delivery uses `pending → submitting → accepted → completed | rejected`. Legacy retry/dead-letter directories are migration evidence and must be reconciled rather than treated as success.
 
 ### Stalled memory operations
