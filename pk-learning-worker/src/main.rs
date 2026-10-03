@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -377,10 +378,20 @@ async fn run_once(root: &Path, memory_url: &str, stale_after: Duration) -> Resul
     }
 
     let client = memory_client(MEMORY_REQUEST_TIMEOUT)?;
+    // A record reconciled from `memory/submitting` lands in `memory/accepted`
+    // before that directory is listed; polling it again would count it twice
+    // and start its backoff after a single real observation.
+    let mut reconciled = HashSet::new();
     'memory_reconciliation: for directory in
         ["memory/submitting", "memory/accepted", "memory/pending"]
     {
         for path in json_files(&root.join(directory))? {
+            let Some(name) = path.file_name().map(ToOwned::to_owned) else {
+                continue;
+            };
+            if !reconciled.insert(name) {
+                continue;
+            }
             let now = Utc::now();
             if directory == "memory/accepted" && poll_deferred(&path, now) {
                 summary.memory_deferred += 1;
@@ -991,6 +1002,11 @@ fn parse_duration(raw: &str) -> std::result::Result<Duration, String> {
         "d" => 86_400,
         _ => return Err(expected()),
     };
+    if value == 0 {
+        // Zero would make every accepted operation stale, even one polled a
+        // moment ago.
+        return Err(format!("duration {raw:?} must be greater than zero"));
+    }
     value
         .checked_mul(unit_seconds)
         .map(Duration::from_secs)
@@ -1064,8 +1080,15 @@ fn quarantine(
     };
     let mut selected = Vec::new();
     for path in json_files(&root.join("memory/accepted"))? {
-        let operation =
-            read_operation(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        // Skipped, as in `status`: reconciliation reports unreadable records,
+        // and one of them must not block quarantining the rest.
+        let operation = match read_operation(&path) {
+            Ok(operation) => operation,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "skipping unreadable operation");
+                continue;
+            }
+        };
         if is_stale(&operation, now, older_than) {
             selected.push((path, operation));
         }
@@ -1082,23 +1105,20 @@ fn quarantine(
             anyhow::bail!("{} already exists; nothing was moved", target.display());
         }
     }
-    let mut entries = Vec::with_capacity(selected.len());
-    for (path, mut operation) in selected {
-        let since = stale_since(&operation);
-        entries.push(ManifestEntry {
-            operation_id: operation.operation_id.clone(),
-            from: "memory/accepted".to_owned(),
-            to: "memory/stalled".to_owned(),
-            last_receipt_state: operation.last_receipt_state.clone(),
-            stale_since: since.map(|time| time.to_rfc3339()),
-            stale_seconds: since.map(|time| now.signed_duration_since(time).num_seconds()),
-        });
-        if !dry_run {
-            operation.state = "stalled".to_owned();
-            atomic_json(&path, &operation)?;
-            durable_rename(&path, &target_for(&path)?)?;
-        }
-    }
+    let entries = selected
+        .iter()
+        .map(|(_, operation)| {
+            let since = stale_since(operation);
+            ManifestEntry {
+                operation_id: operation.operation_id.clone(),
+                from: "memory/accepted".to_owned(),
+                to: "memory/stalled".to_owned(),
+                last_receipt_state: operation.last_receipt_state.clone(),
+                stale_since: since.map(|time| time.to_rfc3339()),
+                stale_seconds: since.map(|time| now.signed_duration_since(time).num_seconds()),
+            }
+        })
+        .collect();
     let manifest = Manifest {
         schema_version: 1,
         action: "quarantine",
@@ -1107,10 +1127,21 @@ fn quarantine(
         older_than_seconds: Some(older_than.as_secs()),
         operations: entries,
     };
-    if let Some(lock) = lock {
-        write_manifest(root, &manifest)?;
-        lock.unlock()?;
+    let Some(lock) = lock else {
+        return Ok(manifest);
+    };
+    // The manifest is written first, as a record of intent: if a move fails
+    // partway, every operation already in `memory/stalled` is still listed.
+    write_manifest(root, &manifest)?;
+    for (path, mut operation) in selected {
+        // Rename before rewriting the state, so a crash in between never
+        // leaves a "stalled" record in `memory/accepted`.
+        let target = target_for(&path)?;
+        durable_rename(&path, &target)?;
+        operation.state = "stalled".to_owned();
+        atomic_json(&target, &operation)?;
     }
+    lock.unlock()?;
     Ok(manifest)
 }
 
@@ -1157,26 +1188,17 @@ fn release(root: &Path, operation_ids: Option<&[String]>, now: DateTime<Utc>) ->
         }
         moves.push((path, target, state, operation));
     }
-    let mut entries = Vec::with_capacity(moves.len());
-    for (path, target, state, mut operation) in moves {
-        operation.state = state.to_owned();
-        operation.unchanged_polls = 0;
-        operation.next_poll_at = None;
-        if operation.receipt.is_some() {
-            // Restart the staleness clock so a released record gets a full window.
-            operation.last_receipt_change_at = Some(now.to_rfc3339());
-        }
-        atomic_json(&path, &operation)?;
-        durable_rename(&path, &target)?;
-        entries.push(ManifestEntry {
-            operation_id: operation.operation_id,
+    let entries = moves
+        .iter()
+        .map(|(_, _, state, operation)| ManifestEntry {
+            operation_id: operation.operation_id.clone(),
             from: "memory/stalled".to_owned(),
             to: format!("memory/{state}"),
-            last_receipt_state: operation.last_receipt_state,
+            last_receipt_state: operation.last_receipt_state.clone(),
             stale_since: None,
             stale_seconds: None,
-        });
-    }
+        })
+        .collect();
     let manifest = Manifest {
         schema_version: 1,
         action: "release",
@@ -1185,7 +1207,27 @@ fn release(root: &Path, operation_ids: Option<&[String]>, now: DateTime<Utc>) ->
         older_than_seconds: None,
         operations: entries,
     };
+    // Written first, as for quarantine, so a partial release is still on record.
     write_manifest(root, &manifest)?;
+    for (path, target, state, mut operation) in moves {
+        operation.state = state.to_owned();
+        operation.unchanged_polls = 0;
+        operation.next_poll_at = None;
+        if let Some(receipt) = &operation.receipt {
+            // Restart the staleness clock so a released record gets a full
+            // window. The receipt pair is recorded too: otherwise a record
+            // quarantined before its first poll would treat that poll as a
+            // first observation and reset the clock to the server's old
+            // `updated_at`, making it stale again at once.
+            operation.last_receipt_state = Some(receipt.state.clone());
+            operation.last_receipt_progress_seq = Some(receipt.progress_seq);
+            operation.last_receipt_change_at = Some(now.to_rfc3339());
+        }
+        // Rewrite before renaming: a crash in between leaves the record in
+        // `memory/stalled`, where a second release fixes it up.
+        atomic_json(&path, &operation)?;
+        durable_rename(&path, &target)?;
+    }
     lock.unlock()?;
     Ok(manifest)
 }
@@ -2032,12 +2074,41 @@ mod tests {
     }
 
     #[test]
+    fn released_legacy_record_gets_a_full_staleness_window() {
+        let temp = TempDir::new().unwrap();
+        ensure_layout(temp.path()).unwrap();
+        let mut operation = operation("add_memory", json!({"content":"delta"}));
+        operation.payload_hash = Some(canonical_payload_hash(&operation.arguments).unwrap());
+        let mut planned = receipt(&operation, "planned");
+        planned.updated_at = "2026-09-21T00:00:00Z".to_owned();
+        operation.receipt = Some(planned.clone());
+        operation.state = "stalled".to_owned();
+        atomic_json(
+            &temp.path().join("memory/stalled/operation-1.json"),
+            &operation,
+        )
+        .unwrap();
+        let now = Utc::now();
+
+        release(temp.path(), None, now).unwrap();
+        let path = temp.path().join("memory/accepted/operation-1.json");
+        let mut released = read_operation(&path).unwrap();
+        observe_receipt(&mut released, &planned, now + TimeDelta::minutes(1));
+
+        assert!(!is_stale(
+            &released,
+            now + TimeDelta::minutes(1),
+            Duration::from_secs(6 * 3_600)
+        ));
+    }
+
+    #[test]
     fn duration_flags_require_a_unit() {
         assert_eq!(parse_duration("90s"), Ok(Duration::from_secs(90)));
         assert_eq!(parse_duration("15m"), Ok(Duration::from_secs(900)));
         assert_eq!(parse_duration("6h"), Ok(Duration::from_secs(21_600)));
         assert_eq!(parse_duration("2d"), Ok(Duration::from_secs(172_800)));
-        for invalid in ["", "6", "h", "6x", "-1h", "1.5h"] {
+        for invalid in ["", "6", "h", "6x", "-1h", "1.5h", "0s", "0h"] {
             assert!(parse_duration(invalid).is_err(), "{invalid:?}");
         }
     }

@@ -35,6 +35,19 @@ no manifest. Every target is checked before anything moves, so a conflict or an
 unknown id leaves the queue unchanged. `release` restarts the staleness clock but
 keeps `firstAcceptedAt`, so the oldest-age metric still reflects the real wait.
 
+Each command writes its manifest before moving anything, so a partial run is
+still on record. `quarantine` renames and then rewrites the state, and `release`
+rewrites and then renames. Either way, a crash between the two steps never leaves
+a `stalled` record in `memory/accepted`. `release` also records the receipt's
+state and progress pair. Without it, a record quarantined before its first poll
+would treat that poll as a first observation and reset its clock to the server's
+old `updated_at`.
+
+A record reconciled out of `memory/submitting` in a run is not polled again when
+`memory/accepted` is listed later in the same run. Durations of zero are
+rejected. Unreadable accepted records are skipped by `quarantine`, as they are by
+`status`, so one bad file does not block quarantining the rest.
+
 ## Out of scope
 
 The `docs/guide/13-tools-reference.md` update and the `learning.worker` doctor
