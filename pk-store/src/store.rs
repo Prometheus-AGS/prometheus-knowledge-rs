@@ -234,16 +234,21 @@ impl MarkdownStore {
     /// in-memory snapshot, keeps existing index lines for pages this binary
     /// cannot parse, and replaces the file atomically (issue #15).
     pub async fn regenerate_index(&self) -> PkResult<()> {
+        let lock = self.lock_index().await?;
+        let result = self.rebuild_index_locked().await;
+        release_lock(lock);
+        result
+    }
+
+    /// Take the exclusive `wiki/.index.lock` that serializes every rewrite of
+    /// the reserved `index.md` and `log.md` files, across stores and processes.
+    /// The blocking wait runs off the async runtime threads.
+    async fn lock_index(&self) -> PkResult<File> {
         let lock_path = self.wiki_dir.join(INDEX_LOCK_FILENAME);
         let lock = tokio::task::spawn_blocking(move || acquire_exclusive_lock(&lock_path))
             .await
             .map_err(join_error)??;
-
-        let result = self.rebuild_index_locked().await;
-        // Closing the descriptor releases the lock; unlock explicitly anyway.
-        let _ = fs2::FileExt::unlock(&lock);
-        drop(lock);
-        result
+        Ok(lock)
     }
 
     async fn rebuild_index_locked(&self) -> PkResult<()> {
@@ -274,15 +279,30 @@ impl MarkdownStore {
     /// Append an entry to the wiki-root `log.md` (OKF v0.2 §9) under today's date
     /// group, newest first. `action` is the leading bold verb (`Creation`,
     /// `Update`, …).
+    ///
+    /// The read-modify-write runs under the same `wiki/.index.lock` as
+    /// `regenerate_index`, so concurrent appenders never drop each other's
+    /// lines.
     pub async fn append_log(&self, action: &str, title: &str, id: &ArticleId) -> PkResult<()> {
-        let path = self.wiki_dir.join("log.md");
-        let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let line = format!("* **{action}**: [{title}](/{}.md)", id.as_str());
-        let updated = crate::bundle::append_log_line(&existing, &date, &line);
-        write_atomic(&path, updated).await?;
-        debug!(path = %path.display(), action, "log.md appended");
+        let lock = self.lock_index().await?;
+        let result = self.append_log_locked(&line).await;
+        release_lock(lock);
+        result?;
+        debug!(action, "log.md appended");
         Ok(())
+    }
+
+    async fn append_log_locked(&self, line: &str) -> PkResult<()> {
+        let path = self.wiki_dir.join("log.md");
+        let existing = match tokio::fs::read(&path).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let updated = crate::bundle::append_log_line(&existing, &date, line);
+        write_atomic(&path, updated).await
     }
 
     pub async fn entry_count(&self) -> usize {
@@ -446,6 +466,13 @@ fn acquire_exclusive_lock(lock_path: &Path) -> std::io::Result<File> {
         .open(lock_path)?;
     fs2::FileExt::lock_exclusive(&lock)?;
     Ok(lock)
+}
+
+/// Release a lock taken by `acquire_exclusive_lock`. Closing the descriptor
+/// releases it too; unlocking first makes the hand-off explicit.
+fn release_lock(lock: File) {
+    let _ = fs2::FileExt::unlock(&lock);
+    drop(lock);
 }
 
 /// Replace `path` atomically: write a uniquely named temp file in the same
