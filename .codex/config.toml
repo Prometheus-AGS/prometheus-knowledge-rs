@@ -1,0 +1,3 @@
+[mcp_servers.compass]
+command = "compass"
+args = ["serve", "--transport", "stdio"]

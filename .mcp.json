@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "compass": {
+      "command": "compass",
+      "args": [
+        "serve",
+        "--transport",
+        "stdio"
+      ]
+    }
+  }
+}
