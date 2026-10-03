@@ -712,3 +712,69 @@ async fn concurrent_append_log_calls_keep_every_line() {
         missing.len()
     );
 }
+
+#[tokio::test]
+async fn page_whose_filename_differs_from_its_id_is_listed_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wiki = dir.path().join("wiki");
+    tokio::fs::create_dir_all(&wiki).await.unwrap();
+    tokio::fs::write(
+        wiki.join("foo.md"),
+        "---\nid: bar\ntitle: Bar\n---\n\nBody.\n",
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(
+        wiki.join("index.md"),
+        "---\nokf_version: \"0.2\"\n---\n\n# Wiki Index\n\n## Uncategorized\n\n* [Foo](/foo.md) - stale line for the file name\n",
+    )
+    .await
+    .unwrap();
+
+    let store = MarkdownStore::open(dir.path()).await.unwrap();
+    assert_eq!(store.readiness_report().await.parse_failures, 0);
+    store.regenerate_index().await.unwrap();
+
+    let index = tokio::fs::read_to_string(wiki.join("index.md"))
+        .await
+        .unwrap();
+    assert_eq!(index.matches("(/bar.md)").count(), 1, "{index}");
+    assert!(
+        !index.contains("(/foo.md)"),
+        "stale line carried for a page that parses: {index}"
+    );
+}
+
+#[tokio::test]
+async fn multi_line_description_survives_when_a_line_is_carried() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wiki = dir.path().join("wiki");
+    tokio::fs::create_dir_all(&wiki).await.unwrap();
+    tokio::fs::write(wiki.join("zeta-format.md"), UNPARSEABLE_PAGE)
+        .await
+        .unwrap();
+    tokio::fs::write(
+        wiki.join("index.md"),
+        "---\nokf_version: \"0.2\"\n---\n\n# Wiki Index\n\n## Reference\n\n* [Zeta Format](/zeta-format.md) - written by a newer binary\n",
+    )
+    .await
+    .unwrap();
+
+    let store = MarkdownStore::open(dir.path()).await.unwrap();
+    let mut axum = WikiEntry::new("Axum", "Async web framework.");
+    axum.description = Some("line one\nline two".into());
+    store.upsert(axum).await.unwrap();
+    store.regenerate_index().await.unwrap();
+
+    let index = tokio::fs::read_to_string(wiki.join("index.md"))
+        .await
+        .unwrap();
+    assert!(
+        index.contains("(/zeta-format.md)"),
+        "carried line lost: {index}"
+    );
+    assert!(
+        index.contains("[Axum](/axum.md) - line one\nline two"),
+        "multi-line description cut: {index}"
+    );
+}
