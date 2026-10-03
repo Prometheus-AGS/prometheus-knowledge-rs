@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "activeTeam": "prometheus-knowledge-maintainers",
+  "manifest": ".agent-team/prometheus-knowledge-maintainers/team.json",
+  "target": "deepseek",
+  "nativeDefinitions": [
+    ".dsh/profiles/prometheus-knowledge-maintainers-knowledge-lead/cordis.patch.yml",
+    ".dsh/profiles/prometheus-knowledge-maintainers-core-engineer/cordis.patch.yml",
+    ".dsh/profiles/prometheus-knowledge-maintainers-surfaces-engineer/cordis.patch.yml",
+    ".dsh/profiles/prometheus-knowledge-maintainers-learning-worker-engineer/cordis.patch.yml",
+    ".dsh/profiles/prometheus-knowledge-maintainers-verifier/cordis.patch.yml",
+    ".dsh/profiles/prometheus-knowledge-maintainers-team/cordis.patch.yml"
+  ],
+  "instructionFiles": [
+    "AGENTS.md",
+    "CLAUDE.md"
+  ],
+  "delegation": "native-definitions",
+  "limitations": [
+    "Native definition presence is not live invocation evidence. The active harness owns permissions, models, concurrency and delegation.",
+    "When delegation is unavailable, use selected role instructions sequentially and report it; builder-context review is not independent.",
+    "Zed external ACP agents use their native configuration; Zed parallel threads are not an automatic delegation API."
+  ]
+}

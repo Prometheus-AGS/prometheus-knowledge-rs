@@ -41,3 +41,7 @@ tarpaulin-report.html
 .prometheus/.writer.lock
 .prometheus/.review-pending
 .claude/settings.json.bak.*
+
+# agent-team-creator: local coordination state and install backups
+.agent-team/*/state.json
+.agent-team/recovery/
