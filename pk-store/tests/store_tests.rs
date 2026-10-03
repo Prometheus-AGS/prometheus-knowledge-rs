@@ -675,3 +675,40 @@ async fn rebuilt_index_drops_lines_for_deleted_pages() {
     );
     assert!(index.contains("[Axum](/axum.md)"), "Axum missing: {index}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_append_log_calls_keep_every_line() {
+    const ROUNDS: usize = 40;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = Arc::new(MarkdownStore::open(dir.path()).await.unwrap());
+    let second = Arc::new(MarkdownStore::open(dir.path()).await.unwrap());
+
+    let append_all = |store: Arc<MarkdownStore>, prefix: &'static str| async move {
+        for i in 0..ROUNDS {
+            let id = ArticleId::from(format!("{prefix}-{i}"));
+            store
+                .append_log("Creation", &format!("{prefix} {i}"), &id)
+                .await
+                .unwrap();
+        }
+    };
+    let a = tokio::spawn(append_all(first, "alpha"));
+    let b = tokio::spawn(append_all(second, "beta"));
+    let (ra, rb) = tokio::join!(a, b);
+    ra.unwrap();
+    rb.unwrap();
+
+    let log = tokio::fs::read_to_string(dir.path().join("wiki").join("log.md"))
+        .await
+        .unwrap();
+    let missing: Vec<String> = ["alpha", "beta"]
+        .iter()
+        .flat_map(|p| (0..ROUNDS).map(move |i| format!("(/{p}-{i}.md)")))
+        .filter(|needle| !log.contains(needle.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "log.md lost {} lines: {missing:?}",
+        missing.len()
+    );
+}
