@@ -36,3 +36,8 @@ logs/
 # Coverage reports
 lcov.info
 tarpaulin-report.html
+
+# prometheus-context-bootstrap
+.prometheus/.writer.lock
+.prometheus/.review-pending
+.claude/settings.json.bak.*
