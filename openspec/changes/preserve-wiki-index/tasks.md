@@ -14,7 +14,7 @@
 
 ## 3. Verification (verifier)
 
-- [ ] 3.1 Adversarial review and the serialized integration gate
+- [x] 3.1 Adversarial review and the serialized integration gate (PASS after one correction cycle; findings in .agent-team/prometheus-knowledge-maintainers/findings/issue-15-preserve-wiki-index.md)
 
 ## 4. Downstream (knowledge-lead)
 
