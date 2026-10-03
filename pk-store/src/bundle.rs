@@ -7,7 +7,7 @@
 
 use pk_core::types::{ArticleId, LintReport, LintSeverity, WikiEntry};
 use pulldown_cmark::{Event, Options, Parser, Tag};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 /// OKF v0.2 §6.1: a bundle-relative link begins with `/` (interpreted from the
 /// bundle root) and, for a concept link, ends in `.md`. Converts such a link
@@ -59,42 +59,49 @@ const LOG_TITLE: &str = "# Update Log";
 /// are sorted for deterministic output (stable diffs). Opens with the
 /// `okf_version` declaration and carries no other frontmatter (§8, §12).
 pub fn render_index(entries: &[WikiEntry]) -> String {
-    use std::collections::BTreeMap;
-
-    let mut groups: BTreeMap<String, Vec<&WikiEntry>> = BTreeMap::new();
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for e in entries {
         let group = e
             .entry_type
             .clone()
             .unwrap_or_else(|| "Uncategorized".to_string());
-        groups.entry(group).or_default().push(e);
+        let mut line = format!("* [{}](/{}.md)", e.title, e.id.as_str());
+        if let Some(desc) = e.description.as_deref().filter(|d| !d.trim().is_empty()) {
+            line.push_str(" - ");
+            line.push_str(desc.trim());
+        }
+        groups.entry(group).or_default().push(line);
     }
+    render_index_groups(groups)
+}
 
+/// Shared §8 layout: version block, title, then each `## Section` (BTreeMap
+/// order) with its entry lines sorted by title, case-insensitively. Ties fall
+/// back to the full line so the output never depends on input order.
+fn render_index_groups(groups: BTreeMap<String, Vec<String>>) -> String {
     let mut out = String::new();
     out.push_str(INDEX_VERSION_BLOCK);
     out.push_str(INDEX_TITLE);
     out.push_str("\n\n");
 
-    if entries.is_empty() {
+    if groups.values().all(Vec::is_empty) {
         out.push_str("_No entries yet._\n");
         return out;
     }
 
-    for (group, mut items) in groups {
-        items.sort_by_key(|item| item.title.to_lowercase());
+    for (group, mut lines) in groups {
+        if lines.is_empty() {
+            continue;
+        }
+        lines.sort_by_cached_key(|line| {
+            let title = parse_index_entry(line).map_or(String::new(), |(t, _)| t.to_lowercase());
+            (title, line.clone())
+        });
         out.push_str("## ");
         out.push_str(&group);
         out.push_str("\n\n");
-        for e in items {
-            out.push_str("* [");
-            out.push_str(&e.title);
-            out.push_str("](/");
-            out.push_str(e.id.as_str());
-            out.push_str(".md)");
-            if let Some(desc) = e.description.as_deref().filter(|d| !d.trim().is_empty()) {
-                out.push_str(" - ");
-                out.push_str(desc.trim());
-            }
+        for line in lines {
+            out.push_str(&line);
             out.push('\n');
         }
         out.push('\n');
@@ -105,6 +112,81 @@ pub fn render_index(entries: &[WikiEntry]) -> String {
         out.pop();
     }
     out
+}
+
+/// Parse a §8 entry line `* [Title](/id.md)...` into `(title, id)`.
+fn parse_index_entry(line: &str) -> Option<(&str, &str)> {
+    let rest = line.trim_start().strip_prefix("* [")?;
+    let (title, after) = rest.split_once("](/")?;
+    let (id, _) = after.split_once(".md)")?;
+    if id.is_empty() {
+        return None;
+    }
+    Some((title, id))
+}
+
+/// Split an `index.md` body into `## Section` → entry lines (CRLF tolerated,
+/// lines kept verbatim minus trailing whitespace). Entry lines that precede
+/// any section heading land under `Uncategorized`, as `render_index` would
+/// file them. Placeholders and other prose are ignored.
+fn index_sections(index: &str) -> BTreeMap<String, Vec<String>> {
+    let mut sections: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut current = "Uncategorized".to_string();
+    for raw in index.lines() {
+        let line = raw.trim_end();
+        if let Some(heading) = line.strip_prefix("## ") {
+            current = heading.to_string();
+            sections.entry(current.clone()).or_default();
+        } else if parse_index_entry(line).is_some() {
+            sections
+                .entry(current.clone())
+                .or_default()
+                .push(line.to_string());
+        }
+    }
+    sections
+}
+
+/// Carry entries of an `existing` index into a freshly `rendered` one (issue
+/// #15). An existing entry line is kept verbatim, under its existing section,
+/// when its id is a safe, non-reserved concept path, is NOT among
+/// `parsed_ids` (those are always rendered fresh), and `exists_on_disk(id)`
+/// reports its page file still exists. Every other existing line is dropped —
+/// that is how a deleted page leaves the index. Output keeps the
+/// `render_index` layout: version block, sorted sections, entries sorted by
+/// title, and no `_No entries yet._` placeholder once anything is listed.
+pub fn merge_preserved_index_entries(
+    rendered: &str,
+    existing: &str,
+    parsed_ids: &HashSet<ArticleId>,
+    exists_on_disk: impl Fn(&str) -> bool,
+) -> String {
+    let mut carried: Vec<(String, String)> = Vec::new();
+    for (section, lines) in index_sections(existing) {
+        for line in lines {
+            let Some((_, id)) = parse_index_entry(&line) else {
+                continue;
+            };
+            let article_id = ArticleId::from(id);
+            let file_name = id.rsplit('/').next().unwrap_or(id);
+            let keep = article_id.is_safe_path()
+                && !crate::markdown::is_reserved_filename(&format!("{file_name}.md"))
+                && !parsed_ids.contains(&article_id)
+                && exists_on_disk(id);
+            if keep && !carried.iter().any(|(_, l)| l == &line) {
+                carried.push((section.clone(), line));
+            }
+        }
+    }
+    if carried.is_empty() {
+        return rendered.to_string();
+    }
+
+    let mut groups = index_sections(rendered);
+    for (section, line) in carried {
+        groups.entry(section).or_default().push(line);
+    }
+    render_index_groups(groups)
 }
 
 /// Insert `line` under the `date` group in an existing OKF v0.2 §9 `log.md` body,
@@ -360,6 +442,94 @@ mod tests {
         e.entry_type = ty.map(str::to_owned);
         e.description = desc.map(str::to_owned);
         e
+    }
+
+    fn article_ids(list: &[&str]) -> HashSet<ArticleId> {
+        list.iter().map(|id| ArticleId::from(*id)).collect()
+    }
+
+    const EXISTING: &str = "---\r\nokf_version: \"0.2\"\r\n---\r\n\r\n# Wiki Index\r\n\r\n## Reference\r\n\r\n* [Zeta](/zeta.md) - kept verbatim\r\n* [Gone](/gone.md) - deleted\r\n* [Axum](/axum.md) - stale description\r\n\r\n## Tools\r\n\r\n* [Nested](/a/nested.md)\r\n";
+
+    #[test]
+    fn merge_carries_unparsed_existing_lines_under_their_section() {
+        let rendered = render_index(&[entry("axum", "Axum", Some("Reference"), Some("fresh"))]);
+        let merged =
+            merge_preserved_index_entries(&rendered, EXISTING, &article_ids(&["axum"]), |id| {
+                id != "gone"
+            });
+        assert_eq!(
+            merged,
+            "---\nokf_version: \"0.2\"\n---\n\n# Wiki Index\n\n## Reference\n\n\
+             * [Axum](/axum.md) - fresh\n* [Zeta](/zeta.md) - kept verbatim\n\n\
+             ## Tools\n\n* [Nested](/a/nested.md)\n"
+        );
+    }
+
+    #[test]
+    fn merge_sorts_carried_lines_among_fresh_ones_by_title() {
+        let rendered = render_index(&[
+            entry("alpha", "alpha", Some("Reference"), None),
+            entry("zulu", "Zulu", Some("Reference"), None),
+        ]);
+        let existing = "## Reference\n* [Mike](/mike.md)\n";
+        let merged = merge_preserved_index_entries(
+            &rendered,
+            existing,
+            &article_ids(&["alpha", "zulu"]),
+            |_| true,
+        );
+        let a = merged.find("[alpha]").unwrap();
+        let m = merged.find("[Mike]").unwrap();
+        let z = merged.find("[Zulu]").unwrap();
+        assert!(a < m && m < z, "unsorted: {merged}");
+    }
+
+    #[test]
+    fn merge_replaces_placeholder_when_only_carried_entries_remain() {
+        let rendered = render_index(&[]);
+        assert!(rendered.contains("_No entries yet._"));
+        let merged = merge_preserved_index_entries(&rendered, EXISTING, &article_ids(&[]), |id| {
+            id == "zeta"
+        });
+        assert!(!merged.contains("_No entries yet._"), "{merged}");
+        assert!(merged.starts_with(INDEX_VERSION_BLOCK));
+        assert!(merged.contains("## Reference\n\n* [Zeta](/zeta.md) - kept verbatim\n"));
+        assert!(!merged.contains("## Tools"), "{merged}");
+    }
+
+    #[test]
+    fn merge_returns_rendered_unchanged_when_nothing_is_carried() {
+        let rendered = render_index(&[entry("axum", "Axum", None, None)]);
+        let merged =
+            merge_preserved_index_entries(&rendered, EXISTING, &article_ids(&["axum"]), |_| false);
+        assert_eq!(merged, rendered);
+        assert_eq!(
+            merge_preserved_index_entries(&rendered, "", &article_ids(&[]), |_| true),
+            rendered
+        );
+    }
+
+    #[test]
+    fn merge_drops_unsafe_reserved_and_parsed_targets() {
+        let existing = "## Reference\n* [Up](/../secret.md)\n* [Index](/index.md)\n* [Log](/sub/log.md)\n* [Axum](/axum.md) - stale\n";
+        let rendered = render_index(&[]);
+        let merged =
+            merge_preserved_index_entries(&rendered, existing, &article_ids(&["axum"]), |_| true);
+        assert_eq!(merged, rendered);
+    }
+
+    #[test]
+    fn merge_puts_sectionless_lines_under_uncategorized_without_duplicates() {
+        let existing = "# Wiki Index\n\n* [Old](/old.md)\n* [Old](/old.md)\n";
+        let merged =
+            merge_preserved_index_entries(&render_index(&[]), existing, &article_ids(&[]), |_| {
+                true
+            });
+        assert!(
+            merged.ends_with("## Uncategorized\n\n* [Old](/old.md)\n"),
+            "{merged}"
+        );
+        assert_eq!(merged.matches("[Old]").count(), 1);
     }
 
     #[test]

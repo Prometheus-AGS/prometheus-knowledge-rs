@@ -9,9 +9,14 @@ use pk_core::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    fs::{File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -220,14 +225,49 @@ impl MarkdownStore {
         Ok(inner.entries.values().cloned().collect())
     }
 
-    /// Regenerate the wiki-root `index.md` (OKF v0.2 §8) from the current entries.
+    /// Regenerate the wiki-root `index.md` (OKF v0.2 §8) from the pages on disk.
     /// Called after every ingest so the catalog stays current.
+    ///
+    /// Holds an exclusive lock on `wiki/.index.lock` across scan, merge, render
+    /// and write, so concurrent rebuilds (other stores, other processes) are
+    /// serialized. Renders from a fresh disk scan rather than this store's
+    /// in-memory snapshot, keeps existing index lines for pages this binary
+    /// cannot parse, and replaces the file atomically (issue #15).
     pub async fn regenerate_index(&self) -> PkResult<()> {
-        let entries = self.snapshot().await?;
-        let content = crate::bundle::render_index(&entries);
+        let lock_path = self.wiki_dir.join(INDEX_LOCK_FILENAME);
+        let lock = tokio::task::spawn_blocking(move || acquire_exclusive_lock(&lock_path))
+            .await
+            .map_err(join_error)??;
+
+        let result = self.rebuild_index_locked().await;
+        // Closing the descriptor releases the lock; unlock explicitly anyway.
+        let _ = fs2::FileExt::unlock(&lock);
+        drop(lock);
+        result
+    }
+
+    async fn rebuild_index_locked(&self) -> PkResult<()> {
+        let scan = scan_wiki_tree(&self.wiki_dir).await?;
+        let entries: Vec<WikiEntry> = scan.entries.values().cloned().collect();
+        let parsed_ids: HashSet<ArticleId> = scan.entries.into_keys().collect();
+        let rendered = crate::bundle::render_index(&entries);
+
         let path = self.wiki_dir.join("index.md");
-        tokio::fs::write(&path, content).await?;
-        debug!(path = %path.display(), "index.md regenerated");
+        let existing = match tokio::fs::read(&path).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let content =
+            crate::bundle::merge_preserved_index_entries(&rendered, &existing, &parsed_ids, |id| {
+                article_path(&self.wiki_dir, &ArticleId::from(id)).is_file()
+            });
+        write_atomic(&path, content).await?;
+        debug!(
+            path = %path.display(),
+            parse_failures = scan.parse_failures,
+            "index.md regenerated"
+        );
         Ok(())
     }
 
@@ -240,7 +280,7 @@ impl MarkdownStore {
         let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let line = format!("* **{action}**: [{title}](/{}.md)", id.as_str());
         let updated = crate::bundle::append_log_line(&existing, &date, &line);
-        tokio::fs::write(&path, updated).await?;
+        write_atomic(&path, updated).await?;
         debug!(path = %path.display(), action, "log.md appended");
         Ok(())
     }
@@ -255,8 +295,6 @@ impl MarkdownStore {
     /// reserved `index.md`/`log.md` structure. Orphan detection uses the
     /// in-memory snapshot.
     pub async fn okf_conformance_reports(&self) -> PkResult<Vec<LintReport>> {
-        use std::collections::HashSet;
-
         let mut concept_files: Vec<(String, String)> = Vec::new();
         let mut index_raw: Option<String> = None;
         let mut log_raw: Option<String> = None;
@@ -386,6 +424,69 @@ impl MarkdownStore {
         tokio::fs::write(&path, content).await?;
         Ok(path)
     }
+}
+
+/// Lock file serializing `index.md` rebuilds. No `.md` extension, so the
+/// wiki scan never treats it as a concept page.
+const INDEX_LOCK_FILENAME: &str = ".index.lock";
+
+fn join_error(error: tokio::task::JoinError) -> PkError {
+    PkError::from(std::io::Error::other(error))
+}
+
+/// Open (creating if needed) `lock_path` and take a blocking exclusive `fs2`
+/// lock on it. Call only from a blocking context. The lock lives as long as
+/// the returned `File`.
+fn acquire_exclusive_lock(lock_path: &Path) -> std::io::Result<File> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    Ok(lock)
+}
+
+/// Replace `path` atomically: write a uniquely named temp file in the same
+/// directory, sync it, then rename it over the target. A crash leaves either
+/// the old file or the new one, never a truncated one.
+async fn write_atomic(path: &Path, contents: String) -> PkResult<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || write_atomic_blocking(&path, contents.as_bytes()))
+        .await
+        .map_err(join_error)??;
+    Ok(())
+}
+
+fn write_atomic_blocking(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let tmp = dir.join(format!(
+        ".{name}.{}.{nanos}.{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let written = write_synced(&tmp, contents).and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+fn write_synced(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
 }
 
 async fn scan_wiki_tree(wiki_dir: &Path) -> PkResult<ScanOutcome> {
