@@ -1363,6 +1363,7 @@ version = "1.9.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "fs2",
  "pk-core",
  "pulldown-cmark",
  "serde",
