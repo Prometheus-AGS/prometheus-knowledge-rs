@@ -1,0 +1,12 @@
+# Authoritative architecture decisions and dependency pins.
+# Agents must not contradict this file, and must not edit it — .claude/settings.json
+# denies Edit(versions.toml). Change it deliberately, by hand.
+
+[meta]
+created = "2026-10-03"
+
+[pins]
+# name = "x.y.z"
+
+[decisions]
+# id = "rationale"

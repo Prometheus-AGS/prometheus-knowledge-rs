@@ -1,0 +1,8 @@
+{
+  "phase": "spec",
+  "status": "ready",
+  "task": null,
+  "waypoint": "bootstrap",
+  "updated": "2026-10-03",
+  "note": "Authoritative for position. tier-guard.sh reads .status; final artifact commands require a completed or release boundary."
+}
