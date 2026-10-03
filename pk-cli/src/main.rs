@@ -1291,6 +1291,9 @@ fn run_doctor(json_output: bool, project_kb: &Path) -> Result<()> {
     .into_iter()
     .map(|relative| count_json(&queue.join(relative)))
     .sum::<usize>();
+    // Quarantined by `prometheus-learning-worker quarantine`: an operator
+    // decision, not an unsettled record, so it is reported but not failed on.
+    let stalled = count_json(&queue.join("memory/stalled"));
     let configured_worker = std::env::var_os("PROMETHEUS_LEARNING_WORKER_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/bin/prometheus-learning-worker"));
@@ -1329,7 +1332,7 @@ fn run_doctor(json_output: bool, project_kb: &Path) -> Result<()> {
             name: "learning-queue",
             status: if queue_healthy { "PASS" } else { "FAIL" },
             detail: format!(
-                "worker {}, unsettled records {unsettled}, queue {}",
+                "worker {}, unsettled records {unsettled}, stalled records {stalled}, queue {}",
                 if worker_installed {
                     "installed"
                 } else {
