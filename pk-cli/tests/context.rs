@@ -184,6 +184,9 @@ fn candidate_budget_is_shared_across_requested_scopes() {
 
     assert!(output.status.success());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["candidate_count"], 2);
+    // Every entry in both scopes is scored; only the matching one survives,
+    // and the cap bounds what is kept, not what is inspected.
+    assert_eq!(report["scored_count"], 5);
+    assert_eq!(report["candidate_count"], 1);
     assert_eq!(report["results"][0]["id"], "shared-target");
 }
