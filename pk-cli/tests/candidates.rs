@@ -105,8 +105,14 @@ fn accept_writes_the_shared_snapshot_queues_a_global_operation_and_moves_the_fil
     let operation = &operations[0];
     assert_eq!(operation["schemaVersion"], 2);
     assert_eq!(operation["method"], "add_memory");
-    assert_eq!(operation["arguments"]["user_id"], "@global", "{operation:#}");
-    assert_eq!(operation["arguments"]["agent_id"], "@global", "{operation:#}");
+    assert_eq!(
+        operation["arguments"]["user_id"], "@global",
+        "{operation:#}"
+    );
+    assert_eq!(
+        operation["arguments"]["agent_id"], "@global",
+        "{operation:#}"
+    );
     assert_eq!(operation["arguments"]["content"], content);
     let expected_hash: String =
         Sha256::digest(serde_json::to_vec(&operation["arguments"]).unwrap())
@@ -117,7 +123,9 @@ fn accept_writes_the_shared_snapshot_queues_a_global_operation_and_moves_the_fil
 
     // The candidate moved to accepted/.
     assert!(!pending.exists(), "pending file must be gone");
-    let moved = home.join(format!(".prometheus/promotion-candidates/accepted/{id}.json"));
+    let moved = home.join(format!(
+        ".prometheus/promotion-candidates/accepted/{id}.json"
+    ));
     let record: Value = serde_json::from_slice(&fs::read(&moved).unwrap()).unwrap();
     assert_eq!(record["state"], "accepted");
 
@@ -133,7 +141,10 @@ fn reject_moves_the_file_and_skill_accept_is_not_yet_supported() {
     let home = fixture.path().join("home");
     fs::create_dir_all(&home).unwrap();
     let pending = write_candidate(&home, "promotion-candidates", "promo-reject", "A lesson.");
-    let rejected = pk(&home, &["candidates", "reject", "promo-reject", "--reason", "noise"]);
+    let rejected = pk(
+        &home,
+        &["candidates", "reject", "promo-reject", "--reason", "noise"],
+    );
     assert_ok(&rejected, "candidates reject");
     assert!(!pending.exists());
     assert!(home
@@ -144,8 +155,14 @@ fn reject_moves_the_file_and_skill_accept_is_not_yet_supported() {
     let listed = pk(&home, &["candidates", "list", "--kind", "skill"]);
     assert_ok(&listed, "candidates list --kind skill");
     assert!(String::from_utf8_lossy(&listed.stdout).contains("skill-one"));
-    let accept = pk(&home, &["candidates", "accept", "skill-one", "--kind", "skill"]);
+    let accept = pk(
+        &home,
+        &["candidates", "accept", "skill-one", "--kind", "skill"],
+    );
     assert!(!accept.status.success(), "skill accept must exit non-zero");
     assert!(String::from_utf8_lossy(&accept.stderr).contains("not yet supported"));
-    assert!(skill.exists(), "an unsupported accept leaves the file in place");
+    assert!(
+        skill.exists(),
+        "an unsupported accept leaves the file in place"
+    );
 }
