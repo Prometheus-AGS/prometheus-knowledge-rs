@@ -145,7 +145,8 @@ enum Cmd {
         scopes: Vec<ContextScope>,
         #[arg(long, default_value_t = 8)]
         limit: usize,
-        /// Maximum immutable snapshot candidates inspected across all scopes.
+        /// Maximum scored candidates kept across all scopes. Every snapshot entry
+        /// is scored first; the cap applies to the merged, ranked list.
         #[arg(long, default_value_t = 128)]
         max_candidates: usize,
         /// Maximum bytes emitted in hook format.
@@ -659,6 +660,9 @@ struct ContextCandidate {
 struct ContextOutput {
     query: String,
     snapshot_generations: BTreeMap<String, String>,
+    /// Snapshot entries scored across all readable scopes.
+    scored_count: usize,
+    /// Ranked candidates kept after de-duplication and the `--max-candidates` cap.
     candidate_count: usize,
     byte_count: usize,
     failures: Vec<ContextFailure>,
@@ -705,10 +709,9 @@ async fn run_context(
     };
     let max_candidates = max_candidates.clamp(1, 512);
     let max_bytes = max_bytes.clamp(256, 65_536);
-    let candidates_per_scope = max_candidates.div_ceil(scopes.len().max(1));
     let mut failures = Vec::new();
     let mut candidates = Vec::new();
-    let mut inspected_candidates = 0usize;
+    let mut scored_count = 0usize;
     let mut generations = BTreeMap::new();
     for scope in scopes {
         let Some(path) = knowledge_root_for_scope(scope, explicit_project_kb) else {
@@ -732,16 +735,11 @@ async fn run_context(
             }
         };
         generations.insert(scope.label().to_owned(), snapshot.generation);
-        let remaining = max_candidates
-            .saturating_sub(inspected_candidates)
-            .min(candidates_per_scope);
-        let bounded_entries = snapshot
-            .entries
-            .into_iter()
-            .take(remaining)
-            .collect::<Vec<_>>();
-        inspected_candidates += bounded_entries.len();
-        candidates.extend(bounded_entries.into_iter().filter_map(|entry| {
+        // Score every entry before any budget applies: truncating first meant
+        // only the first entries in snapshot order were ever considered, and a
+        // failed scope's share of the budget was lost.
+        scored_count += snapshot.entries.len();
+        candidates.extend(snapshot.entries.into_iter().filter_map(|entry| {
             let score = snapshot_score(query, &entry);
             (score > 0.0 || query.trim().is_empty()).then_some(ContextCandidate {
                 scope,
@@ -749,9 +747,6 @@ async fn run_context(
                 score,
             })
         }));
-        if inspected_candidates == max_candidates {
-            break;
-        }
     }
 
     // Select a canonical copy of duplicate IDs or duplicate content. Scope
@@ -793,6 +788,8 @@ async fn run_context(
             .then_with(|| left.scope.priority().cmp(&right.scope.priority()))
             .then_with(|| left.entry.id.as_str().cmp(right.entry.id.as_str()))
     });
+    selected.truncate(max_candidates);
+    let candidate_count = selected.len();
     selected.truncate(limit.clamp(1, 32));
 
     let results = selected
@@ -811,7 +808,8 @@ async fn run_context(
     let mut output = ContextOutput {
         query: query.to_owned(),
         snapshot_generations: generations,
-        candidate_count: inspected_candidates,
+        scored_count,
+        candidate_count,
         byte_count: 0,
         failures,
         results,
