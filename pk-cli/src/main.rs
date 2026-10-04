@@ -100,6 +100,12 @@ enum Cmd {
         /// Skip confirmation prompt when using --scope=shared
         #[arg(long, default_value_t = false)]
         yes: bool,
+        /// OKF entry type (e.g. Lesson, Gotcha, Decision). Defaults to Reference.
+        #[arg(long = "type")]
+        entry_type: Option<String>,
+        /// Tag to add to the entry (repeatable), e.g. role:api-dev, vis:team.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
     },
     /// Run a lint pass over the full knowledge base
     Lint {
@@ -154,6 +160,9 @@ enum Cmd {
         max_bytes: usize,
         #[arg(long, value_enum, default_value = "hook")]
         format: ContextFormat,
+        /// Keep only entries carrying this tag (repeatable; all must match).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
     },
     /// Publish immutable prompt-snapshot generations from local knowledge stores.
     Snapshot {
@@ -287,6 +296,7 @@ async fn main() -> Result<()> {
         max_candidates,
         max_bytes,
         format,
+        tags,
     } = &cli.command
     {
         return run_context(
@@ -296,6 +306,7 @@ async fn main() -> Result<()> {
             *max_candidates,
             *max_bytes,
             *format,
+            tags,
             cli.kb_dir.as_deref(),
         )
         .await;
@@ -348,6 +359,8 @@ async fn main() -> Result<()> {
             source,
             scope,
             yes,
+            entry_type,
+            tags,
         } => {
             // For shared scope, require confirmation unless --yes passed
             if matches!(scope, KbScope::Shared) && !yes {
@@ -374,7 +387,9 @@ async fn main() -> Result<()> {
                 }
             };
             let doc = RawDoc::from_path(source_label, content);
-            let entry = librarian.compile(doc).await?;
+            let entry = librarian
+                .compile_with(doc, pk_librarian::CompileOverrides { entry_type, tags })
+                .await?;
             commit_prompt_snapshot(&kb_dir, scope.snapshot_label(), store.snapshot().await?)?;
             println!("✓ compiled → {} [{}]", entry.title, entry.id);
         }
@@ -691,6 +706,7 @@ async fn run_context(
     max_candidates: usize,
     max_bytes: usize,
     format: ContextFormat,
+    required_tags: &[String],
     explicit_project_kb: Option<&str>,
 ) -> Result<()> {
     let scopes = if requested_scopes.is_empty() {
@@ -738,8 +754,18 @@ async fn run_context(
         // Score every entry before any budget applies: truncating first meant
         // only the first entries in snapshot order were ever considered, and a
         // failed scope's share of the budget was lost.
-        scored_count += snapshot.entries.len();
-        candidates.extend(snapshot.entries.into_iter().filter_map(|entry| {
+        // `--tag` filters before scoring: an entry must carry every requested tag.
+        let entries: Vec<_> = snapshot
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                required_tags
+                    .iter()
+                    .all(|tag| entry.tags.iter().any(|candidate| candidate == tag))
+            })
+            .collect();
+        scored_count += entries.len();
+        candidates.extend(entries.into_iter().filter_map(|entry| {
             let score = snapshot_score(query, &entry);
             (score > 0.0 || query.trim().is_empty()).then_some(ContextCandidate {
                 scope,
