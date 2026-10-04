@@ -64,11 +64,17 @@ pub enum CandidatesCmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Accept a pending candidate: write it to the shared KB, publish the shared
-    /// prompt snapshot, queue a surreal-memory operation, move it to accepted/.
+    /// Accept a pending candidate. Promotion: write it to the shared KB, publish
+    /// the shared prompt snapshot, queue a surreal-memory operation, move it to
+    /// accepted/. Skill: print the `/pmpo-skill-creator` invocation and the
+    /// evidence path, move it to accepted/; no skill is created.
     Accept {
         #[arg()]
         id: String,
+        /// Skill kind only: print `/pmpo-skill-creator --update <skill>` for this
+        /// installed skill instead of a create invocation.
+        #[arg(long, value_name = "SKILL")]
+        update: Option<String>,
     },
     /// Reject a pending candidate: move it to rejected/. It is never proposed again.
     Reject {
@@ -84,11 +90,14 @@ pub async fn run(kind: CandidateKind, action: CandidatesCmd) -> Result<()> {
     let root = candidates_root(&home, kind);
     match action {
         CandidatesCmd::List { state, json } => list(&root, state, json),
-        CandidatesCmd::Accept { id } => match kind {
-            CandidateKind::Promotion => accept_promotion(&home, &root, &id).await,
-            CandidateKind::Skill => bail!(
-                "accepting skill candidates is not yet supported; use `pk candidates reject --kind skill` or wait for skill promotion support"
-            ),
+        CandidatesCmd::Accept { id, update } => match kind {
+            CandidateKind::Promotion => {
+                if update.is_some() {
+                    bail!("--update applies only to `--kind skill`");
+                }
+                accept_promotion(&home, &root, &id).await
+            }
+            CandidateKind::Skill => accept_skill(&root, &id, update.as_deref()),
         },
         CandidatesCmd::Reject { id, reason } => reject(&root, &id, reason.as_deref()),
     }
@@ -194,6 +203,75 @@ fn pending_candidate(root: &Path, id: &str) -> Result<(PathBuf, Value)> {
     let value = serde_json::from_slice(&fs::read(&pending)?)
         .with_context(|| format!("unreadable candidate {}", pending.display()))?;
     Ok((pending, value))
+}
+
+/// Accept a skill candidate: print the invocation, never touch a skill. The
+/// invocation is `--update <skill>` for an update candidate (or when `--update`
+/// names one), else `create "<summary>"`.
+fn accept_skill(root: &Path, id: &str, update: Option<&str>) -> Result<()> {
+    let (pending, mut candidate) = pending_candidate(root, id)?;
+    let update_skill = match update {
+        Some(skill) => Some(skill.to_owned()),
+        None if candidate.get("candidateType").and_then(Value::as_str) == Some("skill-update") => {
+            candidate
+                .get("skillName")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }
+        None => None,
+    };
+    let invocation = match &update_skill {
+        Some(skill) => {
+            validate_skill_name(skill)?;
+            format!("/pmpo-skill-creator --update {skill}")
+        }
+        None => {
+            let summary = candidate
+                .get("summary")
+                .or_else(|| candidate.get("title"))
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .context("candidate has no summary or title")?;
+            let quoted: String = summary
+                .chars()
+                .map(|c| if c == '"' || c.is_control() { ' ' } else { c })
+                .collect();
+            format!("/pmpo-skill-creator create \"{}\"", quoted.trim())
+        }
+    };
+
+    let accepted = root.join("accepted").join(format!("{id}.json"));
+    let now = rfc3339_now();
+    candidate["state"] = json!("accepted");
+    candidate["acceptedAt"] = json!(now);
+    candidate["updatedAt"] = json!(now);
+    candidate["invocation"] = json!(invocation);
+    atomic_json(&pending, &candidate)?;
+    durable_rename(&pending, &accepted)?;
+    println!("accepted {id}");
+    println!("Run: {invocation}");
+    println!("Evidence: {}", accepted.display());
+    if let Some(index) = root
+        .parent()
+        .map(|home| home.join("learning-index/workflows.jsonl"))
+        .filter(|path| path.exists())
+    {
+        println!("Workflow index: {}", index.display());
+    }
+    Ok(())
+}
+
+/// Skill names are echoed into a command line, so only a file-name alphabet passes.
+fn validate_skill_name(skill: &str) -> Result<()> {
+    let safe = !skill.is_empty()
+        && !skill.starts_with(['.', '-'])
+        && skill
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    if !safe {
+        bail!("invalid skill name {skill:?}");
+    }
+    Ok(())
 }
 
 async fn accept_promotion(home: &Path, root: &Path, id: &str) -> Result<()> {
