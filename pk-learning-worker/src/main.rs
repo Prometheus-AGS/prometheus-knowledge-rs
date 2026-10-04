@@ -1675,6 +1675,9 @@ mod tests {
             captured_at: "2026-08-03T00:00:00Z".to_owned(),
             payload_digest: "fixture".to_owned(),
             scope: LearningScope::Project,
+            project_id: None,
+            team_id: None,
+            role_id: None,
             attempt: 0,
         }
     }

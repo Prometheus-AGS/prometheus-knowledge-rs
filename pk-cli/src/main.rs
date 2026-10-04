@@ -299,17 +299,16 @@ async fn main() -> Result<()> {
         tags,
     } = &cli.command
     {
-        return run_context(
+        let request = ContextRequest {
             query,
             scopes,
-            *limit,
-            *max_candidates,
-            *max_bytes,
-            *format,
+            limit: *limit,
+            max_candidates: *max_candidates,
+            max_bytes: *max_bytes,
+            format: *format,
             tags,
-            cli.kb_dir.as_deref(),
-        )
-        .await;
+        };
+        return run_context(request, cli.kb_dir.as_deref()).await;
     }
     if let Cmd::Snapshot { scopes } = &cli.command {
         return run_snapshot(scopes, cli.kb_dir.as_deref()).await;
@@ -699,16 +698,27 @@ struct ContextItem {
     score: f32,
 }
 
-async fn run_context(
-    query: &str,
-    requested_scopes: &[ContextScope],
+/// Options for a single `pk context` invocation, borrowed from the parsed CLI.
+struct ContextRequest<'a> {
+    query: &'a str,
+    scopes: &'a [ContextScope],
     limit: usize,
     max_candidates: usize,
     max_bytes: usize,
     format: ContextFormat,
-    required_tags: &[String],
-    explicit_project_kb: Option<&str>,
-) -> Result<()> {
+    tags: &'a [String],
+}
+
+async fn run_context(request: ContextRequest<'_>, explicit_project_kb: Option<&str>) -> Result<()> {
+    let ContextRequest {
+        query,
+        scopes: requested_scopes,
+        limit,
+        max_candidates,
+        max_bytes,
+        format,
+        tags: required_tags,
+    } = request;
     let scopes = if requested_scopes.is_empty() {
         vec![
             ContextScope::Project,
