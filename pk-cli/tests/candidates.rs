@@ -136,7 +136,7 @@ fn accept_writes_the_shared_snapshot_queues_a_global_operation_and_moves_the_fil
 }
 
 #[test]
-fn reject_moves_the_file_and_skill_accept_is_not_yet_supported() {
+fn reject_moves_the_file_for_both_candidate_kinds() {
     let fixture = tempfile::tempdir().unwrap();
     let home = fixture.path().join("home");
     fs::create_dir_all(&home).unwrap();
@@ -151,18 +151,141 @@ fn reject_moves_the_file_and_skill_accept_is_not_yet_supported() {
         .join(".prometheus/promotion-candidates/rejected/promo-reject.json")
         .exists());
 
-    let skill = write_candidate(&home, "skill-candidates", "skill-one", "A skill.");
+    write_candidate(&home, "skill-candidates", "skill-one", "A skill.");
     let listed = pk(&home, &["candidates", "list", "--kind", "skill"]);
     assert_ok(&listed, "candidates list --kind skill");
     assert!(String::from_utf8_lossy(&listed.stdout).contains("skill-one"));
+    let rejected = pk(
+        &home,
+        &["candidates", "reject", "skill-one", "--kind", "skill"],
+    );
+    assert_ok(&rejected, "candidates reject --kind skill");
+    assert!(home
+        .join(".prometheus/skill-candidates/rejected/skill-one.json")
+        .exists());
+}
+
+fn write_skill_candidate(home: &Path, id: &str, extra: Value) -> PathBuf {
+    let path = home
+        .join(".prometheus/skill-candidates/pending")
+        .join(format!("{id}.json"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut candidate = json!({
+        "schemaVersion": 1,
+        "id": id,
+        "kind": "skill",
+        "state": "pending",
+        "reasons": ["sessions>=3"],
+        "evidence": [{"workflowId": "w1", "projectId": "project:alpha"}],
+        "createdAt": "2026-10-04T00:00:00Z",
+        "updatedAt": "2026-10-04T00:00:00Z"
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        candidate[key] = value.clone();
+    }
+    fs::write(&path, serde_json::to_vec_pretty(&candidate).unwrap()).unwrap();
+    path
+}
+
+#[test]
+fn skill_accept_prints_the_create_invocation_and_never_creates_a_skill() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let pending = write_skill_candidate(
+        &home,
+        "skill-new-0001",
+        json!({
+            "candidateType": "new-skill",
+            "title": "New skill: weekly status report",
+            "summary": "Write the weekly \"status\" report"
+        }),
+    );
+
     let accept = pk(
         &home,
-        &["candidates", "accept", "skill-one", "--kind", "skill"],
+        &["candidates", "accept", "skill-new-0001", "--kind", "skill"],
     );
-    assert!(!accept.status.success(), "skill accept must exit non-zero");
-    assert!(String::from_utf8_lossy(&accept.stderr).contains("not yet supported"));
+    assert_ok(&accept, "candidates accept --kind skill");
+    let stdout = String::from_utf8_lossy(&accept.stdout);
     assert!(
-        skill.exists(),
-        "an unsupported accept leaves the file in place"
+        stdout.contains("/pmpo-skill-creator create \"Write the weekly  status  report\""),
+        "{stdout}"
     );
+    let accepted = home.join(".prometheus/skill-candidates/accepted/skill-new-0001.json");
+    assert!(
+        stdout.contains(&accepted.display().to_string()),
+        "the evidence path is printed: {stdout}"
+    );
+    assert!(!pending.exists(), "pending file must be gone");
+    let record: Value = serde_json::from_slice(&fs::read(&accepted).unwrap()).unwrap();
+    assert_eq!(record["state"], "accepted");
+    for created in [".claude/skills", ".codex/skills", ".prometheus/skills"] {
+        assert!(
+            !home.join(created).exists(),
+            "accept must never create a skill ({created})"
+        );
+    }
+
+    let again = pk(
+        &home,
+        &["candidates", "accept", "skill-new-0001", "--kind", "skill"],
+    );
+    assert!(!again.status.success(), "a second accept is refused");
+}
+
+#[test]
+fn skill_accept_of_an_update_candidate_prints_the_update_invocation() {
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    write_skill_candidate(
+        &home,
+        "skill-upd-0001",
+        json!({
+            "candidateType": "skill-update",
+            "skillName": "kbd-plan",
+            "teamId": "kbd-team",
+            "roleId": "planner",
+            "title": "Update kbd-plan"
+        }),
+    );
+    let accept = pk(
+        &home,
+        &["candidates", "accept", "skill-upd-0001", "--kind", "skill"],
+    );
+    assert_ok(&accept, "accept update candidate");
+    assert!(String::from_utf8_lossy(&accept.stdout)
+        .contains("/pmpo-skill-creator --update kbd-plan"));
+
+    // `--update <skill>` forces the update form for a new-skill candidate.
+    write_skill_candidate(
+        &home,
+        "skill-new-0002",
+        json!({"candidateType": "new-skill", "summary": "Write a report"}),
+    );
+    let forced = pk(
+        &home,
+        &[
+            "candidates", "accept", "skill-new-0002", "--kind", "skill", "--update", "learn-goal",
+        ],
+    );
+    assert_ok(&forced, "accept --update");
+    assert!(String::from_utf8_lossy(&forced.stdout)
+        .contains("/pmpo-skill-creator --update learn-goal"));
+
+    // A skill name is echoed into a command line, so a path-like one is refused.
+    let pending = write_skill_candidate(
+        &home,
+        "skill-new-0003",
+        json!({"candidateType": "new-skill", "summary": "Write a report"}),
+    );
+    let bad = pk(
+        &home,
+        &[
+            "candidates", "accept", "skill-new-0003", "--kind", "skill", "--update", "../evil",
+        ],
+    );
+    assert!(!bad.status.success());
+    assert!(pending.exists(), "a refused accept leaves the file in place");
 }
