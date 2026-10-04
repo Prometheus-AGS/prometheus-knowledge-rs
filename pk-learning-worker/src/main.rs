@@ -18,6 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod promotion;
+
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MEMORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// First wait before re-polling an accepted operation whose receipt did not change.
@@ -366,9 +368,13 @@ async fn run_once(root: &Path, memory_url: &str, stale_after: Duration) -> Resul
         started_at: Utc::now().to_rfc3339(),
         ..RunSummary::default()
     };
+    let mut observations = Vec::new();
     for path in json_files(&root.join("pending"))? {
         match process_job(root, &path).await {
-            Ok(()) => summary.jobs_completed += 1,
+            Ok(observed) => {
+                summary.jobs_completed += 1;
+                observations.extend(observed);
+            }
             Err(error) => {
                 summary.last_error = Some(error.to_string());
                 let completed = root
@@ -385,6 +391,11 @@ async fn run_once(root: &Path, memory_url: &str, stale_after: Duration) -> Resul
                 summary.jobs_rejected += 1;
             }
         }
+    }
+    // Promotion only proposes; a failure here must not hold up memory delivery.
+    if let Err(error) = promotion::run(&observations) {
+        tracing::warn!(error = %error, "promotion detector failed");
+        summary.last_error = Some(format!("promotion detector: {error}"));
     }
 
     let client = memory_client(MEMORY_REQUEST_TIMEOUT)?;
@@ -511,7 +522,7 @@ fn migrate_legacy_memory_retry(root: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn process_job(root: &Path, pending_path: &Path) -> Result<()> {
+async fn process_job(root: &Path, pending_path: &Path) -> Result<Vec<promotion::Observation>> {
     let name = pending_path
         .file_name()
         .context("job path has no filename")?;
@@ -525,7 +536,7 @@ async fn process_job(root: &Path, pending_path: &Path) -> Result<()> {
     let completed = root.join("completed").join(name);
     if completed.exists() {
         preserve_duplicate(root, &processing, "duplicate-completed")?;
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let packet = build_session_packet(&job)?;
@@ -569,18 +580,51 @@ async fn process_job(root: &Path, pending_path: &Path) -> Result<()> {
     // Publish the store's current entries as the committed prompt snapshot that
     // `pk context` reads. Without this, session records were written to disk
     // but never became recallable.
+    let entries = store.snapshot().await?;
+    let project_id = lesson_project_id(&job);
+    let mut observations = job
+        .transcript_path
+        .as_deref()
+        .and_then(extract_final_assistant_message)
+        .map(|message| {
+            promotion::observations_from_message(
+                &project_id,
+                &job.project_root,
+                &job.session_id,
+                &message,
+            )
+        })
+        .unwrap_or_default();
+    if matches!(job.scope, LearningScope::Project) {
+        observations.extend(promotion::observations_from_entries(
+            &project_id,
+            &job.project_root,
+            &entries,
+        ));
+    }
     pk_store::commit_prompt_snapshot(
         &target_kb,
         match job.scope {
             LearningScope::Project => "project",
             LearningScope::Shared => "shared",
         },
-        store.snapshot().await?,
+        entries,
     )?;
     append_learning_log(&job, &packet)?;
     enqueue_memory(root, &job, &packet)?;
     durable_rename(&processing, &completed)?;
-    Ok(())
+    Ok(observations)
+}
+
+/// The project a lesson belongs to, for cross-project recurrence: the job's
+/// resolved project id, else the same fallback the memory scope keys use.
+fn lesson_project_id(job: &LearningJob) -> String {
+    job.project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| project_scope(&job.project_root))
 }
 
 fn build_session_packet(job: &LearningJob) -> Result<String> {

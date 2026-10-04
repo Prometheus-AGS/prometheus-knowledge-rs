@@ -23,6 +23,8 @@ use std::{
 };
 use tokio::sync::broadcast;
 
+mod candidates;
+
 /// KB scope: project-local (default) or globally shared across projects.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum KbScope {
@@ -220,6 +222,14 @@ enum Cmd {
         #[command(subcommand)]
         action: EventsCmd,
     },
+    /// Review promotion or skill candidates proposed by the learning worker
+    Candidates {
+        /// Candidate kind: promotion (lessons for user/global scope) or skill.
+        #[arg(long, value_enum, default_value = "promotion", global = true)]
+        kind: candidates::CandidateKind,
+        #[command(subcommand)]
+        action: candidates::CandidatesCmd,
+    },
     /// Migrate single-store events to dual-store (KG + episodic) layout (SP-020)
     MigrateStores {
         /// Print migration plan without applying changes (default: true)
@@ -280,6 +290,11 @@ async fn main() -> Result<()> {
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()))
         .with_writer(std::io::stderr)
         .init();
+
+    // Candidates live under ~/.prometheus and never touch the resolved KB.
+    if let Cmd::Candidates { kind, action } = cli.command {
+        return candidates::run(kind, action).await;
+    }
 
     // Resolve KB directory: explicit flag > env > project-root > global fallback
     let kb_dir = resolve_kb_dir(cli.kb_dir.as_deref(), &cli.command);
@@ -567,6 +582,7 @@ async fn main() -> Result<()> {
         }
 
         Cmd::MigrateToPerProject { .. } => unreachable!("handled above"),
+        Cmd::Candidates { .. } => unreachable!("candidates return before resolving the KB"),
 
         Cmd::Codegraph { action } => match action {
             CodegraphCmd::Extract {
