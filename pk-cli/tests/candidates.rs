@@ -255,8 +255,9 @@ fn skill_accept_of_an_update_candidate_prints_the_update_invocation() {
         &["candidates", "accept", "skill-upd-0001", "--kind", "skill"],
     );
     assert_ok(&accept, "accept update candidate");
-    assert!(String::from_utf8_lossy(&accept.stdout)
-        .contains("/pmpo-skill-creator --update kbd-plan"));
+    assert!(
+        String::from_utf8_lossy(&accept.stdout).contains("/pmpo-skill-creator --update kbd-plan")
+    );
 
     // `--update <skill>` forces the update form for a new-skill candidate.
     write_skill_candidate(
@@ -267,12 +268,19 @@ fn skill_accept_of_an_update_candidate_prints_the_update_invocation() {
     let forced = pk(
         &home,
         &[
-            "candidates", "accept", "skill-new-0002", "--kind", "skill", "--update", "learn-goal",
+            "candidates",
+            "accept",
+            "skill-new-0002",
+            "--kind",
+            "skill",
+            "--update",
+            "learn-goal",
         ],
     );
     assert_ok(&forced, "accept --update");
-    assert!(String::from_utf8_lossy(&forced.stdout)
-        .contains("/pmpo-skill-creator --update learn-goal"));
+    assert!(
+        String::from_utf8_lossy(&forced.stdout).contains("/pmpo-skill-creator --update learn-goal")
+    );
 
     // A skill name is echoed into a command line, so a path-like one is refused.
     let pending = write_skill_candidate(
@@ -283,9 +291,18 @@ fn skill_accept_of_an_update_candidate_prints_the_update_invocation() {
     let bad = pk(
         &home,
         &[
-            "candidates", "accept", "skill-new-0003", "--kind", "skill", "--update", "../evil",
+            "candidates",
+            "accept",
+            "skill-new-0003",
+            "--kind",
+            "skill",
+            "--update",
+            "../evil",
         ],
     );
     assert!(!bad.status.success());
-    assert!(pending.exists(), "a refused accept leaves the file in place");
+    assert!(
+        pending.exists(),
+        "a refused accept leaves the file in place"
+    );
 }

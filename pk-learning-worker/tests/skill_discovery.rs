@@ -19,22 +19,28 @@ fn user(text: &str) -> String {
 }
 
 fn tool_result(id: &str) -> String {
-    line(&json!({"type": "user", "message": {"role": "user", "content": [
-        {"type": "tool_result", "tool_use_id": id, "content": "ok"}
-    ]}}))
+    line(
+        &json!({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": id, "content": "ok"}
+        ]}}),
+    )
 }
 
 fn tool_use(name: &str, input: Value) -> String {
-    line(&json!({"type": "assistant", "message": {"role": "assistant", "content": [
-        {"type": "text", "text": "Working on it."},
-        {"type": "tool_use", "id": "toolu_1", "name": name, "input": input}
-    ]}}))
+    line(
+        &json!({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "Working on it."},
+            {"type": "tool_use", "id": "toolu_1", "name": name, "input": input}
+        ]}}),
+    )
 }
 
 fn assistant_text(text: &str) -> String {
-    line(&json!({"type": "assistant", "message": {"role": "assistant", "content": [
-        {"type": "text", "text": text}
-    ]}}))
+    line(
+        &json!({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": text}
+        ]}}),
+    )
 }
 
 /// A report-writing session: read two sources, write a report, commit it.
@@ -45,9 +51,15 @@ fn report_transcript(project: &Path, topic: &str, slug: &str) -> String {
         "Write the weekly status report for the {topic} workstream into reports/{slug}-status.md. \
          Cover risks, milestones and open decisions, and keep it under one page."
     )));
-    text.push_str(&tool_use("Read", json!({"file_path": project.join("docs/plan.md")})));
+    text.push_str(&tool_use(
+        "Read",
+        json!({"file_path": project.join("docs/plan.md")}),
+    ));
     text.push_str(&tool_result("toolu_1"));
-    text.push_str(&tool_use("Read", json!({"file_path": project.join("docs/notes.md")})));
+    text.push_str(&tool_use(
+        "Read",
+        json!({"file_path": project.join("docs/notes.md")}),
+    ));
     text.push_str(&tool_result("toolu_1"));
     // A torn line from a crash mid-write must not stop the parse.
     text.push_str("{\"type\": \"assistant\", \"message\": {\"role\": \"assis\n");
@@ -80,7 +92,9 @@ fn kbd_plan_transcript(project: &Path) -> String {
     text.push_str(&line(&json!({"type": "user", "isMeta": true,
         "message": {"role": "user", "content": "Base directory for this skill: /skills/kbd-plan"}})));
     text.push_str(&assistant_text("Here is a plan with five changes."));
-    text.push_str(&user("No, don't split it into five changes; keep it to two."));
+    text.push_str(&user(
+        "No, don't split it into five changes; keep it to two.",
+    ));
     text.push_str(&tool_use(
         "Write",
         json!({"file_path": project.join("docs/plan.md"), "content": "plan"}),
@@ -207,7 +221,11 @@ fn three_similar_report_sessions_across_two_projects_yield_one_new_skill_candida
 
     let pending = pending_candidates(&home);
     let new_skills = of_type(&pending, "new-skill");
-    assert_eq!(new_skills.len(), 1, "expected one new-skill candidate: {pending:#?}");
+    assert_eq!(
+        new_skills.len(),
+        1,
+        "expected one new-skill candidate: {pending:#?}"
+    );
     assert!(
         of_type(&pending, "skill-update").is_empty(),
         "no skill ran, so there is nothing to update: {pending:#?}"
@@ -217,7 +235,10 @@ fn three_similar_report_sessions_across_two_projects_yield_one_new_skill_candida
     assert_eq!(candidate["state"], "pending", "{candidate:#}");
     let reasons = candidate["reasons"].as_array().unwrap();
     for wanted in ["sessions>=3", "projects>=2", "no-covering-skill"] {
-        assert!(reasons.iter().any(|r| r == wanted), "{wanted} in {candidate:#}");
+        assert!(
+            reasons.iter().any(|r| r == wanted),
+            "{wanted} in {candidate:#}"
+        );
     }
     let evidence = candidate["evidence"].as_array().unwrap();
     assert_eq!(evidence.len(), 3, "{candidate:#}");
@@ -249,8 +270,16 @@ fn three_similar_report_sessions_across_two_projects_yield_one_new_skill_candida
     run_worker(&home);
 
     let after = pending_candidates(&home);
-    assert_eq!(after.len(), pending.len(), "a re-run must not add candidates");
-    assert_eq!(fs::read(&after[0].0).unwrap(), before, "unchanged, not rewritten");
+    assert_eq!(
+        after.len(),
+        pending.len(),
+        "a re-run must not add candidates"
+    );
+    assert_eq!(
+        fs::read(&after[0].0).unwrap(),
+        before,
+        "unchanged, not rewritten"
+    );
     assert_eq!(fs::read_to_string(&index).unwrap(), indexed);
 }
 
@@ -300,7 +329,11 @@ fn a_skill_followed_by_corrections_yields_one_update_candidate_for_its_role() {
 
     let pending = pending_candidates(&home);
     let updates = of_type(&pending, "skill-update");
-    assert_eq!(updates.len(), 1, "expected one update candidate: {pending:#?}");
+    assert_eq!(
+        updates.len(),
+        1,
+        "expected one update candidate: {pending:#?}"
+    );
     assert!(of_type(&pending, "new-skill").is_empty(), "{pending:#?}");
     let candidate = updates[0];
     assert_eq!(candidate["kind"], "skill", "{candidate:#}");
@@ -313,7 +346,10 @@ fn a_skill_followed_by_corrections_yields_one_update_candidate_for_its_role() {
     assert_eq!(evidence[0]["roleId"], "planner", "{candidate:#}");
     let corrections = evidence[0]["corrections"].as_array().unwrap();
     assert_eq!(corrections.len(), 2, "{candidate:#}");
-    assert!(corrections[0].as_str().unwrap().starts_with("No, don't split"));
+    assert!(corrections[0]
+        .as_str()
+        .unwrap()
+        .starts_with("No, don't split"));
 
     // The propose-skill-update.sh format: marker line, hint line, placeholder diff.
     let updates_dir = home.join(".prometheus/skill-updates");

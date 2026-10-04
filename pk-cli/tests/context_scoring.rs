@@ -74,12 +74,23 @@ fn an_entry_sorting_last_in_a_large_scope_is_still_recalled_with_default_flags()
         );
     }
     // Sorts after every filler entry by id.
-    write_entry(&kb, "zzz-target", "latesortingtoken lesson that must be recalled");
+    write_entry(
+        &kb,
+        "zzz-target",
+        "latesortingtoken lesson that must be recalled",
+    );
     pk(&f, &["snapshot", "--scope", "project"]);
 
     let report = json(&pk(
         &f,
-        &["context", "latesortingtoken", "--scope", "project", "--format", "json"],
+        &[
+            "context",
+            "latesortingtoken",
+            "--scope",
+            "project",
+            "--format",
+            "json",
+        ],
     ));
     assert_eq!(report["scored_count"], 200, "{report:#}");
     assert_eq!(report["results"][0]["id"], "zzz-target", "{report:#}");
@@ -117,9 +128,17 @@ fn a_failed_scope_does_not_reserve_budget_the_remaining_scopes_can_use() {
             "json",
         ],
     ));
-    assert_eq!(report["failures"].as_array().unwrap().len(), 1, "{report:#}");
+    assert_eq!(
+        report["failures"].as_array().unwrap().len(),
+        1,
+        "{report:#}"
+    );
     assert_eq!(report["candidate_count"], 60, "{report:#}");
-    assert_eq!(report["results"].as_array().unwrap().len(), 32, "{report:#}");
+    assert_eq!(
+        report["results"].as_array().unwrap().len(),
+        32,
+        "{report:#}"
+    );
 }
 
 #[test]
@@ -147,11 +166,17 @@ fn output_is_deterministic_and_ranked_by_score_then_scope_then_id() {
     ];
     let first = pk(&f, &args).stdout;
     let second = pk(&f, &args).stdout;
-    assert_eq!(first, second, "context output must be byte-identical across runs");
+    assert_eq!(
+        first, second,
+        "context output must be byte-identical across runs"
+    );
 
     let report: Value = serde_json::from_slice(&first).unwrap();
     let results = report["results"].as_array().unwrap();
-    let scores: Vec<f64> = results.iter().map(|r| r["score"].as_f64().unwrap()).collect();
+    let scores: Vec<f64> = results
+        .iter()
+        .map(|r| r["score"].as_f64().unwrap())
+        .collect();
     assert!(
         scores.windows(2).all(|w| w[0] >= w[1]),
         "results must be ordered by descending score: {report:#}"

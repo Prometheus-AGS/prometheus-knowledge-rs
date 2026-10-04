@@ -19,6 +19,8 @@ use std::{
 };
 
 mod promotion;
+mod skill_candidates;
+mod transcript;
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MEMORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -369,11 +371,13 @@ async fn run_once(root: &Path, memory_url: &str, stale_after: Duration) -> Resul
         ..RunSummary::default()
     };
     let mut observations = Vec::new();
+    let mut sessions = Vec::new();
     for path in json_files(&root.join("pending"))? {
         match process_job(root, &path).await {
-            Ok(observed) => {
+            Ok((observed, session)) => {
                 summary.jobs_completed += 1;
                 observations.extend(observed);
+                sessions.extend(session);
             }
             Err(error) => {
                 summary.last_error = Some(error.to_string());
@@ -396,6 +400,11 @@ async fn run_once(root: &Path, memory_url: &str, stale_after: Duration) -> Resul
     if let Err(error) = promotion::run(&observations) {
         tracing::warn!(error = %error, "promotion detector failed");
         summary.last_error = Some(format!("promotion detector: {error}"));
+    }
+    // Skill discovery only proposes too; same rule for failures.
+    if let Err(error) = skill_candidates::run(&sessions) {
+        tracing::warn!(error = %error, "skill discovery failed");
+        summary.last_error = Some(format!("skill discovery: {error}"));
     }
 
     let client = memory_client(MEMORY_REQUEST_TIMEOUT)?;
@@ -522,7 +531,13 @@ fn migrate_legacy_memory_retry(root: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn process_job(root: &Path, pending_path: &Path) -> Result<Vec<promotion::Observation>> {
+/// What a processed job contributes to the detectors that run after the drain.
+type JobObservations = (
+    Vec<promotion::Observation>,
+    Option<skill_candidates::SessionObservation>,
+);
+
+async fn process_job(root: &Path, pending_path: &Path) -> Result<JobObservations> {
     let name = pending_path
         .file_name()
         .context("job path has no filename")?;
@@ -536,7 +551,7 @@ async fn process_job(root: &Path, pending_path: &Path) -> Result<Vec<promotion::
     let completed = root.join("completed").join(name);
     if completed.exists() {
         preserve_duplicate(root, &processing, "duplicate-completed")?;
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
 
     let packet = build_session_packet(&job)?;
@@ -610,10 +625,22 @@ async fn process_job(root: &Path, pending_path: &Path) -> Result<Vec<promotion::
         },
         entries,
     )?;
+    // Whole-transcript digest for skill discovery; the packet above still
+    // carries only the final message.
+    let session = job.transcript_path.as_deref().map(|path| {
+        skill_candidates::observation_for(
+            &project_id,
+            &job.project_root,
+            &job.session_id,
+            job.team_id.as_deref(),
+            job.role_id.as_deref(),
+            transcript::parse_file(path),
+        )
+    });
     append_learning_log(&job, &packet)?;
     enqueue_memory(root, &job, &packet)?;
     durable_rename(&processing, &completed)?;
-    Ok(observations)
+    Ok((observations, session))
 }
 
 /// The project a lesson belongs to, for cross-project recurrence: the job's
