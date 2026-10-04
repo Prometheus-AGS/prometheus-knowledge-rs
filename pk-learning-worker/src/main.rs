@@ -100,6 +100,16 @@ struct LearningJob {
     scope: LearningScope,
     #[serde(default)]
     attempt: u32,
+    /// Resolved by the hook's single project-id resolver; falls back to
+    /// `project_scope(project_root)` when absent (jobs queued by older hooks).
+    #[serde(default)]
+    project_id: Option<String>,
+    /// Agent-team id of the authoring agent, when it resolved to a team role.
+    #[serde(default)]
+    team_id: Option<String>,
+    /// Role id within `team_id`.
+    #[serde(default)]
+    role_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -556,6 +566,17 @@ async fn process_job(root: &Path, pending_path: &Path) -> Result<()> {
             )
             .await?;
     }
+    // Publish the store's current entries as the committed prompt snapshot that
+    // `pk context` reads. Without this, session records were written to disk
+    // but never became recallable.
+    pk_store::commit_prompt_snapshot(
+        &target_kb,
+        match job.scope {
+            LearningScope::Project => "project",
+            LearningScope::Shared => "shared",
+        },
+        store.snapshot().await?,
+    )?;
     append_learning_log(&job, &packet)?;
     enqueue_memory(root, &job, &packet)?;
     durable_rename(&processing, &completed)?;
@@ -724,14 +745,38 @@ fn append_learning_log(job: &LearningJob, packet: &str) -> Result<()> {
     Ok(())
 }
 
+/// The surreal-memory scope keys for a job (design: one `agent_id` per
+/// visibility level, never null). A role-attributed project lesson is private
+/// to `<team>/<role>`; an unattributed one is project-visible; shared-scope
+/// learning is global.
+fn memory_identity(job: &LearningJob) -> (String, String) {
+    let present = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    match job.scope {
+        LearningScope::Shared => ("@global".to_owned(), "@global".to_owned()),
+        LearningScope::Project => {
+            let user_id =
+                present(&job.project_id).unwrap_or_else(|| project_scope(&job.project_root));
+            let agent_id = match (present(&job.team_id), present(&job.role_id)) {
+                (Some(team), Some(role)) => format!("{team}/{role}"),
+                _ => "@project".to_owned(),
+            };
+            (user_id, agent_id)
+        }
+    }
+}
+
 fn enqueue_memory(root: &Path, job: &LearningJob, packet: &str) -> Result<()> {
+    let (user_id, agent_id) = memory_identity(job);
     let arguments = json!({
         "content": packet,
-        "user_id": match job.scope {
-            LearningScope::Project => project_scope(&job.project_root),
-            LearningScope::Shared => "global".to_owned(),
-        },
-        "agent_id": null,
+        "user_id": user_id,
+        "agent_id": agent_id,
         "session_id": job.session_id,
         "categories": ["karpathy", "session-learning"]
     });
@@ -1295,6 +1340,9 @@ fn normalize_operation(mut operation: MemoryOperation) -> Result<MemoryOperation
 
 fn normalize_payload(method: &str, arguments: &Value) -> Result<Value> {
     match method {
+        // Already-normalized payloads pass through unchanged: their stored
+        // payload hash (and any server receipt) is bound to these exact bytes.
+        // New operations get non-null scope keys at the source (memory bridge).
         "add_memory" | "create_task_stream" => Ok(arguments.clone()),
         "add_task_step" if arguments.get("stream_name").is_some() => Ok(arguments.clone()),
         "add_task_step" => {
@@ -1312,8 +1360,8 @@ fn normalize_payload(method: &str, arguments: &Value) -> Result<Value> {
                 "name": description,
                 "description": description,
                 "idempotency_key": description,
-                "agent_id": null,
-                "user_id": null
+                "agent_id": scope_key(arguments, "agent_id", "@project"),
+                "user_id": scope_key(arguments, "user_id", &fallback_project_id())
             }))
         }
         "complete_step" if arguments.get("idempotency_key").is_some() => Ok(arguments.clone()),
@@ -1528,6 +1576,24 @@ fn print_status(root: &Path, stale_after: Duration, json_output: bool) -> Result
         println!("ambiguous delivery: {}", status.ambiguous_delivery);
     }
     Ok(())
+}
+
+fn scope_key(arguments: &Value, key: &str, fallback: &str) -> Value {
+    match arguments.get(key).and_then(Value::as_str).map(str::trim) {
+        Some(value) if !value.is_empty() => Value::String(value.to_owned()),
+        _ => Value::String(fallback.to_owned()),
+    }
+}
+
+/// Project scope for a legacy bridge operation that did not name one: the
+/// explicit environment id, else an explicit `project:unknown` sentinel that the
+/// surreal-memory re-key operation can repair (never a null key).
+fn fallback_project_id() -> String {
+    std::env::var("PROMETHEUS_PROJECT_ID")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "project:unknown".to_owned())
 }
 
 fn truncate_chars(value: &str, limit: usize) -> String {
