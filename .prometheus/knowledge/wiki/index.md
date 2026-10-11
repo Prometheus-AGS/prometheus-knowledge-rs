@@ -34,6 +34,7 @@ okf_version: "0.2"
 * [Karpathy session 8df851aacd3e](/karpathy-session-8df851aacd3e1ea3.md)
 * [Karpathy session 96928fa5ea8b](/karpathy-session-96928fa5ea8b314d.md)
 * [Karpathy session 983acdc46a17](/karpathy-session-983acdc46a1771df.md)
+* [Karpathy session 9af3222c6496](/karpathy-session-9af3222c6496d9c2.md)
 * [Karpathy session 9cdfd5ab00fd](/karpathy-session-9cdfd5ab00fdd7ae.md)
 * [Karpathy session a81525eb3d8e](/karpathy-session-a81525eb3d8e2271.md)
 * [Karpathy session ac6782bf798c](/karpathy-session-ac6782bf798cfcb0.md)
@@ -47,4 +48,5 @@ okf_version: "0.2"
 * [Karpathy session d9526a7558ad](/karpathy-session-d9526a7558adc66d.md)
 * [Karpathy session de07543d423e](/karpathy-session-de07543d423ef2c6.md)
 * [Karpathy session f83b9707b740](/karpathy-session-f83b9707b7405198.md)
+* [Karpathy session fb98571ce5b9](/karpathy-session-fb98571ce5b9e695.md)
 * [Karpathy session fc9a062eacbf](/karpathy-session-fc9a062eacbfeced.md)
