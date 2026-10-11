@@ -37,6 +37,18 @@ impl Librarian {
     }
 
     pub async fn compile(&self, raw: RawDoc) -> PkResult<WikiEntry> {
+        self.compile_with(raw, CompileOverrides::default()).await
+    }
+
+    /// Compile with caller-supplied classification: `entry_type` replaces the
+    /// generic OKF `Reference` default, and `tags` are added to the model's
+    /// tags (de-duplicated, caller tags first). Used by `pk ingest --type/--tag`
+    /// so lessons can be filtered by role/team/visibility at recall time.
+    pub async fn compile_with(
+        &self,
+        raw: RawDoc,
+        overrides: CompileOverrides,
+    ) -> PkResult<WikiEntry> {
         info!(source = %raw.source_path, "compiling raw doc");
 
         let related = self.store.related_entries(&raw, 5).await?;
@@ -51,6 +63,7 @@ impl Librarian {
             .map_err(|e| PkError::llm(e.to_string()))?;
 
         let mut entry = parse_compile_response(&response)?;
+        overrides.apply(&mut entry);
 
         // Ingest-time duplicate detection: the LLM synthesizes a fresh title
         // (and therefore a fresh ArticleId) on every call, even over content
@@ -372,6 +385,36 @@ fn with_unique_ids(sources: Vec<Source>) -> Vec<Source> {
         .zip(ids)
         .map(|(source, id)| Source { id, ..source })
         .collect()
+}
+
+/// Caller-supplied classification applied to a compiled entry.
+#[derive(Debug, Clone, Default)]
+pub struct CompileOverrides {
+    pub entry_type: Option<String>,
+    pub tags: Vec<String>,
+}
+
+impl CompileOverrides {
+    fn apply(&self, entry: &mut WikiEntry) {
+        if let Some(entry_type) = self
+            .entry_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            entry.entry_type = Some(entry_type.to_owned());
+        }
+        if !self.tags.is_empty() {
+            let mut tags: Vec<String> = Vec::new();
+            for tag in self.tags.iter().chain(entry.tags.iter()) {
+                let tag = tag.trim();
+                if !tag.is_empty() && !tags.iter().any(|existing| existing == tag) {
+                    tags.push(tag.to_owned());
+                }
+            }
+            entry.tags = tags;
+        }
+    }
 }
 
 fn parse_compile_response(raw: &str) -> PkResult<WikiEntry> {

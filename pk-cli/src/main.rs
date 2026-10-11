@@ -23,6 +23,8 @@ use std::{
 };
 use tokio::sync::broadcast;
 
+mod candidates;
+
 /// KB scope: project-local (default) or globally shared across projects.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum KbScope {
@@ -100,6 +102,12 @@ enum Cmd {
         /// Skip confirmation prompt when using --scope=shared
         #[arg(long, default_value_t = false)]
         yes: bool,
+        /// OKF entry type (e.g. Lesson, Gotcha, Decision). Defaults to Reference.
+        #[arg(long = "type")]
+        entry_type: Option<String>,
+        /// Tag to add to the entry (repeatable), e.g. role:api-dev, vis:team.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
     },
     /// Run a lint pass over the full knowledge base
     Lint {
@@ -145,7 +153,8 @@ enum Cmd {
         scopes: Vec<ContextScope>,
         #[arg(long, default_value_t = 8)]
         limit: usize,
-        /// Maximum immutable snapshot candidates inspected across all scopes.
+        /// Maximum scored candidates kept across all scopes. Every snapshot entry
+        /// is scored first; the cap applies to the merged, ranked list.
         #[arg(long, default_value_t = 128)]
         max_candidates: usize,
         /// Maximum bytes emitted in hook format.
@@ -153,6 +162,9 @@ enum Cmd {
         max_bytes: usize,
         #[arg(long, value_enum, default_value = "hook")]
         format: ContextFormat,
+        /// Keep only entries carrying this tag (repeatable; all must match).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
     },
     /// Publish immutable prompt-snapshot generations from local knowledge stores.
     Snapshot {
@@ -209,6 +221,14 @@ enum Cmd {
     Events {
         #[command(subcommand)]
         action: EventsCmd,
+    },
+    /// Review promotion or skill candidates proposed by the learning worker
+    Candidates {
+        /// Candidate kind: promotion (lessons for user/global scope) or skill.
+        #[arg(long, value_enum, default_value = "promotion", global = true)]
+        kind: candidates::CandidateKind,
+        #[command(subcommand)]
+        action: candidates::CandidatesCmd,
     },
     /// Migrate single-store events to dual-store (KG + episodic) layout (SP-020)
     MigrateStores {
@@ -271,6 +291,11 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // Candidates live under ~/.prometheus and never touch the resolved KB.
+    if let Cmd::Candidates { kind, action } = cli.command {
+        return candidates::run(kind, action).await;
+    }
+
     // Resolve KB directory: explicit flag > env > project-root > global fallback
     let kb_dir = resolve_kb_dir(cli.kb_dir.as_deref(), &cli.command);
 
@@ -286,18 +311,19 @@ async fn main() -> Result<()> {
         max_candidates,
         max_bytes,
         format,
+        tags,
     } = &cli.command
     {
-        return run_context(
+        let request = ContextRequest {
             query,
             scopes,
-            *limit,
-            *max_candidates,
-            *max_bytes,
-            *format,
-            cli.kb_dir.as_deref(),
-        )
-        .await;
+            limit: *limit,
+            max_candidates: *max_candidates,
+            max_bytes: *max_bytes,
+            format: *format,
+            tags,
+        };
+        return run_context(request, cli.kb_dir.as_deref()).await;
     }
     if let Cmd::Snapshot { scopes } = &cli.command {
         return run_snapshot(scopes, cli.kb_dir.as_deref()).await;
@@ -347,6 +373,8 @@ async fn main() -> Result<()> {
             source,
             scope,
             yes,
+            entry_type,
+            tags,
         } => {
             // For shared scope, require confirmation unless --yes passed
             if matches!(scope, KbScope::Shared) && !yes {
@@ -373,7 +401,9 @@ async fn main() -> Result<()> {
                 }
             };
             let doc = RawDoc::from_path(source_label, content);
-            let entry = librarian.compile(doc).await?;
+            let entry = librarian
+                .compile_with(doc, pk_librarian::CompileOverrides { entry_type, tags })
+                .await?;
             commit_prompt_snapshot(&kb_dir, scope.snapshot_label(), store.snapshot().await?)?;
             println!("✓ compiled → {} [{}]", entry.title, entry.id);
         }
@@ -551,6 +581,7 @@ async fn main() -> Result<()> {
         }
 
         Cmd::MigrateToPerProject { .. } => unreachable!("handled above"),
+        Cmd::Candidates { .. } => unreachable!("candidates return before resolving the KB"),
 
         Cmd::Codegraph { action } => match action {
             CodegraphCmd::Extract {
@@ -659,6 +690,9 @@ struct ContextCandidate {
 struct ContextOutput {
     query: String,
     snapshot_generations: BTreeMap<String, String>,
+    /// Snapshot entries scored across all readable scopes.
+    scored_count: usize,
+    /// Ranked candidates kept after de-duplication and the `--max-candidates` cap.
     candidate_count: usize,
     byte_count: usize,
     failures: Vec<ContextFailure>,
@@ -680,15 +714,27 @@ struct ContextItem {
     score: f32,
 }
 
-async fn run_context(
-    query: &str,
-    requested_scopes: &[ContextScope],
+/// Options for a single `pk context` invocation, borrowed from the parsed CLI.
+struct ContextRequest<'a> {
+    query: &'a str,
+    scopes: &'a [ContextScope],
     limit: usize,
     max_candidates: usize,
     max_bytes: usize,
     format: ContextFormat,
-    explicit_project_kb: Option<&str>,
-) -> Result<()> {
+    tags: &'a [String],
+}
+
+async fn run_context(request: ContextRequest<'_>, explicit_project_kb: Option<&str>) -> Result<()> {
+    let ContextRequest {
+        query,
+        scopes: requested_scopes,
+        limit,
+        max_candidates,
+        max_bytes,
+        format,
+        tags: required_tags,
+    } = request;
     let scopes = if requested_scopes.is_empty() {
         vec![
             ContextScope::Project,
@@ -705,10 +751,9 @@ async fn run_context(
     };
     let max_candidates = max_candidates.clamp(1, 512);
     let max_bytes = max_bytes.clamp(256, 65_536);
-    let candidates_per_scope = max_candidates.div_ceil(scopes.len().max(1));
     let mut failures = Vec::new();
     let mut candidates = Vec::new();
-    let mut inspected_candidates = 0usize;
+    let mut scored_count = 0usize;
     let mut generations = BTreeMap::new();
     for scope in scopes {
         let Some(path) = knowledge_root_for_scope(scope, explicit_project_kb) else {
@@ -732,16 +777,21 @@ async fn run_context(
             }
         };
         generations.insert(scope.label().to_owned(), snapshot.generation);
-        let remaining = max_candidates
-            .saturating_sub(inspected_candidates)
-            .min(candidates_per_scope);
-        let bounded_entries = snapshot
+        // Score every entry before any budget applies: truncating first meant
+        // only the first entries in snapshot order were ever considered, and a
+        // failed scope's share of the budget was lost.
+        // `--tag` filters before scoring: an entry must carry every requested tag.
+        let entries: Vec<_> = snapshot
             .entries
             .into_iter()
-            .take(remaining)
-            .collect::<Vec<_>>();
-        inspected_candidates += bounded_entries.len();
-        candidates.extend(bounded_entries.into_iter().filter_map(|entry| {
+            .filter(|entry| {
+                required_tags
+                    .iter()
+                    .all(|tag| entry.tags.iter().any(|candidate| candidate == tag))
+            })
+            .collect();
+        scored_count += entries.len();
+        candidates.extend(entries.into_iter().filter_map(|entry| {
             let score = snapshot_score(query, &entry);
             (score > 0.0 || query.trim().is_empty()).then_some(ContextCandidate {
                 scope,
@@ -749,9 +799,6 @@ async fn run_context(
                 score,
             })
         }));
-        if inspected_candidates == max_candidates {
-            break;
-        }
     }
 
     // Select a canonical copy of duplicate IDs or duplicate content. Scope
@@ -793,6 +840,8 @@ async fn run_context(
             .then_with(|| left.scope.priority().cmp(&right.scope.priority()))
             .then_with(|| left.entry.id.as_str().cmp(right.entry.id.as_str()))
     });
+    selected.truncate(max_candidates);
+    let candidate_count = selected.len();
     selected.truncate(limit.clamp(1, 32));
 
     let results = selected
@@ -811,7 +860,8 @@ async fn run_context(
     let mut output = ContextOutput {
         query: query.to_owned(),
         snapshot_generations: generations,
-        candidate_count: inspected_candidates,
+        scored_count,
+        candidate_count,
         byte_count: 0,
         failures,
         results,

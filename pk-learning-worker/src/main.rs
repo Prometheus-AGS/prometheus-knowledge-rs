@@ -18,6 +18,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod promotion;
+mod skill_candidates;
+mod transcript;
+
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MEMORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// First wait before re-polling an accepted operation whose receipt did not change.
@@ -100,6 +104,16 @@ struct LearningJob {
     scope: LearningScope,
     #[serde(default)]
     attempt: u32,
+    /// Resolved by the hook's single project-id resolver; falls back to
+    /// `project_scope(project_root)` when absent (jobs queued by older hooks).
+    #[serde(default)]
+    project_id: Option<String>,
+    /// Agent-team id of the authoring agent, when it resolved to a team role.
+    #[serde(default)]
+    team_id: Option<String>,
+    /// Role id within `team_id`.
+    #[serde(default)]
+    role_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -356,9 +370,15 @@ async fn run_once(root: &Path, memory_url: &str, stale_after: Duration) -> Resul
         started_at: Utc::now().to_rfc3339(),
         ..RunSummary::default()
     };
+    let mut observations = Vec::new();
+    let mut sessions = Vec::new();
     for path in json_files(&root.join("pending"))? {
         match process_job(root, &path).await {
-            Ok(()) => summary.jobs_completed += 1,
+            Ok((observed, session)) => {
+                summary.jobs_completed += 1;
+                observations.extend(observed);
+                sessions.extend(session);
+            }
             Err(error) => {
                 summary.last_error = Some(error.to_string());
                 let completed = root
@@ -375,6 +395,16 @@ async fn run_once(root: &Path, memory_url: &str, stale_after: Duration) -> Resul
                 summary.jobs_rejected += 1;
             }
         }
+    }
+    // Promotion only proposes; a failure here must not hold up memory delivery.
+    if let Err(error) = promotion::run(&observations) {
+        tracing::warn!(error = %error, "promotion detector failed");
+        summary.last_error = Some(format!("promotion detector: {error}"));
+    }
+    // Skill discovery only proposes too; same rule for failures.
+    if let Err(error) = skill_candidates::run(&sessions) {
+        tracing::warn!(error = %error, "skill discovery failed");
+        summary.last_error = Some(format!("skill discovery: {error}"));
     }
 
     let client = memory_client(MEMORY_REQUEST_TIMEOUT)?;
@@ -501,7 +531,13 @@ fn migrate_legacy_memory_retry(root: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn process_job(root: &Path, pending_path: &Path) -> Result<()> {
+/// What a processed job contributes to the detectors that run after the drain.
+type JobObservations = (
+    Vec<promotion::Observation>,
+    Option<skill_candidates::SessionObservation>,
+);
+
+async fn process_job(root: &Path, pending_path: &Path) -> Result<JobObservations> {
     let name = pending_path
         .file_name()
         .context("job path has no filename")?;
@@ -515,7 +551,7 @@ async fn process_job(root: &Path, pending_path: &Path) -> Result<()> {
     let completed = root.join("completed").join(name);
     if completed.exists() {
         preserve_duplicate(root, &processing, "duplicate-completed")?;
-        return Ok(());
+        return Ok((Vec::new(), None));
     }
 
     let packet = build_session_packet(&job)?;
@@ -556,10 +592,66 @@ async fn process_job(root: &Path, pending_path: &Path) -> Result<()> {
             )
             .await?;
     }
+    // Publish the store's current entries as the committed prompt snapshot that
+    // `pk context` reads. Without this, session records were written to disk
+    // but never became recallable.
+    let entries = store.snapshot().await?;
+    let project_id = lesson_project_id(&job);
+    let mut observations = job
+        .transcript_path
+        .as_deref()
+        .and_then(extract_final_assistant_message)
+        .map(|message| {
+            promotion::observations_from_message(
+                &project_id,
+                &job.project_root,
+                &job.session_id,
+                &message,
+            )
+        })
+        .unwrap_or_default();
+    if matches!(job.scope, LearningScope::Project) {
+        observations.extend(promotion::observations_from_entries(
+            &project_id,
+            &job.project_root,
+            &entries,
+        ));
+    }
+    pk_store::commit_prompt_snapshot(
+        &target_kb,
+        match job.scope {
+            LearningScope::Project => "project",
+            LearningScope::Shared => "shared",
+        },
+        entries,
+    )?;
+    // Whole-transcript digest for skill discovery; the packet above still
+    // carries only the final message.
+    let session = job.transcript_path.as_deref().map(|path| {
+        skill_candidates::observation_for(
+            &project_id,
+            &job.project_root,
+            &job.session_id,
+            job.team_id.as_deref(),
+            job.role_id.as_deref(),
+            transcript::parse_file(path),
+        )
+    });
     append_learning_log(&job, &packet)?;
     enqueue_memory(root, &job, &packet)?;
     durable_rename(&processing, &completed)?;
-    Ok(())
+    Ok((observations, session))
+}
+
+/// The project a lesson belongs to, for cross-project recurrence: the job's
+/// resolved project id, else the same fallback the memory scope keys use.
+fn lesson_project_id(job: &LearningJob) -> String {
+    job.project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| project_scope(&job.project_root))
 }
 
 fn build_session_packet(job: &LearningJob) -> Result<String> {
@@ -724,14 +816,38 @@ fn append_learning_log(job: &LearningJob, packet: &str) -> Result<()> {
     Ok(())
 }
 
+/// The surreal-memory scope keys for a job (design: one `agent_id` per
+/// visibility level, never null). A role-attributed project lesson is private
+/// to `<team>/<role>`; an unattributed one is project-visible; shared-scope
+/// learning is global.
+fn memory_identity(job: &LearningJob) -> (String, String) {
+    let present = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    match job.scope {
+        LearningScope::Shared => ("@global".to_owned(), "@global".to_owned()),
+        LearningScope::Project => {
+            let user_id =
+                present(&job.project_id).unwrap_or_else(|| project_scope(&job.project_root));
+            let agent_id = match (present(&job.team_id), present(&job.role_id)) {
+                (Some(team), Some(role)) => format!("{team}/{role}"),
+                _ => "@project".to_owned(),
+            };
+            (user_id, agent_id)
+        }
+    }
+}
+
 fn enqueue_memory(root: &Path, job: &LearningJob, packet: &str) -> Result<()> {
+    let (user_id, agent_id) = memory_identity(job);
     let arguments = json!({
         "content": packet,
-        "user_id": match job.scope {
-            LearningScope::Project => project_scope(&job.project_root),
-            LearningScope::Shared => "global".to_owned(),
-        },
-        "agent_id": null,
+        "user_id": user_id,
+        "agent_id": agent_id,
         "session_id": job.session_id,
         "categories": ["karpathy", "session-learning"]
     });
@@ -1295,6 +1411,9 @@ fn normalize_operation(mut operation: MemoryOperation) -> Result<MemoryOperation
 
 fn normalize_payload(method: &str, arguments: &Value) -> Result<Value> {
     match method {
+        // Already-normalized payloads pass through unchanged: their stored
+        // payload hash (and any server receipt) is bound to these exact bytes.
+        // New operations get non-null scope keys at the source (memory bridge).
         "add_memory" | "create_task_stream" => Ok(arguments.clone()),
         "add_task_step" if arguments.get("stream_name").is_some() => Ok(arguments.clone()),
         "add_task_step" => {
@@ -1312,8 +1431,8 @@ fn normalize_payload(method: &str, arguments: &Value) -> Result<Value> {
                 "name": description,
                 "description": description,
                 "idempotency_key": description,
-                "agent_id": null,
-                "user_id": null
+                "agent_id": scope_key(arguments, "agent_id", "@project"),
+                "user_id": scope_key(arguments, "user_id", &fallback_project_id())
             }))
         }
         "complete_step" if arguments.get("idempotency_key").is_some() => Ok(arguments.clone()),
@@ -1530,6 +1649,24 @@ fn print_status(root: &Path, stale_after: Duration, json_output: bool) -> Result
     Ok(())
 }
 
+fn scope_key(arguments: &Value, key: &str, fallback: &str) -> Value {
+    match arguments.get(key).and_then(Value::as_str).map(str::trim) {
+        Some(value) if !value.is_empty() => Value::String(value.to_owned()),
+        _ => Value::String(fallback.to_owned()),
+    }
+}
+
+/// Project scope for a legacy bridge operation that did not name one: the
+/// explicit environment id, else an explicit `project:unknown` sentinel that the
+/// surreal-memory re-key operation can repair (never a null key).
+fn fallback_project_id() -> String {
+    std::env::var("PROMETHEUS_PROJECT_ID")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "project:unknown".to_owned())
+}
+
 fn truncate_chars(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
@@ -1609,6 +1746,9 @@ mod tests {
             captured_at: "2026-08-03T00:00:00Z".to_owned(),
             payload_digest: "fixture".to_owned(),
             scope: LearningScope::Project,
+            project_id: None,
+            team_id: None,
+            role_id: None,
             attempt: 0,
         }
     }
