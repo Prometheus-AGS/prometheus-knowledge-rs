@@ -33,7 +33,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-serde_yaml = "0.9"
+serde_yaml = { package = "yaml_serde", version = "=0.10.7" }
 
 # Errors
 anyhow = "1"
