@@ -728,7 +728,12 @@ fn extract_text(value: &Value) -> Option<String> {
 
 fn git_changed_paths(project_root: &Path) -> Vec<String> {
     let mut child = match Command::new("git")
-        .args(["status", "--short"])
+        .args([
+            "--no-optional-locks",
+            "status",
+            "--short",
+            "--ignore-submodules=all",
+        ])
         .current_dir(project_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -745,7 +750,16 @@ fn git_changed_paths(project_root: &Path) -> Vec<String> {
             Ok(None) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(50));
             }
-            Ok(None) | Err(_) => {
+            Ok(None) => {
+                tracing::warn!(
+                    timeout_seconds = 5,
+                    "git status timed out; changed paths unavailable"
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return Vec::new();
+            }
+            Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Vec::new();
